@@ -4,7 +4,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -24,6 +24,7 @@ from app.api.wfh import router as wfh_router
 from app.api.signup_requests import router as signup_requests_router
 from app.api.referrals import router as referrals_router, external_router as referrals_external_router
 from app.api.payroll import router as payroll_router
+from app.api.performance_reviews import router as performance_reviews_router
 from app.seed_skills import seed_skills
 
 Base.metadata.create_all(bind=engine)
@@ -212,6 +213,20 @@ def sync_employee_salary_schema() -> None:
 
 
 sync_employee_salary_schema()
+
+
+def sync_performance_reviews_schema() -> None:
+    """Create the performance_reviews table on existing databases if missing."""
+    inspector = inspect(engine)
+    try:
+        tables = set(inspector.get_table_names())
+    except Exception:
+        return
+    if "performance_reviews" not in tables:
+        performance_review.Base.metadata.tables["performance_reviews"].create(bind=engine)
+
+
+sync_performance_reviews_schema()
 seed_skills()
 
 app = FastAPI(title="Autonex Resource Planning Tool V2")
@@ -248,4 +263,5 @@ app.include_router(signup_requests_router)
 app.include_router(referrals_router)
 app.include_router(referrals_external_router)
 app.include_router(payroll_router)
+app.include_router(performance_reviews_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
