@@ -530,11 +530,32 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
-    leave.employee_id = payload.employee_id
+    if leave.start_date <= date_type.today():
+        raise HTTPException(status_code=400, detail="Cannot edit a leave that has already started")
+
+    # Check for overlapping leaves (excluding this one)
+    overlap = (
+        db.query(Leave)
+        .filter(
+            Leave.employee_id == leave.employee_id,
+            Leave.id != leave_id,
+            Leave.status != "rejected",
+            Leave.start_date <= payload.end_date,
+            Leave.end_date >= payload.start_date,
+        )
+        .first()
+    )
+    if overlap:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}).",
+        )
+
     leave.start_date = payload.start_date
     leave.end_date = payload.end_date
     leave.leave_type = payload.leave_type
     leave.reason = payload.reason
+    leave.status = "pending"  # reset to pending so PM re-reviews the edited request
     db.commit()
     db.refresh(leave)
     return LeaveSchema(
@@ -678,6 +699,8 @@ def delete_leave(leave_id: int, db: Session = Depends(get_db)):
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
+    if leave.start_date <= date_type.today():
+        raise HTTPException(status_code=400, detail="Cannot delete a leave that has already started")
     db.delete(leave)
     db.commit()
     return {"message": "Leave deleted successfully"}
