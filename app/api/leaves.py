@@ -120,13 +120,14 @@ def sync_leave_to_razorpay(employee: Employee, leave: Leave) -> None:
     current_date = leave.start_date
 
     while current_date <= leave.end_date:
-        request_body = build_razorpay_attendance_request(
-            employee=employee,
-            date_value=current_date,
-            leave_type=leave.leave_type,
-            remarks=remarks,
-        )
-        post_razorpay_attendance(request_body)
+        if not is_weekend(current_date) and not is_fixed_holiday(current_date):
+            request_body = build_razorpay_attendance_request(
+                employee=employee,
+                date_value=current_date,
+                leave_type=leave.leave_type,
+                remarks=remarks,
+            )
+            post_razorpay_attendance(request_body)
         current_date += timedelta(days=1)
 
 
@@ -390,23 +391,6 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
             detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}). Please check your existing leaves.",
         )
 
-    # Weekend and fixed public holiday validation
-    check_date = payload.start_date
-    while check_date <= payload.end_date:
-        if is_weekend(check_date):
-            day_name = "Saturday" if check_date.weekday() == 5 else "Sunday"
-            raise HTTPException(
-                status_code=400,
-                detail=f"{check_date} is a {day_name}. Leave cannot be applied on weekends.",
-            )
-        if is_fixed_holiday(check_date):
-            fixed = sorted(get_fixed_holidays_for_year(check_date.year))
-            raise HTTPException(
-                status_code=400,
-                detail=f"{check_date} is a fixed public holiday. Leave cannot be applied on fixed public holidays.",
-            )
-        check_date += timedelta(days=1)
-
     # Floater leave date validation
     normalized_type = normalize_leave_type(payload.leave_type)
     if normalized_type == "floater":
@@ -590,22 +574,6 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
             status_code=409,
             detail=f"A leave already exists for this period ({overlap.start_date} – {overlap.end_date}).",
         )
-
-    # Weekend and fixed public holiday validation
-    check_date = payload.start_date
-    while check_date <= payload.end_date:
-        if is_weekend(check_date):
-            day_name = "Saturday" if check_date.weekday() == 5 else "Sunday"
-            raise HTTPException(
-                status_code=400,
-                detail=f"{check_date} is a {day_name}. Leave cannot be applied on weekends.",
-            )
-        if is_fixed_holiday(check_date):
-            raise HTTPException(
-                status_code=400,
-                detail=f"{check_date} is a fixed public holiday. Leave cannot be applied on fixed public holidays.",
-            )
-        check_date += timedelta(days=1)
 
     # Floater leave date validation
     normalized_type = normalize_leave_type(payload.leave_type)
