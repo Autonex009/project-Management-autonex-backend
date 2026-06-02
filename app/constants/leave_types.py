@@ -24,6 +24,28 @@ RAZORPAY_LEAVE_TYPE_IDS = {
 }
 
 
+# ── Annual paid-leave entitlement (per employee, per calendar year) ─────────
+# Razorpay exposes no leave-balance API, so the entitlement is defined here and
+# the remaining balance is computed locally as: quota − working-days already used
+# (from approved leaves). A leave consumes its own type's balance; once a type's
+# balance for the year is exhausted, further days of that type are treated as
+# UNPAID leave (salary is deducted per working day).
+#
+# casual_sick is a single combined type in this system; 6 = 6 days total
+# (not 6 casual + 6 sick). Adjust these numbers to change policy — no code edits
+# elsewhere are required.
+ANNUAL_LEAVE_QUOTA = {
+    "paid": 12,
+    "casual_sick": 6,
+    "floater": 2,
+}
+
+
+def get_annual_leave_quota(leave_type: str) -> int:
+    """Annual paid entitlement (in working days) for a leave type. Unknown → 0 (always unpaid)."""
+    return ANNUAL_LEAVE_QUOTA.get(normalize_leave_type(leave_type), 0)
+
+
 # ── Approved floater holiday dates (2026) ───────────────────────────
 # Employees may only apply Floater Leave on these specific dates.
 FLOATER_DATES_2026: frozenset[date] = frozenset([

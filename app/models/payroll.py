@@ -33,6 +33,9 @@ class PayrollLeaveAdjustment(Base):
     employee_id = Column(Integer, ForeignKey("employees.id", ondelete="CASCADE"), nullable=False)
     leave_id = Column(Integer, ForeignKey("leaves.id", ondelete="CASCADE"), nullable=False)
     deduct = Column(Boolean, nullable=False, default=True)
+    # Snapshot of unpaid working-days for this leave within the run's month.
+    # Null on legacy rows → fall back to (days_in_month if deduct else 0).
+    unpaid_days = Column(Integer, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
     __table_args__ = (UniqueConstraint("payroll_run_id", "leave_id", name="uq_payroll_adj_run_leave"),)

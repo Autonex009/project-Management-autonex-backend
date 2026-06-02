@@ -243,6 +243,30 @@ def sync_performance_reviews_schema() -> None:
 
 
 sync_performance_reviews_schema()
+
+
+def sync_payroll_schema() -> None:
+    """Backfill the unpaid_days snapshot column on existing payroll_leave_adjustments tables."""
+    inspector = inspect(engine)
+    try:
+        tables = set(inspector.get_table_names())
+    except Exception:
+        return
+    if "payroll_leave_adjustments" not in tables:
+        return  # create_all() will build it with the column already present
+    try:
+        columns = {column["name"] for column in inspector.get_columns("payroll_leave_adjustments")}
+    except Exception:
+        return
+    if "unpaid_days" in columns:
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text("ALTER TABLE payroll_leave_adjustments ADD COLUMN unpaid_days INTEGER")
+        )
+
+
+sync_payroll_schema()
 seed_skills()
 
 app = FastAPI(title="Autonex Resource Planning Tool V2")

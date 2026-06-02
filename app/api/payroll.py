@@ -12,7 +12,7 @@ caller must pass current_user_id which maps to a user with role=admin).
 import io
 import csv
 from calendar import monthrange
-from datetime import date as date_type
+from datetime import date as date_type, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -25,21 +25,88 @@ from app.models.employee import Employee
 from app.models.leave import Leave
 from app.models.payroll import PayrollLeaveAdjustment, PayrollRun
 from app.models.user import User
+from app.constants.leave_types import (
+    is_non_working_day,
+    normalize_leave_type,
+    get_annual_leave_quota,
+    ANNUAL_LEAVE_QUOTA,
+    get_leave_type_label,
+)
 
 router = APIRouter(prefix="/api/payroll", tags=["payroll"])
-
-WORKING_DAYS_DEFAULT = 22
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _days_in_month(start: date_type, end: date_type, month_start: date_type, month_end: date_type) -> int:
-    """Return count of calendar days a leave overlaps with the given month."""
+def _working_days_in_month(month_start: date_type, month_end: date_type) -> int:
+    """Count working days in the month — excludes weekends and fixed holidays."""
+    count = 0
+    d = month_start
+    while d <= month_end:
+        if not is_non_working_day(d):
+            count += 1
+        d += timedelta(days=1)
+    return count
+
+
+def _working_days_in_month_overlap(start: date_type, end: date_type, month_start: date_type, month_end: date_type) -> int:
+    """Count working days (excl. weekends & fixed holidays) a leave overlaps within the month."""
     effective_start = max(start, month_start)
     effective_end = min(end, month_end)
-    if effective_end < effective_start:
-        return 0
-    return (effective_end - effective_start).days + 1
+    count = 0
+    d = effective_start
+    while d <= effective_end:
+        if not is_non_working_day(d):
+            count += 1
+        d += timedelta(days=1)
+    return count
+
+
+def _working_dates(start: date_type, end: date_type, year: int):
+    """Yield each working date (excl. weekends & fixed holidays) in [start, end] within `year`."""
+    d = start
+    while d <= end:
+        if d.year == year and not is_non_working_day(d):
+            yield d
+        d += timedelta(days=1)
+
+
+def _classify_year_leaves(leaves: list, year: int):
+    """
+    Apply the annual paid-leave entitlement to one employee's approved leaves for a calendar year.
+
+    Walks leaves chronologically; each working day consumes its leave type's annual quota.
+    Days within quota are PAID (no salary impact); days beyond it are UNPAID (deducted).
+    A single leave may straddle the boundary (part paid, part unpaid).
+
+    Returns:
+      classification: {leave_id: {"paid_dates": set, "unpaid_dates": set, "type": str}}
+      balances:       {leave_type: {"quota": int, "used": int, "remaining": int}}
+    """
+    used: dict[str, int] = {}
+    classification: dict[int, dict] = {}
+
+    for leave in sorted(leaves, key=lambda lv: (lv.start_date, lv.id)):
+        ltype = normalize_leave_type(leave.leave_type)
+        quota = get_annual_leave_quota(ltype)
+        paid_dates, unpaid_dates = set(), set()
+        for wd in _working_dates(leave.start_date, leave.end_date, year):
+            used[ltype] = used.get(ltype, 0) + 1
+            if used[ltype] <= quota:
+                paid_dates.add(wd)
+            else:
+                unpaid_dates.add(wd)
+        classification[leave.id] = {"paid_dates": paid_dates, "unpaid_dates": unpaid_dates, "type": ltype}
+
+    balances = {}
+    for ltype, quota in ANNUAL_LEAVE_QUOTA.items():
+        used_days = used.get(ltype, 0)
+        balances[ltype] = {
+            "quota": quota,
+            "used": used_days,
+            "remaining": max(quota - used_days, 0),
+        }
+    return classification, balances
 
 
 def _month_bounds(month: str):
@@ -52,9 +119,15 @@ def _month_bounds(month: str):
     return date_type(year, mo, 1), date_type(year, mo, last_day)
 
 
-def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int, saved_adjustments: dict = None) -> dict:
+def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
+                        balances: dict, saved_adjustments: dict = None) -> dict:
     """
-    saved_adjustments: {leave_id: deduct_bool} — if None, default all to deduct=True.
+    Each leave in `approved_leaves` carries `auto_unpaid_days` (from the annual-quota
+    classifier) and `days_in_month` (working days within the month).
+
+    saved_adjustments: {leave_id: {"deduct": bool, "unpaid_days": int|None}} — a finalized
+    run's snapshot / admin override. When present it wins over the auto classification.
+    When None (live preview), the auto classification is used.
     """
     base = emp.base_salary or 0.0
     per_day = round(base / working_days, 2) if working_days > 0 else 0.0
@@ -65,14 +138,39 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
     for leave in approved_leaves:
         leave_id = leave["leave_id"]
         days = leave["days_in_month"]
-        if saved_adjustments is not None:
-            deduct = saved_adjustments.get(leave_id, True)
+        auto_unpaid = leave.get("auto_unpaid_days", 0)
+
+        snap = saved_adjustments.get(leave_id) if saved_adjustments is not None else None
+        if snap is not None:
+            if snap.get("unpaid_days") is not None:
+                unpaid_days = max(0, min(int(snap["unpaid_days"]), days))
+            else:  # legacy boolean-only row
+                unpaid_days = days if snap.get("deduct", True) else 0
+            source = "manual"
         else:
-            deduct = True   # preview default
-        deduction_amount = round(days * per_day, 2) if deduct else 0.0
-        if deduct:
-            total_deducted_days += days
-        leave_rows.append({**leave, "deduct": deduct, "deduction_amount": deduction_amount})
+            unpaid_days = auto_unpaid
+            source = "auto"
+
+        paid_days = days - unpaid_days
+        deduct = unpaid_days > 0
+        deduction_amount = round(unpaid_days * per_day, 2)
+        if unpaid_days >= days and days > 0:
+            classification = "unpaid"
+        elif unpaid_days == 0:
+            classification = "paid"
+        else:
+            classification = "partial"
+        total_deducted_days += unpaid_days
+
+        leave_rows.append({
+            **leave,
+            "deduct": deduct,
+            "paid_days": paid_days,
+            "unpaid_days": unpaid_days,
+            "classification": classification,
+            "source": source,
+            "deduction_amount": deduction_amount,
+        })
 
     total_deduction = round(total_deducted_days * per_day, 2)
     payable_days = working_days - total_deducted_days
@@ -87,7 +185,9 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
         "working_days": working_days,
         "per_day_rate": per_day,
         "leaves": leave_rows,
+        "leave_balances": balances,
         "total_leave_days": sum(l["days_in_month"] for l in approved_leaves),
+        "total_paid_days": sum(l["paid_days"] for l in leave_rows),
         "total_deducted_days": total_deducted_days,
         "total_deduction": total_deduction,
         "payable_days": payable_days,
@@ -108,29 +208,24 @@ def preview_payroll(
     Employees without a base_salary set are included but flagged.
     """
     month_start, month_end = _month_bounds(month)
+    working_days = _working_days_in_month(month_start, month_end)
+    year = month_start.year
+    year_start, year_end = date_type(year, 1, 1), date_type(year, 12, 31)
 
     employees = db.query(Employee).filter(Employee.status == "active").order_by(Employee.name).all()
 
-    # All approved leaves that overlap with this month
-    all_leaves = db.query(Leave).filter(
+    # Fetch the whole CALENDAR YEAR of approved leaves so the annual paid-leave
+    # entitlement can be applied chronologically (a leave's paid/unpaid split
+    # depends on how much of the year's quota was already consumed before it).
+    year_leaves = db.query(Leave).filter(
         Leave.status == "approved",
-        Leave.start_date <= month_end,
-        Leave.end_date >= month_start,
+        Leave.start_date <= year_end,
+        Leave.end_date >= year_start,
     ).all()
 
     leaves_by_emp = {}
-    for leave in all_leaves:
-        days = _days_in_month(leave.start_date, leave.end_date, month_start, month_end)
-        if days <= 0:
-            continue
-        leaves_by_emp.setdefault(leave.employee_id, []).append({
-            "leave_id": leave.id,
-            "leave_type": leave.leave_type,
-            "start_date": leave.start_date.isoformat(),
-            "end_date": leave.end_date.isoformat(),
-            "days_in_month": days,
-            "reason": leave.reason or "",
-        })
+    for leave in year_leaves:
+        leaves_by_emp.setdefault(leave.employee_id, []).append(leave)
 
     # Check if a finalized run exists for this month
     existing_run = db.query(PayrollRun).filter(PayrollRun.month == month).first()
@@ -139,21 +234,47 @@ def preview_payroll(
         adjs = db.query(PayrollLeaveAdjustment).filter(
             PayrollLeaveAdjustment.payroll_run_id == existing_run.id
         ).all()
-        saved_adjustments = {a.leave_id: a.deduct for a in adjs}
+        saved_adjustments = {a.leave_id: {"deduct": a.deduct, "unpaid_days": a.unpaid_days} for a in adjs}
 
     rows = []
     for emp in employees:
-        emp_leaves = leaves_by_emp.get(emp.id, [])
+        emp_year_leaves = leaves_by_emp.get(emp.id, [])
+        classification, balances = _classify_year_leaves(emp_year_leaves, year)
+
+        # Build rows only for leaves that touch THIS month, scoping the auto
+        # paid/unpaid day counts to the month being run.
+        month_leaves = []
+        for leave in sorted(emp_year_leaves, key=lambda lv: (lv.start_date, lv.id)):
+            if leave.start_date > month_end or leave.end_date < month_start:
+                continue
+            cls = classification.get(leave.id, {"paid_dates": set(), "unpaid_dates": set()})
+            paid_in_month = sum(1 for d in cls["paid_dates"] if month_start <= d <= month_end)
+            unpaid_in_month = sum(1 for d in cls["unpaid_dates"] if month_start <= d <= month_end)
+            days_in_month = paid_in_month + unpaid_in_month
+            if days_in_month <= 0:
+                continue
+            month_leaves.append({
+                "leave_id": leave.id,
+                "leave_type": leave.leave_type,
+                "leave_type_label": get_leave_type_label(leave.leave_type),
+                "start_date": leave.start_date.isoformat(),
+                "end_date": leave.end_date.isoformat(),
+                "days_in_month": days_in_month,
+                "auto_unpaid_days": unpaid_in_month,
+                "reason": leave.reason or "",
+            })
+
         row = _build_employee_row(
-            emp, emp_leaves, WORKING_DAYS_DEFAULT,
-            saved_adjustments if existing_run else None
+            emp, month_leaves, working_days, balances,
+            saved_adjustments if existing_run else None,
         )
         row["salary_missing"] = emp.base_salary is None
         rows.append(row)
 
     return {
         "month": month,
-        "working_days": WORKING_DAYS_DEFAULT,
+        "working_days": working_days,
+        "annual_leave_quota": ANNUAL_LEAVE_QUOTA,
         "run_status": existing_run.status if existing_run else None,
         "run_id": existing_run.id if existing_run else None,
         "employees": rows,
@@ -164,6 +285,7 @@ class LeaveAdjustmentIn(BaseModel):
     employee_id: int
     leave_id: int
     deduct: bool
+    unpaid_days: Optional[int] = None   # snapshot of unpaid working-days; preserves partial classifications
 
 
 class SavePayrollBody(BaseModel):
@@ -183,11 +305,15 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
     if body.status not in ("draft", "finalized"):
         raise HTTPException(status_code=422, detail="status must be 'draft' or 'finalized'")
 
+    month_start, month_end = _month_bounds(body.month)
+    working_days = _working_days_in_month(month_start, month_end)
+
     run = db.query(PayrollRun).filter(PayrollRun.month == body.month).first()
     if run:
         if run.status == "finalized" and body.status != "finalized":
             raise HTTPException(status_code=400, detail="Payroll already finalized for this month")
         run.status = body.status
+        run.working_days = working_days
         run.notes = body.notes
         run.processed_by = body.processed_by
         # Delete existing adjustments and re-insert
@@ -198,7 +324,7 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
         run = PayrollRun(
             month=body.month,
             status=body.status,
-            working_days=WORKING_DAYS_DEFAULT,
+            working_days=working_days,
             notes=body.notes,
             processed_by=body.processed_by,
         )
@@ -211,6 +337,7 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
             employee_id=adj.employee_id,
             leave_id=adj.leave_id,
             deduct=adj.deduct,
+            unpaid_days=adj.unpaid_days,
         ))
 
     db.commit()
@@ -245,7 +372,7 @@ def export_payroll_csv(
     writer.writerow([
         "Employee", "Designation", "Type",
         "Base Salary (₹)", f"Per Day (₹, ÷{data['working_days']})",
-        "Leave Days", "Deducted Days", "Deduction (₹)", "Final Salary (₹)", "Notes"
+        "Leave Days", "Paid Days", "Unpaid (Deducted) Days", "Deduction (₹)", "Final Salary (₹)", "Notes"
     ])
     for row in data["employees"]:
         writer.writerow([
@@ -255,6 +382,7 @@ def export_payroll_csv(
             row["base_salary"],
             row["per_day_rate"],
             row["total_leave_days"],
+            row.get("total_paid_days", 0),
             row["total_deducted_days"],
             row["total_deduction"],
             row["final_salary"],
