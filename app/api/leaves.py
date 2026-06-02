@@ -131,6 +131,50 @@ def sync_leave_to_razorpay(employee: Employee, leave: Leave) -> None:
         current_date += timedelta(days=1)
 
 
+def build_razorpay_clear_request(employee: Employee, date_value, remarks: str) -> dict:
+    """Build a request that resets a day's attendance back to 'present' (removes the leave)."""
+    if not employee.razorpay_email:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Razorpay Email is missing for {employee.name}",
+        )
+
+    return {
+        "request": {
+            "type": "attendance",
+            "sub-type": "modify",
+        },
+        "data": {
+            "email": employee.razorpay_email,
+            "employee-type": "employee",
+            "date": date_value.isoformat(),
+            "status": "present",
+            "remarks": remarks,
+        },
+    }
+
+
+def unsync_leave_from_razorpay(employee: Employee, leave: Leave) -> None:
+    """Reverse a previously-synced leave in Razorpay by resetting each working day to 'present'.
+
+    Mirrors sync_leave_to_razorpay so the same working days that were marked as leave are cleared.
+    Raises HTTPException if Razorpay rejects the request — callers should reverse BEFORE mutating
+    local state so the website and Razorpay never drift out of sync.
+    """
+    remarks = f"Leave cancelled in Autonex ({get_leave_type_label(leave.leave_type)})"
+    current_date = leave.start_date
+
+    while current_date <= leave.end_date:
+        if not is_weekend(current_date) and not is_fixed_holiday(current_date):
+            request_body = build_razorpay_clear_request(
+                employee=employee,
+                date_value=current_date,
+                remarks=remarks,
+            )
+            post_razorpay_attendance(request_body)
+        current_date += timedelta(days=1)
+
+
 def _date_ranges_overlap(start_a, end_a, start_b, end_b) -> bool:
     return start_a <= end_b and start_b <= end_a
 
@@ -618,6 +662,16 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
                 )
             check_date += timedelta(days=1)
 
+    # If this leave was already pushed to Razorpay, clear the ORIGINAL dates there before
+    # editing. It returns to pending and will be re-synced when re-approved. Reverse first so
+    # a Razorpay failure aborts the edit and the two systems never drift apart.
+    if leave.razorpay_applied:
+        employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+        if not employee:
+            raise HTTPException(status_code=404, detail="Employee not found")
+        unsync_leave_from_razorpay(employee, leave)  # uses the current (pre-edit) dates
+        leave.razorpay_applied = False
+
     leave.start_date = payload.start_date
     leave.end_date = payload.end_date
     leave.leave_type = payload.leave_type
@@ -730,6 +784,12 @@ def reject_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
+    # If a previously-approved leave was already pushed to Razorpay, reverse it there
+    # before rejecting so the two systems stay in sync. A Razorpay failure aborts the reject.
+    if leave.razorpay_applied:
+        unsync_leave_from_razorpay(employee, leave)
+        leave.razorpay_applied = False
+
     leave.status = "rejected"
     leave.approved_by = approved_by
     db.commit()
@@ -768,6 +828,15 @@ def delete_leave(leave_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Leave not found")
     if leave.start_date <= date_type.today():
         raise HTTPException(status_code=400, detail="Cannot delete a leave that has already started")
+
+    # If this leave was pushed to Razorpay, reverse it there FIRST. If Razorpay rejects,
+    # the raised HTTPException aborts the delete so the website and Razorpay stay in sync.
+    if leave.razorpay_applied:
+        employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+        if not employee:
+            raise HTTPException(status_code=404, detail="Employee not found")
+        unsync_leave_from_razorpay(employee, leave)
+
     db.delete(leave)
     db.commit()
     return {"message": "Leave deleted successfully"}
