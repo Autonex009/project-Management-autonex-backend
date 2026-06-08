@@ -66,7 +66,7 @@
 #     class Config:
 #         from_attributes = True
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional
 from datetime import date, datetime
 
@@ -141,10 +141,27 @@ class ProjectResponse(ProjectBase):
     id: int
     required_manpower: int = 0
     allocated_employees: int = 0
-    project_status: str
+    project_status: str = "active"
 
     created_at: datetime
     updated_at: datetime
+
+    # Some daily_sheets rows have NULLs in these columns (legacy / non-ORM insert paths).
+    # Coerce None -> sensible defaults so one bad row can't 500 the whole list endpoint.
+    @field_validator("required_expertise", mode="before")
+    @classmethod
+    def _expertise_default(cls, v):
+        return [] if v is None else v
+
+    @field_validator("required_manpower", "allocated_employees", mode="before")
+    @classmethod
+    def _int_default(cls, v):
+        return 0 if v is None else v
+
+    @field_validator("project_status", mode="before")
+    @classmethod
+    def _status_default(cls, v):
+        return "active" if v is None else v
 
     class Config:
         from_attributes = True
