@@ -30,6 +30,8 @@ from app.constants.leave_types import (
     normalize_leave_type,
     get_annual_leave_quota,
     ANNUAL_LEAVE_QUOTA,
+    INTERN_MONTHLY_PAID_QUOTA,
+    is_intern,
     get_leave_type_label,
 )
 
@@ -71,40 +73,67 @@ def _working_dates(start: date_type, end: date_type, year: int):
         d += timedelta(days=1)
 
 
-def _classify_year_leaves(leaves: list, year: int):
+def _classify_year_leaves(leaves: list, year: int, intern: bool = False):
     """
-    Apply the annual paid-leave entitlement to one employee's approved leaves for a calendar year.
+    Apply the paid-leave entitlement to one employee's approved leaves for a calendar year.
 
-    Walks leaves chronologically; each working day consumes its leave type's annual quota.
+    Walks leaves chronologically; each working day consumes its leave type's quota.
     Days within quota are PAID (no salary impact); days beyond it are UNPAID (deducted).
     A single leave may straddle the boundary (part paid, part unpaid).
 
+    Entitlement differs by employee type:
+      • Employees: annual quota per leave type (ANNUAL_LEAVE_QUOTA), consumed over the year.
+      • Interns:   PAID leave accrues MONTHLY (INTERN_MONTHLY_PAID_QUOTA per calendar month,
+                   resetting each month); casual_sick / floater keep the same annual quotas.
+
     Returns:
       classification: {leave_id: {"paid_dates": set, "unpaid_dates": set, "type": str}}
-      balances:       {leave_type: {"quota": int, "used": int, "remaining": int}}
+      balances:       {leave_type: {"quota": int, "used": int, "remaining": int, "period": str}}
+                      For interns the "paid" balance is monthly; preview_payroll scopes it to
+                      the month being run.
     """
-    used: dict[str, int] = {}
+    used: dict[str, int] = {}                       # annual usage (employees; intern non-paid)
+    used_paid_by_month: dict[tuple, int] = {}       # (year, month) -> intern paid days used
     classification: dict[int, dict] = {}
 
     for leave in sorted(leaves, key=lambda lv: (lv.start_date, lv.id)):
         ltype = normalize_leave_type(leave.leave_type)
-        quota = get_annual_leave_quota(ltype)
         paid_dates, unpaid_dates = set(), set()
         for wd in _working_dates(leave.start_date, leave.end_date, year):
-            used[ltype] = used.get(ltype, 0) + 1
-            if used[ltype] <= quota:
-                paid_dates.add(wd)
+            if intern and ltype == "paid":
+                # Monthly entitlement that resets each calendar month.
+                key = (wd.year, wd.month)
+                used_paid_by_month[key] = used_paid_by_month.get(key, 0) + 1
+                if used_paid_by_month[key] <= INTERN_MONTHLY_PAID_QUOTA:
+                    paid_dates.add(wd)
+                else:
+                    unpaid_dates.add(wd)
             else:
-                unpaid_dates.add(wd)
+                quota = get_annual_leave_quota(ltype)
+                used[ltype] = used.get(ltype, 0) + 1
+                if used[ltype] <= quota:
+                    paid_dates.add(wd)
+                else:
+                    unpaid_dates.add(wd)
         classification[leave.id] = {"paid_dates": paid_dates, "unpaid_dates": unpaid_dates, "type": ltype}
 
     balances = {}
     for ltype, quota in ANNUAL_LEAVE_QUOTA.items():
+        if intern and ltype == "paid":
+            # Monthly entitlement — month-scoped figures are filled in by preview_payroll.
+            balances[ltype] = {
+                "quota": INTERN_MONTHLY_PAID_QUOTA,
+                "used": 0,
+                "remaining": INTERN_MONTHLY_PAID_QUOTA,
+                "period": "month",
+            }
+            continue
         used_days = used.get(ltype, 0)
         balances[ltype] = {
             "quota": quota,
             "used": used_days,
             "remaining": max(quota - used_days, 0),
+            "period": "year",
         }
     return classification, balances
 
@@ -239,7 +268,24 @@ def preview_payroll(
     rows = []
     for emp in employees:
         emp_year_leaves = leaves_by_emp.get(emp.id, [])
-        classification, balances = _classify_year_leaves(emp_year_leaves, year)
+        emp_is_intern = is_intern(emp.employee_type)
+        classification, balances = _classify_year_leaves(emp_year_leaves, year, emp_is_intern)
+
+        # Interns' paid leave is monthly — report the balance for THIS month.
+        if emp_is_intern and "paid" in balances:
+            paid_used_month = sum(
+                1
+                for cls in classification.values()
+                if cls["type"] == "paid"
+                for d in cls["paid_dates"]
+                if month_start <= d <= month_end
+            )
+            balances["paid"] = {
+                "quota": INTERN_MONTHLY_PAID_QUOTA,
+                "used": paid_used_month,
+                "remaining": max(INTERN_MONTHLY_PAID_QUOTA - paid_used_month, 0),
+                "period": "month",
+            }
 
         # Build rows only for leaves that touch THIS month, scoping the auto
         # paid/unpaid day counts to the month being run.

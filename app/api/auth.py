@@ -61,6 +61,7 @@ class UserResponse(BaseModel):
     role: str
     designation: Optional[str] = None
     employee_id: Optional[int] = None
+    employee_type: Optional[str] = None
     skills: Optional[list] = None
 
     class Config:
@@ -90,12 +91,17 @@ DESIGNATION_ACCESS = {
 }
 
 
-def get_user_designation(user: User, db: Session) -> Optional[str]:
+def _lookup_employee(user: User, db: Session) -> Optional[Employee]:
     employee = None
     if user.employee_id:
         employee = db.query(Employee).filter(Employee.id == user.employee_id).first()
     if employee is None:
         employee = db.query(Employee).filter(Employee.email == user.email).first()
+    return employee
+
+
+def get_user_designation(user: User, db: Session) -> Optional[str]:
+    employee = _lookup_employee(user, db)
     if employee and employee.designation:
         return employee.designation
     if user.role == "admin":
@@ -110,6 +116,7 @@ def get_access_role(designation: Optional[str], fallback_role: str) -> str:
 def build_user_response(user: User, db: Session) -> UserResponse:
     designation = get_user_designation(user, db)
     access_role = get_access_role(designation, user.role)
+    employee = _lookup_employee(user, db)
     return UserResponse(
         id=user.id,
         name=user.name,
@@ -117,6 +124,7 @@ def build_user_response(user: User, db: Session) -> UserResponse:
         role=access_role,
         designation=designation,
         employee_id=user.employee_id,
+        employee_type=employee.employee_type if employee else None,
         skills=user.skills,
     )
 

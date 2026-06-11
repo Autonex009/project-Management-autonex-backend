@@ -46,6 +46,19 @@ def get_annual_leave_quota(leave_type: str) -> int:
     return ANNUAL_LEAVE_QUOTA.get(normalize_leave_type(leave_type), 0)
 
 
+# ── Intern paid-leave entitlement ───────────────────────────────────
+# Interns accrue paid leave MONTHLY, not annually: 1 paid working-day per
+# calendar month (resets each month). Days beyond that become UNPAID. Other
+# leave types (casual_sick, floater) follow the same annual quotas as employees.
+INTERN_EMPLOYEE_TYPE = "Intern"
+INTERN_MONTHLY_PAID_QUOTA = 1
+
+
+def is_intern(employee_type: str | None) -> bool:
+    """True if the employee_type denotes an intern (case/space-insensitive)."""
+    return (employee_type or "").strip().lower() == "intern"
+
+
 # ── Approved floater holiday dates (2026) ───────────────────────────
 # Employees may only apply Floater Leave on these specific dates.
 FLOATER_DATES_2026: frozenset[date] = frozenset([
