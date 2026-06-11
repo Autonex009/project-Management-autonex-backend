@@ -149,6 +149,27 @@ class RecommendationEngine:
             Allocation.sub_project_id == project_id
         ).all()
         
+        # Capacity needs a finite timeline; open-ended sub-projects (no end date)
+        # can't be scheduled, so report a neutral "no_end_date" status instead of
+        # crashing on date arithmetic.
+        if not project.end_date:
+            return {
+                "project_id": project_id,
+                "project_name": project.name,
+                "status": "no_end_date",
+                "message": "Set an end date for this sub-project to compute capacity.",
+                "total_estimated_hours": round((project.total_tasks or 0) * (project.estimated_time_per_task or 0), 1),
+                "net_capacity": 0,
+                "working_days": 0,
+                "total_calendar_days": 0,
+                "utilization_ratio": 0,
+                "avg_daily_hours_per_employee": 0,
+                "team_size": len(allocations),
+                "leaves_impact": 0,
+                "leave_impact_details": [],
+                "replacement_suggestions": [],
+            }
+
         working_days = self._get_working_days(project.start_date, project.end_date)
         total_working_days = len(working_days)
         total_estimated_hours = project.total_tasks * project.estimated_time_per_task
@@ -373,7 +394,7 @@ class RecommendationEngine:
         
         for project in projects:
             result = self.calculate_project_capacity(project.id)
-            if "error" not in result:
+            if "error" not in result and result.get("status") != "no_end_date":
                 summary = {
                     "project_id": project.id,
                     "project_name": project.name,

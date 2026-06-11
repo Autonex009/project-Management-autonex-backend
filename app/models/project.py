@@ -38,7 +38,7 @@ class DailySheet(Base):
     assigned_employee_ids = Column(JSON, nullable=True, default=[])
 
     start_date = Column(Date, nullable=False)
-    end_date = Column(Date, nullable=False)
+    end_date = Column(Date, nullable=True)  # optional: open-ended sub-projects have no end date
 
     daily_target = Column(Integer, default=0)
     project_duration_weeks = Column(Integer, nullable=True)

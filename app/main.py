@@ -231,6 +231,31 @@ def sync_wfh_end_date_schema() -> None:
 sync_wfh_end_date_schema()
 
 
+def sync_daily_sheets_end_date_nullable() -> None:
+    """Relax daily_sheets.end_date to allow NULL (sub-projects may be open-ended).
+
+    Idempotent: only runs the ALTER when the column is still NOT NULL. Wrapped in
+    try/except so engines that don't support the ALTER (e.g. local SQLite) don't
+    block startup — the model definition handles freshly-created tables there.
+    """
+    inspector = inspect(engine)
+    try:
+        columns = {c["name"]: c for c in inspector.get_columns("daily_sheets")}
+    except Exception:
+        return
+    end_date_col = columns.get("end_date")
+    if end_date_col is None or end_date_col.get("nullable", True):
+        return
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE daily_sheets ALTER COLUMN end_date DROP NOT NULL"))
+    except Exception:
+        pass
+
+
+sync_daily_sheets_end_date_nullable()
+
+
 def sync_performance_reviews_schema() -> None:
     """Create the performance_reviews table on existing databases if missing."""
     inspector = inspect(engine)

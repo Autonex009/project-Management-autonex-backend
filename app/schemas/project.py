@@ -89,7 +89,7 @@ class ProjectBase(BaseModel):
     previous_sub_project_id: Optional[int] = None
 
     start_date: date
-    end_date: date
+    end_date: Optional[date] = None  # optional — open-ended sub-projects have no end date
 
     daily_target: Optional[int] = Field(0, ge=0)
 
