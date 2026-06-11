@@ -522,7 +522,10 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
     )
 
     duration_days = (leave.end_date - leave.start_date).days + 1
-    pm_targets = _get_pm_notification_targets(db, employee, leave)
+    # PMs route their own leave requests straight to Admin for approval. Everyone
+    # else routes to the PM(s) of their allocated projects, falling back to Admin.
+    is_pm_applicant = emp_user is not None and emp_user.role == "pm"
+    pm_targets = [] if is_pm_applicant else _get_pm_notification_targets(db, employee, leave)
     notification_targets = pm_targets if pm_targets else _get_admin_notification_targets(db)
     notified_user_ids: set[int] = set()
     for target in notification_targets:
