@@ -215,6 +215,29 @@ def sync_employee_salary_schema() -> None:
 sync_employee_salary_schema()
 
 
+def sync_employee_conversion_schema() -> None:
+    """Add intern→full-time conversion audit columns to existing employee tables."""
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns("employees")}
+    except Exception:
+        return
+    statements = []
+    if "previous_employee_type" not in columns:
+        statements.append("ALTER TABLE employees ADD COLUMN previous_employee_type TEXT")
+    if "converted_to_fulltime_at" not in columns:
+        statements.append("ALTER TABLE employees ADD COLUMN converted_to_fulltime_at TIMESTAMP")
+    if "converted_by" not in columns:
+        statements.append("ALTER TABLE employees ADD COLUMN converted_by INTEGER")
+    if statements:
+        with engine.begin() as connection:
+            for stmt in statements:
+                connection.execute(text(stmt))
+
+
+sync_employee_conversion_schema()
+
+
 def sync_wfh_end_date_schema() -> None:
     """Add end_date column to wfh_requests and backfill existing rows."""
     inspector = inspect(engine)

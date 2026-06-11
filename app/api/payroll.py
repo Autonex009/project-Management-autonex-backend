@@ -73,7 +73,7 @@ def _working_dates(start: date_type, end: date_type, year: int):
         d += timedelta(days=1)
 
 
-def _classify_year_leaves(leaves: list, year: int, intern: bool = False):
+def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_until: date_type | None = None):
     """
     Apply the paid-leave entitlement to one employee's approved leaves for a calendar year.
 
@@ -85,6 +85,10 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False):
       • Employees: annual quota per leave type (ANNUAL_LEAVE_QUOTA), consumed over the year.
       • Interns:   PAID leave accrues MONTHLY (INTERN_MONTHLY_PAID_QUOTA per calendar month,
                    resetting each month); casual_sick / floater keep the same annual quotas.
+
+    `intern_until` preserves history across an intern→full-time promotion: when set,
+    PAID days BEFORE that date use the monthly intern rule and days ON/AFTER it use the
+    annual quota — so a promotion never retroactively reclassifies leave already taken.
 
     Returns:
       classification: {leave_id: {"paid_dates": set, "unpaid_dates": set, "type": str}}
@@ -100,7 +104,8 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False):
         ltype = normalize_leave_type(leave.leave_type)
         paid_dates, unpaid_dates = set(), set()
         for wd in _working_dates(leave.start_date, leave.end_date, year):
-            if intern and ltype == "paid":
+            use_monthly = ltype == "paid" and (intern or (intern_until is not None and wd < intern_until))
+            if use_monthly:
                 # Monthly entitlement that resets each calendar month.
                 key = (wd.year, wd.month)
                 used_paid_by_month[key] = used_paid_by_month.get(key, 0) + 1
@@ -269,7 +274,9 @@ def preview_payroll(
     for emp in employees:
         emp_year_leaves = leaves_by_emp.get(emp.id, [])
         emp_is_intern = is_intern(emp.employee_type)
-        classification, balances = _classify_year_leaves(emp_year_leaves, year, emp_is_intern)
+        # A promoted intern keeps the monthly rule for leave taken before the promotion.
+        intern_until = emp.converted_to_fulltime_at.date() if emp.converted_to_fulltime_at else None
+        classification, balances = _classify_year_leaves(emp_year_leaves, year, emp_is_intern, intern_until)
 
         # Interns' paid leave is monthly — report the balance for THIS month.
         if emp_is_intern and "paid" in balances:

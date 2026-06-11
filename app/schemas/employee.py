@@ -79,6 +79,9 @@ class EmployeeUpdate(BaseModel):
 
 class EmployeeResponse(EmployeeBase):
     id: int
+    previous_employee_type: Optional[str] = None
+    converted_to_fulltime_at: Optional[datetime] = None
+    converted_by: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 

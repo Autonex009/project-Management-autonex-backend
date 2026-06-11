@@ -32,7 +32,15 @@ class Employee(Base):
     base_salary = Column(Float, nullable=True)
 
     status = Column(Text, default="active")  # active, inactive, on-leave
-    
+
+    # ── Intern → Full-time conversion audit ──────────────────────────
+    # Set when an intern is promoted in-place to a full-time employee. The
+    # timestamp also acts as the cutoff for payroll: paid leave taken BEFORE it
+    # keeps the monthly intern entitlement; leave on/after it uses the annual quota.
+    previous_employee_type = Column(Text, nullable=True)
+    converted_to_fulltime_at = Column(TIMESTAMP, nullable=True)
+    converted_by = Column(Integer, nullable=True)  # user_id of the admin who promoted
+
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(
         TIMESTAMP,

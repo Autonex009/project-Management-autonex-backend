@@ -1,13 +1,17 @@
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.database import get_db
+from app.constants.leave_types import is_intern
 from app.models.allocation import Allocation
 from app.models.employee import Employee
 from app.models.leave import Leave
+from app.models.notification import Notification
 from app.models.side_project import SideProject
 from app.models.user import User
 from app.models.wfh import WFHRequest
@@ -128,6 +132,64 @@ def update_employee(
         linked_user.role = get_user_role_from_designation(employee.designation)
         linked_user.skills = employee.skills or []
     
+    db.commit()
+    db.refresh(employee)
+    return employee
+
+
+class ConvertToFulltimeBody(BaseModel):
+    converted_by: Optional[int] = None   # user_id of the admin performing the promotion
+    designation: Optional[str] = None    # optionally update designation on promotion
+
+
+# ✅ CONVERT INTERN → FULL-TIME (in place — preserves all linked history)
+@router.post("/{employee_id}/convert-to-fulltime", response_model=EmployeeResponse)
+def convert_to_fulltime(
+    employee_id: int,
+    body: ConvertToFulltimeBody = ConvertToFulltimeBody(),
+    db: Session = Depends(get_db),
+):
+    """Promote an intern to a full-time employee WITHOUT creating a new record.
+
+    The same employee row is updated in place, so every linked record (leaves,
+    WFH, payroll, performance, allocations, documents, …) is preserved unchanged.
+    Only employment type (and optionally designation) changes; full-time leave
+    policy then applies automatically via employee_type. The promotion is audited
+    via converted_to_fulltime_at / converted_by / previous_employee_type.
+    """
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    if not is_intern(employee.employee_type):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only interns can be converted to full-time (current type: {employee.employee_type}).",
+        )
+
+    employee.previous_employee_type = employee.employee_type
+    employee.employee_type = "Full-time"
+    employee.converted_to_fulltime_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    employee.converted_by = body.converted_by
+    if body.designation:
+        employee.designation = body.designation
+
+    # Keep the linked auth user's role in sync (designation may have changed).
+    linked_user = db.query(User).filter(User.employee_id == employee.id).first()
+    if linked_user:
+        linked_user.role = get_user_role_from_designation(employee.designation)
+        # In-app audit/notification for the employee.
+        db.add(Notification(
+            user_id=linked_user.id,
+            title="Converted to Full-time",
+            message=(
+                f"Your employment type has been updated to Full-time"
+                f"{f' ({employee.designation})' if employee.designation else ''}. "
+                "Full-time leave entitlements now apply."
+            ),
+            type="employee_converted",
+        ))
+
     db.commit()
     db.refresh(employee)
     return employee
