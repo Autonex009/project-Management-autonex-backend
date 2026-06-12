@@ -11,11 +11,13 @@ caller must pass current_user_id which maps to a user with role=admin).
 """
 import io
 import csv
+import os
+import hmac
 from calendar import monthrange
 from datetime import date as date_type, timedelta
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -36,7 +38,33 @@ from app.constants.leave_types import (
 )
 from app.services.salary_crypto import decrypt_salary
 
-router = APIRouter(prefix="/api/payroll", tags=["payroll"])
+
+def require_payroll_passcode(
+    x_payroll_passcode: Optional[str] = Header(default=None),
+    passcode: Optional[str] = Query(default=None),  # query fallback for the CSV download link
+):
+    """Gate every payroll endpoint behind a shared passcode.
+
+    The expected value lives only in the PAYROLL_PASSCODE env var (a sensitive
+    secret set on the production deployment). If it's unset, the gate is DISABLED
+    (dev convenience — local DBs hold no real salaries). When set, requests must
+    supply it via the X-Payroll-Passcode header (or ?passcode= for downloads),
+    otherwise the API returns 401 — so payroll data is unreachable, UI or not.
+    """
+    expected = (os.getenv("PAYROLL_PASSCODE") or "").strip()
+    if not expected:
+        return
+    provided = x_payroll_passcode or passcode or ""
+    if not hmac.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="Invalid or missing payroll passcode")
+
+
+# Passcode dependency applies to ALL routes on this router.
+router = APIRouter(
+    prefix="/api/payroll",
+    tags=["payroll"],
+    dependencies=[Depends(require_payroll_passcode)],
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
