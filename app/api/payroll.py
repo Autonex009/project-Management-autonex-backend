@@ -13,6 +13,7 @@ import io
 import csv
 import os
 import hmac
+import hashlib
 from calendar import monthrange
 from datetime import date as date_type, timedelta
 from typing import List, Optional
@@ -45,17 +46,19 @@ def require_payroll_passcode(
 ):
     """Gate every payroll endpoint behind a shared passcode.
 
-    The expected value lives only in the PAYROLL_PASSCODE env var (a sensitive
-    secret set on the production deployment). If it's unset, the gate is DISABLED
-    (dev convenience — local DBs hold no real salaries). When set, requests must
-    supply it via the X-Payroll-Passcode header (or ?passcode= for downloads),
-    otherwise the API returns 401 — so payroll data is unreachable, UI or not.
+    Only the SHA-256 HASH of the passcode is stored (in the PAYROLL_PASSCODE_HASH
+    env var, a sensitive secret on the production deployment) — never the passcode
+    itself, so the stored value can't be reversed. Requests supply the plaintext
+    passcode via the X-Payroll-Passcode header (or ?passcode= for downloads); the
+    server hashes it and compares in constant time. If the hash env var is unset,
+    the gate is DISABLED (dev convenience — local DBs hold no real salaries).
     """
-    expected = (os.getenv("PAYROLL_PASSCODE") or "").strip()
-    if not expected:
+    expected_hash = (os.getenv("PAYROLL_PASSCODE_HASH") or "").strip().lower()
+    if not expected_hash:
         return
     provided = x_payroll_passcode or passcode or ""
-    if not hmac.compare_digest(provided, expected):
+    provided_hash = hashlib.sha256(provided.encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(provided_hash, expected_hash):
         raise HTTPException(status_code=401, detail="Invalid or missing payroll passcode")
 
 

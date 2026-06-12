@@ -9,6 +9,11 @@ import os
 os.environ.pop("SLACK_BOT_TOKEN", None)
 
 import sys
+import hashlib
+
+# Server stores only the SHA-256 hash; clients send the plaintext passcode.
+PASSCODE = "s3cret-pay"
+PASSCODE_HASH = hashlib.sha256(PASSCODE.encode()).hexdigest()
 
 import pytest
 from fastapi import FastAPI
@@ -64,34 +69,34 @@ def client():
 
 
 def test_gate_disabled_when_passcode_unset(client, monkeypatch):
-    monkeypatch.delenv("PAYROLL_PASSCODE", raising=False)
+    monkeypatch.delenv("PAYROLL_PASSCODE_HASH", raising=False)
     r = client.get("/api/payroll/preview", params={"month": "2026-06"})
     assert r.status_code == 200, r.text          # open in dev (no passcode configured)
 
 
 def test_blocks_without_passcode_when_set(client, monkeypatch):
-    monkeypatch.setenv("PAYROLL_PASSCODE", "s3cret-pay")
+    monkeypatch.setenv("PAYROLL_PASSCODE_HASH", PASSCODE_HASH)
     r = client.get("/api/payroll/preview", params={"month": "2026-06"})
     assert r.status_code == 401
 
 
 def test_blocks_with_wrong_passcode(client, monkeypatch):
-    monkeypatch.setenv("PAYROLL_PASSCODE", "s3cret-pay")
+    monkeypatch.setenv("PAYROLL_PASSCODE_HASH", PASSCODE_HASH)
     r = client.get("/api/payroll/preview", params={"month": "2026-06"},
                    headers={"X-Payroll-Passcode": "wrong"})
     assert r.status_code == 401
 
 
 def test_allows_with_correct_passcode_header(client, monkeypatch):
-    monkeypatch.setenv("PAYROLL_PASSCODE", "s3cret-pay")
+    monkeypatch.setenv("PAYROLL_PASSCODE_HASH", PASSCODE_HASH)
     r = client.get("/api/payroll/preview", params={"month": "2026-06"},
-                   headers={"X-Payroll-Passcode": "s3cret-pay"})
+                   headers={"X-Payroll-Passcode": PASSCODE})
     assert r.status_code == 200, r.text
 
 
 def test_csv_allows_passcode_via_query(client, monkeypatch):
-    monkeypatch.setenv("PAYROLL_PASSCODE", "s3cret-pay")
+    monkeypatch.setenv("PAYROLL_PASSCODE_HASH", PASSCODE_HASH)
     blocked = client.get("/api/payroll/export.csv", params={"month": "2026-06"})
     assert blocked.status_code == 401
-    ok = client.get("/api/payroll/export.csv", params={"month": "2026-06", "passcode": "s3cret-pay"})
+    ok = client.get("/api/payroll/export.csv", params={"month": "2026-06", "passcode": PASSCODE})
     assert ok.status_code == 200, ok.text
