@@ -24,6 +24,40 @@ from urllib.parse import urlparse
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 
+
+def _forbidden_hosts() -> set:
+    """Hosts this tool must NEVER scrub — auto-derived so prod is blocked by default.
+
+    Sources: PROD_DB_HOST env (comma-separated), the DATABASE_URL env, and any
+    DATABASE_URL found in local .env / .env.production / .env.local. Because the
+    project owner's machine has the prod URL in .env.production, the prod host is
+    blocked automatically — no flag to remember.
+    """
+    hosts = set()
+    for h in (os.getenv("PROD_DB_HOST") or "").split(","):
+        if h.strip():
+            hosts.add(h.strip())
+    candidates = [os.getenv("DATABASE_URL")]
+    for fname in (".env", ".env.production", ".env.local"):
+        try:
+            with open(fname) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("DATABASE_URL") and "=" in line:
+                        candidates.append(line.split("=", 1)[1].strip().strip('"').strip("'"))
+        except FileNotFoundError:
+            pass
+    for c in candidates:
+        if not c:
+            continue
+        try:
+            h = urlparse(c.strip()).hostname
+            if h:
+                hosts.add(h)
+        except Exception:
+            pass
+    return hosts
+
 # Obvious example/placeholder fragments — if the URL still contains these, the
 # user pasted the sample instead of their real connection string.
 PLACEHOLDER_TOKENS = ("user:pass", "ep-xxxx", "ep-xxx", "<", ">", "example.com", "dev-branch-url")
@@ -57,9 +91,12 @@ def main() -> None:
             "connection string in quotes."
         )
 
-    prod_guard = (os.getenv("PROD_DB_HOST") or "").strip()
-    if prod_guard and prod_guard in host:
-        sys.exit(f"REFUSING: target host '{host}' matches PROD_DB_HOST. This tool is dev-only.")
+    forbidden = _forbidden_hosts()
+    if host in forbidden:
+        sys.exit(
+            f"REFUSING: '{host}' is a configured PRODUCTION database — this tool is dev-only.\n"
+            "Point --url at a separate dev/staging branch with a DIFFERENT host."
+        )
 
     print(f"Target database host: {host}")
     if not args.yes:
