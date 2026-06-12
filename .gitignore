@@ -40,6 +40,11 @@ env/
 .mypy_cache/
 pip-wheel-metadata/
 
+# Node (stray npm installs in the Python backend dir)
+node_modules/
+package.json
+package-lock.json
+
 # OS files
 .DS_Store
 Thumbs.db
@@ -54,9 +59,8 @@ seed_admin.py
 sync_excel_full.py
 sync_roles_to_tables.py
 
-# Unused model stubs
-app/models/admin.py
-app/models/product_manager.py
+# NOTE: app/models/admin.py and app/models/product_manager.py are real source
+# (imported by the test suite) and ARE tracked — do not ignore them.
 
 # Local test scripts
 test_auth_e2e.py
