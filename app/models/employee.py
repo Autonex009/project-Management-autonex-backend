@@ -28,8 +28,11 @@ class Employee(Base):
     
     productivity_baseline = Column(Float, nullable=False, default=1.0)
 
-    # Monthly base salary (CTC) — used for payroll calculation
+    # Monthly base salary (CTC) — used for payroll calculation.
+    # Stored ENCRYPTED in base_salary_enc; the plaintext column is retired (kept
+    # only for the migration and always left NULL). See services/salary_crypto.py.
     base_salary = Column(Float, nullable=True)
+    base_salary_enc = Column(Text, nullable=True)
 
     status = Column(Text, default="active")  # active, inactive, on-leave
 

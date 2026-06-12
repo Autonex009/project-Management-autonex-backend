@@ -34,6 +34,7 @@ from app.constants.leave_types import (
     is_intern,
     get_leave_type_label,
 )
+from app.services.salary_crypto import decrypt_salary
 
 router = APIRouter(prefix="/api/payroll", tags=["payroll"])
 
@@ -163,7 +164,7 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
     run's snapshot / admin override. When present it wins over the auto classification.
     When None (live preview), the auto classification is used.
     """
-    base = emp.base_salary or 0.0
+    base = decrypt_salary(emp.base_salary_enc) or 0.0
     per_day = round(base / working_days, 2) if working_days > 0 else 0.0
 
     leave_rows = []
@@ -321,7 +322,7 @@ def preview_payroll(
             emp, month_leaves, working_days, balances,
             saved_adjustments if existing_run else None,
         )
-        row["salary_missing"] = emp.base_salary is None
+        row["salary_missing"] = decrypt_salary(emp.base_salary_enc) is None
         rows.append(row)
 
     return {

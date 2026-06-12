@@ -7,6 +7,9 @@ paid balance is monthly.
 """
 import os
 os.environ.pop("SLACK_BOT_TOKEN", None)
+# Salary is encrypted at rest; the payroll path needs the key to read it.
+from cryptography.fernet import Fernet
+os.environ["SALARY_KEY"] = Fernet.generate_key().decode()
 
 import sys
 from datetime import date
@@ -70,8 +73,9 @@ def client_and_db():
 
 def test_intern_second_monthly_paid_leave_is_deducted(client_and_db):
     client, db = client_and_db
+    from app.services.salary_crypto import encrypt_salary
     intern = Employee(name="Ira Intern", email="ira@x.com", employee_type="Intern",
-                      status="active", base_salary=22000.0)
+                      status="active", base_salary_enc=encrypt_salary(22000.0))
     db.add(intern)
     db.commit()
     db.refresh(intern)

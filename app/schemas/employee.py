@@ -42,7 +42,6 @@ class EmployeeBase(BaseModel):
     skills: Optional[List[str]] = []
     productivity_baseline: float = Field(1.0, gt=0, le=2.0)
     status: Optional[str] = "active"
-    base_salary: Optional[float] = None
 
     @field_validator("employee_type", mode="before")
     @classmethod
@@ -51,7 +50,10 @@ class EmployeeBase(BaseModel):
 
 
 class EmployeeCreate(EmployeeBase):
-    pass
+    # Write-only: accepted on input, encrypted at rest, and never echoed back
+    # (EmployeeResponse deliberately omits it — salary is only readable via the
+    # admin payroll endpoints).
+    base_salary: Optional[float] = None
 
 
 class EmployeeUpdate(BaseModel):

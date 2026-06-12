@@ -215,6 +215,44 @@ def sync_employee_salary_schema() -> None:
 sync_employee_salary_schema()
 
 
+def sync_salary_encryption_schema() -> None:
+    """Add the encrypted salary column and migrate any plaintext salaries into it.
+
+    Adds employees.base_salary_enc, then (only when SALARY_KEY is configured)
+    encrypts every existing plaintext base_salary into base_salary_enc and NULLs
+    the plaintext. Gating on the key prevents destroying plaintext before it can
+    be encrypted — set SALARY_KEY in the production env, then deploy.
+    """
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns("employees")}
+    except Exception:
+        return
+    if "base_salary_enc" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE employees ADD COLUMN base_salary_enc TEXT"))
+
+    from app.services.salary_crypto import encryption_enabled, encrypt_salary
+    if not encryption_enabled():
+        return  # no key yet — leave any plaintext untouched until the key is set
+
+    with engine.begin() as connection:
+        rows = connection.execute(text(
+            "SELECT id, base_salary FROM employees "
+            "WHERE base_salary IS NOT NULL AND (base_salary_enc IS NULL OR base_salary_enc = '')"
+        )).fetchall()
+        for row in rows:
+            enc = encrypt_salary(row.base_salary)
+            if enc:
+                connection.execute(
+                    text("UPDATE employees SET base_salary_enc = :enc, base_salary = NULL WHERE id = :id"),
+                    {"enc": enc, "id": row.id},
+                )
+
+
+sync_salary_encryption_schema()
+
+
 def sync_employee_conversion_schema() -> None:
     """Add intern→full-time conversion audit columns to existing employee tables."""
     inspector = inspect(engine)

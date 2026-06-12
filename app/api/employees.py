@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.database import get_db
 from app.constants.leave_types import is_intern
+from app.services.salary_crypto import encrypt_salary
 from app.models.allocation import Allocation
 from app.models.employee import Employee
 from app.models.leave import Leave
@@ -57,8 +58,13 @@ def create_employee(
     existing_user = db.query(User).filter(User.email == payload.email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="User email already registered")
-    
-    employee = Employee(**payload.dict())
+
+    data = payload.dict()
+    # Salary is encrypted at rest — never store the plaintext column.
+    plain_salary = data.pop("base_salary", None)
+    employee = Employee(**data)
+    if plain_salary is not None:
+        employee.base_salary_enc = encrypt_salary(plain_salary)
     db.add(employee)
     db.flush()
 
@@ -122,7 +128,13 @@ def update_employee(
         if existing_user:
             raise HTTPException(status_code=400, detail="User email already registered")
     
-    for key, value in payload.dict(exclude_unset=True).items():
+    update_data = payload.dict(exclude_unset=True)
+    # Salary is encrypted at rest — divert it to the encrypted column and keep
+    # the plaintext column NULL.
+    if "base_salary" in update_data:
+        employee.base_salary_enc = encrypt_salary(update_data.pop("base_salary"))
+        employee.base_salary = None
+    for key, value in update_data.items():
         setattr(employee, key, value)
 
     linked_user = db.query(User).filter(User.employee_id == employee.id).first()
