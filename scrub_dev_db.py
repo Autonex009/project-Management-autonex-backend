@@ -30,7 +30,20 @@ def main() -> None:
     parser.add_argument("--yes", action="store_true", help="confirm the target is a dev/staging DB")
     args = parser.parse_args()
 
-    host = urlparse(args.url).hostname or "(unknown)"
+    url = args.url.strip()
+    # SQLAlchemy 2.x rejects the postgres:// scheme Neon sometimes hands out.
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+
+    parsed = urlparse(url)
+    host = parsed.hostname
+    if not host or not parsed.scheme.startswith("postgresql"):
+        sys.exit(
+            "Could not parse a Postgres host from --url. Pass the REAL dev-branch "
+            "connection string in quotes, e.g.\n"
+            '  --url "postgresql://user:pass@ep-xxxx.neon.tech/neondb?sslmode=require"'
+        )
+
     prod_guard = (os.getenv("PROD_DB_HOST") or "").strip()
     if prod_guard and prod_guard in host:
         sys.exit(f"REFUSING: target host '{host}' matches PROD_DB_HOST. This tool is dev-only.")
@@ -39,7 +52,7 @@ def main() -> None:
     if not args.yes:
         sys.exit("Aborted. Re-run with --yes once you've confirmed this is a DEV/staging DB.")
 
-    engine = create_engine(args.url)
+    engine = create_engine(url)
     with engine.begin() as conn:
         result = conn.execute(text(
             "UPDATE employees SET base_salary = NULL, base_salary_enc = NULL "
