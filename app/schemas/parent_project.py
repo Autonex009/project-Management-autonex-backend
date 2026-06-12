@@ -6,9 +6,10 @@ from datetime import date, datetime
 class ParentProjectBase(BaseModel):
     """Base schema with common fields."""
     name: str = Field(..., min_length=2, description="Parent project name")
-    program_manager_id: Optional[int] = Field(None, description="Employee ID of Program Manager")
+    program_manager_id: Optional[int] = Field(None, description="Employee ID of primary Program Manager")
+    program_manager_ids: Optional[List[int]] = Field(None, description="Employee IDs of all Program Managers")
     description: Optional[str] = Field(None, description="Scope of work")
-    client: Optional[str] = Field(None, description="Client name for context inheritance")
+    client: Optional[str] = Field(None, description="Organization name")
     project_type: str = Field("Full", description="Project type: Full, POC, Side")
     global_start_date: date = Field(..., description="Project start date")
     tentative_duration_months: Optional[int] = Field(None, ge=1, description="Expected duration in months")
@@ -16,14 +17,16 @@ class ParentProjectBase(BaseModel):
 
 
 class ParentProjectCreate(ParentProjectBase):
-    """Schema for creating a new parent project."""
-    program_manager_id: int = Field(..., description="Employee ID of Program Manager")
+    """Schema for creating a new parent project. Requires at least one PM
+    (either program_manager_id or a non-empty program_manager_ids list)."""
+    pass
 
 
 class ParentProjectUpdate(BaseModel):
     """Schema for updating a parent project - all fields optional."""
     name: Optional[str] = Field(None, min_length=2)
     program_manager_id: Optional[int] = None
+    program_manager_ids: Optional[List[int]] = None
     description: Optional[str] = None
     client: Optional[str] = None
     project_type: Optional[str] = None
@@ -49,7 +52,8 @@ class ParentProjectResponse(ParentProjectBase):
     created_at: datetime
     updated_at: datetime
     sub_projects_count: int = 0
-    program_manager_name: Optional[str] = None  # Joined from Employee table
+    program_manager_name: Optional[str] = None  # Joined from Employee table (primary PM)
+    program_manager_names: List[str] = []  # Names of all PMs
     
     class Config:
         from_attributes = True
