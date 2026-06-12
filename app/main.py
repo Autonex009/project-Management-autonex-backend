@@ -38,13 +38,34 @@ def sync_main_project_schema() -> None:
     except Exception:
         return
 
-    if "project_type" in columns:
+    statements = []
+    if "project_type" not in columns:
+        statements.append("ALTER TABLE main_projects ADD COLUMN project_type TEXT NOT NULL DEFAULT 'Full'")
+    if "program_manager_ids" not in columns:
+        statements.append("ALTER TABLE main_projects ADD COLUMN program_manager_ids JSON")
+
+    if not statements:
         return
 
     with engine.begin() as connection:
-        connection.execute(
-            text("ALTER TABLE main_projects ADD COLUMN project_type TEXT NOT NULL DEFAULT 'Full'")
-        )
+        for statement in statements:
+            connection.execute(text(statement))
+
+        # Backfill: seed program_manager_ids from the existing single PM column
+        if any("program_manager_ids" in s for s in statements):
+            dialect = engine.dialect.name
+            if dialect == "postgresql":
+                connection.execute(text(
+                    "UPDATE main_projects "
+                    "SET program_manager_ids = to_jsonb(ARRAY[program_manager_id]) "
+                    "WHERE program_manager_id IS NOT NULL"
+                ))
+            else:
+                connection.execute(text(
+                    "UPDATE main_projects "
+                    "SET program_manager_ids = '[' || program_manager_id || ']' "
+                    "WHERE program_manager_id IS NOT NULL"
+                ))
 
 
 sync_main_project_schema()

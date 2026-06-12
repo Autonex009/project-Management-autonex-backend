@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, Text, TIMESTAMP, ForeignKey
+from sqlalchemy import Column, Integer, String, Date, Text, TIMESTAMP, ForeignKey, JSON
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 
@@ -17,7 +17,10 @@ class MainProject(Base):
     # Core fields
     name = Column(Text, nullable=False)
     program_manager_id = Column(Integer, nullable=True)
+    # Multiple PMs per project; program_manager_id stays as the primary PM for backward compat
+    program_manager_ids = Column(JSON, nullable=True, default=list)
     description = Column(Text, nullable=True)
+    # Organization name (formerly "client")
     client = Column(Text, nullable=True)
     project_type = Column(Text, nullable=False, default="Full")
     

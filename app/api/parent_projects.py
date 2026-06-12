@@ -27,6 +27,42 @@ def get_pm_name(db: Session, pm_id: int) -> str | None:
     return employee.name if employee else None
 
 
+def get_pm_ids(pp) -> list[int]:
+    """All PM ids for a project (multi-PM list, falling back to single column)."""
+    ids = pp.program_manager_ids or []
+    if not ids and pp.program_manager_id:
+        ids = [pp.program_manager_id]
+    return ids
+
+
+def get_pm_names(db: Session, pm_ids: list[int]) -> list[str]:
+    """Names for a list of PM ids, preserving order."""
+    if not pm_ids:
+        return []
+    employees = db.query(Employee).filter(Employee.id.in_(pm_ids)).all()
+    name_map = {e.id: e.name for e in employees}
+    return [name_map[i] for i in pm_ids if i in name_map]
+
+
+def normalize_pm_fields(db: Session, data: dict) -> dict:
+    """Merge program_manager_id / program_manager_ids into a validated, consistent pair.
+    The first valid PM in the list becomes the primary program_manager_id."""
+    ids = data.get("program_manager_ids") or []
+    if not ids and data.get("program_manager_id"):
+        ids = [data["program_manager_id"]]
+
+    # De-duplicate preserving order, keep only existing employees
+    seen = set()
+    ordered = [i for i in ids if not (i in seen or seen.add(i))]
+    if ordered:
+        valid = {row[0] for row in db.query(Employee.id).filter(Employee.id.in_(ordered)).all()}
+        ordered = [i for i in ordered if i in valid]
+
+    data["program_manager_ids"] = ordered
+    data["program_manager_id"] = ordered[0] if ordered else None
+    return data
+
+
 def release_project_allocations(db: Session, parent_project_id: int) -> None:
     """Release all allocations belonging to sub-projects under a main project."""
     sub_project_ids = [
@@ -61,8 +97,10 @@ def get_all_parent_projects(db: Session = Depends(get_db)):
     ).group_by(Project.main_project_id).all()
     sub_count_map = {row[0]: row[1] for row in sub_counts}
     
-    # Batch load all PMs in a single query
-    pm_ids = list(set(pp.program_manager_id for pp in parent_projects if pp.program_manager_id))
+    # Batch load all PMs (primary + multi) in a single query
+    pm_ids = set()
+    for pp in parent_projects:
+        pm_ids.update(get_pm_ids(pp))
     if pm_ids:
         pms = db.query(Employee).filter(Employee.id.in_(pm_ids)).all()
         pm_map = {pm.id: pm.name for pm in pms}
@@ -71,10 +109,12 @@ def get_all_parent_projects(db: Session = Depends(get_db)):
     
     result = []
     for pp in parent_projects:
+        all_pm_ids = get_pm_ids(pp)
         response = ParentProjectResponse(
             id=pp.id,
             name=pp.name,
             program_manager_id=pp.program_manager_id,
+            program_manager_ids=all_pm_ids,
             description=pp.description,
             client=pp.client,
             project_type=pp.project_type,
@@ -84,7 +124,8 @@ def get_all_parent_projects(db: Session = Depends(get_db)):
             created_at=pp.created_at,
             updated_at=pp.updated_at,
             sub_projects_count=sub_count_map.get(pp.id, 0),
-            program_manager_name=pm_map.get(pp.program_manager_id) if pp.program_manager_id else None
+            program_manager_name=pm_map.get(pp.program_manager_id) if pp.program_manager_id else None,
+            program_manager_names=[pm_map[i] for i in all_pm_ids if i in pm_map]
         )
         result.append(response)
     
@@ -97,22 +138,25 @@ def create_parent_project(
     db: Session = Depends(get_db)
 ):
     """Create a new parent project."""
-    # Validate program manager exists if provided; silently clear if not found
-    data = parent_project.model_dump()
-    if data.get("program_manager_id"):
-        pm = db.query(Employee).filter(Employee.id == data["program_manager_id"]).first()
-        if not pm:
-            data["program_manager_id"] = None
+    # Normalize/validate PM fields (supports multiple PMs)
+    data = normalize_pm_fields(db, parent_project.model_dump())
+    if not data["program_manager_ids"]:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one valid Program Manager is required"
+        )
 
     db_parent_project = ParentProject(**data)
     db.add(db_parent_project)
     db.commit()
     db.refresh(db_parent_project)
     
+    all_pm_ids = get_pm_ids(db_parent_project)
     return ParentProjectResponse(
         id=db_parent_project.id,
         name=db_parent_project.name,
         program_manager_id=db_parent_project.program_manager_id,
+        program_manager_ids=all_pm_ids,
         description=db_parent_project.description,
         client=db_parent_project.client,
         project_type=db_parent_project.project_type,
@@ -122,7 +166,8 @@ def create_parent_project(
         created_at=db_parent_project.created_at,
         updated_at=db_parent_project.updated_at,
         sub_projects_count=0,
-        program_manager_name=get_pm_name(db, db_parent_project.program_manager_id)
+        program_manager_name=get_pm_name(db, db_parent_project.program_manager_id),
+        program_manager_names=get_pm_names(db, all_pm_ids)
     )
 
 
@@ -155,6 +200,7 @@ def get_parent_project(parent_project_id: int, db: Session = Depends(get_db)):
         id=pp.id,
         name=pp.name,
         program_manager_id=pp.program_manager_id,
+        program_manager_ids=get_pm_ids(pp),
         description=pp.description,
         client=pp.client,
         project_type=pp.project_type,
@@ -165,6 +211,7 @@ def get_parent_project(parent_project_id: int, db: Session = Depends(get_db)):
         updated_at=pp.updated_at,
         sub_projects_count=len(sub_project_list),
         program_manager_name=get_pm_name(db, pp.program_manager_id),
+        program_manager_names=get_pm_names(db, get_pm_ids(pp)),
         sub_projects=sub_project_list
     )
 
@@ -184,14 +231,18 @@ def update_parent_project(
             detail=f"Parent project with ID {parent_project_id} not found"
         )
     
-    # Validate program manager if being updated; silently clear if not found
-    if update_data.program_manager_id:
-        pm = db.query(Employee).filter(Employee.id == update_data.program_manager_id).first()
-        if not pm:
-            update_data.program_manager_id = None
-    
     # Update only provided fields
     update_dict = update_data.model_dump(exclude_unset=True)
+
+    # Normalize PM fields if either was provided
+    if "program_manager_id" in update_dict or "program_manager_ids" in update_dict:
+        pm_data = normalize_pm_fields(db, {
+            "program_manager_id": update_dict.get("program_manager_id"),
+            "program_manager_ids": update_dict.get("program_manager_ids"),
+        })
+        update_dict["program_manager_id"] = pm_data["program_manager_id"]
+        update_dict["program_manager_ids"] = pm_data["program_manager_ids"]
+
     previous_project_type = pp.project_type
     for key, value in update_dict.items():
         setattr(pp, key, value)
@@ -210,6 +261,7 @@ def update_parent_project(
         id=pp.id,
         name=pp.name,
         program_manager_id=pp.program_manager_id,
+        program_manager_ids=get_pm_ids(pp),
         description=pp.description,
         client=pp.client,
         project_type=pp.project_type,
@@ -219,7 +271,8 @@ def update_parent_project(
         created_at=pp.created_at,
         updated_at=pp.updated_at,
         sub_projects_count=sub_count,
-        program_manager_name=get_pm_name(db, pp.program_manager_id)
+        program_manager_name=get_pm_name(db, pp.program_manager_id),
+        program_manager_names=get_pm_names(db, get_pm_ids(pp))
     )
 
 
@@ -265,6 +318,8 @@ def get_parent_context(parent_project_id: int, db: Session = Depends(get_db)):
     return {
         "program_manager_id": pp.program_manager_id,
         "program_manager_name": get_pm_name(db, pp.program_manager_id),
+        "program_manager_ids": get_pm_ids(pp),
+        "program_manager_names": get_pm_names(db, get_pm_ids(pp)),
         "client": pp.client,
         "parent_name": pp.name,
         "global_start_date": pp.global_start_date.isoformat() if pp.global_start_date else None
