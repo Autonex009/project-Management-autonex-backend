@@ -47,6 +47,7 @@ class DailySheet(Base):
     required_manpower = Column(Integer, default=0)
     allocated_employees = Column(Integer, default=0)
 
+    is_annotation = Column(Boolean, default=False, nullable=True)
     priority = Column(Text, default="medium")
     project_status = Column(Text, default="active")
 

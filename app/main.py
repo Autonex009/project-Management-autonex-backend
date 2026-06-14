@@ -4,7 +4,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, onboarding
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -25,6 +25,7 @@ from app.api.signup_requests import router as signup_requests_router
 from app.api.referrals import router as referrals_router, external_router as referrals_external_router
 from app.api.payroll import router as payroll_router
 from app.api.performance_reviews import router as performance_reviews_router
+from app.api.onboarding import router as onboarding_router
 from app.seed_skills import seed_skills
 
 Base.metadata.create_all(bind=engine)
@@ -297,6 +298,52 @@ def sync_employee_conversion_schema() -> None:
 sync_employee_conversion_schema()
 
 
+def sync_employee_mentor_schema() -> None:
+    """Backfill missing employee mentor_id column on existing databases."""
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns("employees")}
+    except Exception:
+        return
+    if "mentor_id" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE employees ADD COLUMN mentor_id INTEGER"))
+
+
+sync_employee_mentor_schema()
+
+
+def sync_main_project_annotation_schema() -> None:
+    """Add is_annotation column to main_projects if not present."""
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns("main_projects")}
+    except Exception:
+        return
+    if "is_annotation" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE main_projects ADD COLUMN is_annotation BOOLEAN DEFAULT 0"))
+
+
+sync_main_project_annotation_schema()
+
+
+def sync_daily_sheet_annotation_schema() -> None:
+    """Add is_annotation column to daily_sheets if not present."""
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns("daily_sheets")}
+    except Exception:
+        return
+    if "is_annotation" not in columns:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE daily_sheets ADD COLUMN is_annotation BOOLEAN DEFAULT 0"))
+
+
+sync_daily_sheet_annotation_schema()
+
+
+
 def sync_wfh_end_date_schema() -> None:
     """Add end_date column to wfh_requests and backfill existing rows."""
     inspector = inspect(engine)
@@ -411,4 +458,5 @@ app.include_router(referrals_router)
 app.include_router(referrals_external_router)
 app.include_router(payroll_router)
 app.include_router(performance_reviews_router)
+app.include_router(onboarding_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")

@@ -1,7 +1,8 @@
-from sqlalchemy import Column, Integer, String, Float, Text, TIMESTAMP, JSON
+from sqlalchemy import Column, Integer, String, Float, Text, TIMESTAMP, JSON, ForeignKey
 from sqlalchemy.sql import func
 
 from app.db.database import Base
+
 
 
 class Employee(Base):
@@ -35,6 +36,8 @@ class Employee(Base):
     base_salary_enc = Column(Text, nullable=True)
 
     status = Column(Text, default="active")  # active, inactive, on-leave
+    mentor_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
+
 
     # ── Intern → Full-time conversion audit ──────────────────────────
     # Set when an intern is promoted in-place to a full-time employee. The

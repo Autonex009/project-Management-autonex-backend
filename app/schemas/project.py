@@ -99,6 +99,7 @@ class ProjectBase(BaseModel):
     required_manpower: Optional[int] = 0  # Number of employees required
     allocated_employees: Optional[int] = 0  # Actual allocations (auto-updated)
     priority: Optional[str] = "medium"
+    is_annotation: Optional[bool] = False
 
 
 class ProjectCreate(ProjectBase):
@@ -135,6 +136,7 @@ class ProjectUpdate(BaseModel):
 
     priority: Optional[str] = None
     project_status: Optional[str] = None
+    is_annotation: Optional[bool] = None
 
 
 class ProjectResponse(ProjectBase):

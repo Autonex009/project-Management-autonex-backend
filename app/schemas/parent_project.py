@@ -14,6 +14,7 @@ class ParentProjectBase(BaseModel):
     global_start_date: date = Field(..., description="Project start date")
     tentative_duration_months: Optional[int] = Field(None, ge=1, description="Expected duration in months")
     status: Optional[str] = Field("active", description="Status: active, completed, archived")
+    is_annotation: Optional[bool] = Field(False, description="Flag indicating if this is an annotation project")
 
 
 class ParentProjectCreate(ParentProjectBase):
@@ -33,6 +34,8 @@ class ParentProjectUpdate(BaseModel):
     global_start_date: Optional[date] = None
     tentative_duration_months: Optional[int] = Field(None, ge=1)
     status: Optional[str] = None
+    is_annotation: Optional[bool] = None
+
 
 
 class SubProjectSummary(BaseModel):

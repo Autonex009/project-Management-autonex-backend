@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, Text, TIMESTAMP, ForeignKey, JSON
+from sqlalchemy import Column, Integer, String, Date, Text, TIMESTAMP, ForeignKey, JSON, Boolean
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 
@@ -23,6 +23,7 @@ class MainProject(Base):
     # Organization name (formerly "client")
     client = Column(Text, nullable=True)
     project_type = Column(Text, nullable=False, default="Full")
+    is_annotation = Column(Boolean, default=False, nullable=True)
     
     # Timeline
     global_start_date = Column(Date, nullable=False)
