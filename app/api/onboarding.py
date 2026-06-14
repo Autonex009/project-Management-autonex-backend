@@ -60,6 +60,28 @@ def get_onboarding_candidates(db: Session) -> List[User]:
     ).all()
 
 
+def is_module_locked(user_id: int, module_id: int, db: Session) -> bool:
+    """Check if a module is locked for a candidate based on sequence completion."""
+    # Retrieve all published modules sorted by order
+    modules = db.query(OnboardingModule).filter(OnboardingModule.status.ilike("PUBLISHED")).order_by(OnboardingModule.order.asc()).all()
+    
+    previous_completed = True
+    for m in modules:
+        if m.id == module_id:
+            return not previous_completed
+            
+        total_sections = len(m.sections)
+        completed_count = db.query(OnboardingProgress).filter(
+            OnboardingProgress.user_id == user_id,
+            OnboardingProgress.module_id == m.id
+        ).count()
+        
+        is_completed = (total_sections > 0 and completed_count == total_sections) or (total_sections == 0)
+        previous_completed = is_completed
+        
+    return False
+
+
 # ── Modules Endpoints ───────────────────────────────────────────────
 
 @router.get("/modules", response_model=List[OnboardingModuleResponse])
@@ -85,6 +107,11 @@ def get_module(
     module = db.query(OnboardingModule).filter(OnboardingModule.id == module_id).first()
     if not module:
         raise HTTPException(status_code=404, detail="Module not found")
+        
+    if current_user.role == "employee":
+        if is_module_locked(current_user.id, module_id, db):
+            raise HTTPException(status_code=403, detail="This module is locked.")
+            
     return module
 
 
@@ -387,6 +414,32 @@ def record_progress(
     """Mark a section complete for an employee."""
     user_id = payload.user_id or current_user.id
 
+    section = db.query(OnboardingSection).filter(OnboardingSection.id == payload.section_id).first()
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found")
+
+    if current_user.role == "employee":
+        if is_module_locked(user_id, section.module_id, db):
+            raise HTTPException(status_code=403, detail="Cannot record progress for a locked module.")
+
+        # If the section has quiz questions, the employee must pass the quiz first
+        questions_count = db.query(OnboardingQuizQuestion).filter(OnboardingQuizQuestion.section_id == payload.section_id).count()
+        if questions_count > 0:
+            attempts = db.query(OnboardingQuizAttempt).filter(
+                OnboardingQuizAttempt.user_id == user_id,
+                OnboardingQuizAttempt.section_id == payload.section_id
+            ).all()
+            
+            correct_count = sum(1 for a in attempts if a.is_correct)
+            score = int((correct_count / questions_count) * 100) if questions_count > 0 else 0
+            passing_score = section.quiz_passing_score or 0
+            
+            if score < passing_score:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Quiz passing score not met. You scored {score}%, but {passing_score}% is required."
+                )
+
     existing = db.query(OnboardingProgress).filter(
         OnboardingProgress.user_id == user_id,
         OnboardingProgress.section_id == payload.section_id
@@ -400,7 +453,7 @@ def record_progress(
 
     progress = OnboardingProgress(
         user_id=user_id,
-        module_id=payload.module_id,
+        module_id=section.module_id,
         section_id=payload.section_id
     )
     db.add(progress)
@@ -440,6 +493,14 @@ def submit_quiz(
 ):
     """Submit quiz answers, scores them, and updates attempts."""
     user_id = payload.user_id or current_user.id
+    
+    section = db.query(OnboardingSection).filter(OnboardingSection.id == payload.section_id).first()
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found")
+
+    if current_user.role == "employee":
+        if is_module_locked(user_id, section.module_id, db):
+            raise HTTPException(status_code=403, detail="Cannot submit quiz for a locked module.")
     
     question_ids = [ans.question_id for ans in payload.answers]
     questions = db.query(OnboardingQuizQuestion).filter(OnboardingQuizQuestion.id.in_(question_ids)).all()
@@ -679,10 +740,14 @@ def get_candidate_dashboard(
     correct_answers = 0
 
     enriched_modules = []
+    previous_completed = True
     for m in modules:
         total_sections = len(m.sections)
         completed = completed_module_sections.get(m.id, 0)
         progress = int((completed / total_sections) * 100) if total_sections > 0 else 0
+
+        # Determine locked state
+        is_locked = not previous_completed
 
         module_questions = 0
         module_correct = 0
@@ -694,7 +759,8 @@ def get_candidate_dashboard(
                     module_correct += 1
                     correct_answers += 1
 
-        status_str = "completed" if progress == 100 else "in_progress"
+        is_completed = (progress == 100 or total_sections == 0)
+        status_str = "completed" if is_completed else "in_progress"
         total_progress += progress
 
         sections_list = []
@@ -724,8 +790,12 @@ def get_candidate_dashboard(
             "completedLessons": completed,
             "assessmentUrl": m.assessment_url,
             "sections": sections_list,
-            "quizScore": int((module_correct / module_questions) * 100) if module_questions > 0 else 0
+            "quizScore": int((module_correct / module_questions) * 100) if module_questions > 0 else 0,
+            "locked": is_locked
         })
+
+        # Update previous_completed state for the next module
+        previous_completed = is_completed
 
     overall_progress = int(total_progress / len(modules)) if modules else 0
     avg_quiz_score = int((correct_answers / total_questions) * 100) if total_questions > 0 else 0
