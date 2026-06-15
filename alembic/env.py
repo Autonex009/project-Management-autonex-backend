@@ -7,9 +7,29 @@ from alembic import context
 
 # Import your Base and models
 from app.db.database import Base, engine
-from app.models.employee import Employee
-from app.models.skill import Skill
-from app.models.project import Project
+from app.models import (
+    project,
+    allocation,
+    leave,
+    employee,
+    parent_project,
+    user,
+    sub_project,
+    guideline,
+    side_project,
+    skill,
+    notification,
+    wfh,
+    signup_request,
+    referral,
+    payroll,
+    performance_review,
+    onboarding
+)
+
+
+
+
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
