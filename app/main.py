@@ -322,7 +322,7 @@ def sync_main_project_annotation_schema() -> None:
         return
     if "is_annotation" not in columns:
         with engine.begin() as connection:
-            connection.execute(text("ALTER TABLE main_projects ADD COLUMN is_annotation BOOLEAN DEFAULT 0"))
+            connection.execute(text("ALTER TABLE main_projects ADD COLUMN is_annotation BOOLEAN DEFAULT FALSE"))
 
 
 sync_main_project_annotation_schema()
@@ -337,7 +337,7 @@ def sync_daily_sheet_annotation_schema() -> None:
         return
     if "is_annotation" not in columns:
         with engine.begin() as connection:
-            connection.execute(text("ALTER TABLE daily_sheets ADD COLUMN is_annotation BOOLEAN DEFAULT 0"))
+            connection.execute(text("ALTER TABLE daily_sheets ADD COLUMN is_annotation BOOLEAN DEFAULT FALSE"))
 
 
 sync_daily_sheet_annotation_schema()
