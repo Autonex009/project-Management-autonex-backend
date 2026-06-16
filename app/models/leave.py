@@ -16,6 +16,8 @@ class Leave(Base):
     razorpay_applied = Column(Boolean, default=False)
     flagged = Column(Boolean, default=False, nullable=False)
     approval_remark = Column(Text, nullable=True)
+    is_half_day = Column(Boolean, default=False, nullable=False)
+    half_day_slot = Column(String, nullable=True)
 
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
