@@ -4,7 +4,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, onboarding
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, onboarding, company_settings
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -26,6 +26,7 @@ from app.api.referrals import router as referrals_router, external_router as ref
 from app.api.payroll import router as payroll_router
 from app.api.performance_reviews import router as performance_reviews_router
 from app.api.onboarding import router as onboarding_router
+from app.api.company_settings import router as company_settings_router
 from app.seed_skills import seed_skills
 
 Base.metadata.create_all(bind=engine)
@@ -421,6 +422,32 @@ def sync_payroll_schema() -> None:
 
 
 sync_payroll_schema()
+
+
+def sync_company_settings_schema() -> None:
+    """Create the company_settings table on existing databases if missing,
+    and seed default WiFi placeholder keys."""
+    inspector = inspect(engine)
+    try:
+        tables = set(inspector.get_table_names())
+    except Exception:
+        return
+    if "company_settings" not in tables:
+        company_settings.Base.metadata.tables["company_settings"].create(bind=engine)
+
+    # Seed default keys if the table is empty
+    from sqlalchemy.orm import Session as _Session
+    with _Session(engine) as session:
+        from app.models.company_settings import CompanySetting
+        if session.query(CompanySetting).count() == 0:
+            session.add_all([
+                CompanySetting(key="wifi_name", value=""),
+                CompanySetting(key="wifi_password", value=""),
+            ])
+            session.commit()
+
+
+sync_company_settings_schema()
 seed_skills()
 
 app = FastAPI(title="Autonex Resource Planning Tool V2")
@@ -459,4 +486,5 @@ app.include_router(referrals_external_router)
 app.include_router(payroll_router)
 app.include_router(performance_reviews_router)
 app.include_router(onboarding_router)
+app.include_router(company_settings_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
