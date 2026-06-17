@@ -1,11 +1,14 @@
 from datetime import date
 
-LEAVE_TYPE_CHOICES = ("paid", "casual_sick", "floater")
+LEAVE_TYPE_CHOICES = ("paid", "casual_sick", "floater", "half_day", "first_half", "second_half")
 
 LEAVE_TYPE_LABELS = {
     "paid": "Paid Leave",
     "casual_sick": "Casual/Sick Leave",
     "floater": "Floater Leave",
+    "half_day": "Half-Day Leave",
+    "first_half": "First Half-Day Leave",
+    "second_half": "Second Half-Day Leave",
 }
 
 # Legacy values are still accepted so existing records continue to sync safely.
