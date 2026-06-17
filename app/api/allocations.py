@@ -118,59 +118,6 @@ def _send_employee_allocation_removed_notification(db: Session, allocation: Allo
     )
 
 
-def _notify_project_team_target_change(
-    db: Session,
-    project: Project | None,
-    old_allocation_count: int,
-    new_allocation_count: int,
-    excluded_employee_ids: set[int] | None = None,
-) -> None:
-    if not project:
-        return
-
-    excluded_employee_ids = excluded_employee_ids or set()
-    if old_allocation_count == new_allocation_count:
-        return
-
-    previous_target = _format_target_tasks_per_employee(project, old_allocation_count)
-    current_target = _format_target_tasks_per_employee(project, new_allocation_count)
-    if previous_target == current_target:
-        return
-
-    current_allocations = db.query(Allocation).filter(Allocation.sub_project_id == project.id).all()
-    if not current_allocations:
-        return
-
-    changes_summary = (
-        f"Team allocation changed from {old_allocation_count} to {new_allocation_count} employee(s).\n"
-        f"• Your Target (Tasks/Emp): {previous_target} -> {current_target}"
-    )
-
-    for team_allocation in current_allocations:
-        if team_allocation.employee_id in excluded_employee_ids:
-            continue
-
-        employee = db.query(Employee).filter(Employee.id == team_allocation.employee_id).first()
-        if not employee:
-            continue
-
-        slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
-        if not slack_user_id:
-            continue
-
-        notify_employee_sub_project_updated(
-            employee_slack_user_id=slack_user_id,
-            employee_name=employee.name,
-            sub_project_name=project.name,
-            project_manager_name=_get_project_manager_name(db, project),
-            avg_time_per_task=_format_avg_time_per_task(project),
-            target_tasks_per_employee=current_target,
-            timeline=_format_timeline(project),
-            status=project.project_status,
-            changes_summary=changes_summary,
-        )
-
-
 def enrich_allocation_response(allocation: Allocation, db: Session) -> dict:
     """Add employee and sub-project names to allocation response."""
     employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
@@ -297,11 +244,6 @@ def create_allocation(data: AllocationCreate, db: Session = Depends(get_db)):
     )
 
     project = db.query(Project).filter(Project.id == data.sub_project_id).first()
-    previous_count = 0
-    if project:
-        previous_count = db.query(Allocation).filter(
-            Allocation.sub_project_id == data.sub_project_id
-        ).count()
 
     allocation = Allocation(**data.model_dump())
     db.add(allocation)
@@ -318,19 +260,11 @@ def create_allocation(data: AllocationCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(allocation)
 
+    # Notify only the newly allocated employee. The whole-team
+    # "target changed" broadcast was intentionally removed so that adding a
+    # member doesn't spam everyone already on the project.
     try:
         _send_employee_allocation_notification(db, allocation, project, actual_count)
-    except Exception:
-        pass
-
-    try:
-        _notify_project_team_target_change(
-            db,
-            project,
-            old_allocation_count=previous_count,
-            new_allocation_count=actual_count,
-            excluded_employee_ids={allocation.employee_id},
-        )
     except Exception:
         pass
 
@@ -523,16 +457,10 @@ def delete_allocation(allocation_id: int, db: Session = Depends(get_db)):
     
     sub_project_id = allocation.sub_project_id
     project = db.query(Project).filter(Project.id == sub_project_id).first()
-    previous_count = 0
-    if project:
-        previous_count = db.query(Allocation).filter(
-            Allocation.sub_project_id == sub_project_id
-        ).count()
     db.delete(allocation)
     db.flush()
 
     # Sync project allocated_employees count from actual allocation records
-    actual_count = 0
     if project:
         actual_count = db.query(Allocation).filter(
             Allocation.sub_project_id == sub_project_id
@@ -541,19 +469,11 @@ def delete_allocation(allocation_id: int, db: Session = Depends(get_db)):
 
     db.commit()
 
+    # Notify only the removed employee. The whole-team "target changed"
+    # broadcast was intentionally removed so removing a member doesn't spam
+    # everyone still on the project.
     try:
         _send_employee_allocation_removed_notification(db, allocation, project)
-    except Exception:
-        pass
-
-    try:
-        _notify_project_team_target_change(
-            db,
-            project,
-            old_allocation_count=previous_count,
-            new_allocation_count=actual_count,
-            excluded_employee_ids={allocation.employee_id},
-        )
     except Exception:
         pass
 
