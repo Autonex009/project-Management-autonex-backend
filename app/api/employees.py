@@ -22,6 +22,7 @@ from app.schemas.employee import (
     EmployeeResponse,
 )
 from app.services.auth_service import hash_password
+from app.services.identity_validator import check_duplicate_identity
 
 router = APIRouter(
     prefix="/api/employees",
@@ -50,14 +51,8 @@ def create_employee(
     payload: EmployeeCreate,
     db: Session = Depends(get_db)
 ):
-    # Check if email already exists
-    existing = db.query(Employee).filter(Employee.email == payload.email).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    existing_user = db.query(User).filter(User.email == payload.email).first()
-    if existing_user:
-        raise HTTPException(status_code=400, detail="User email already registered")
+    # Enforce unique physical identity check
+    check_duplicate_identity(db, email=payload.email, phone=payload.phone)
 
     data = payload.dict()
     # Salary is encrypted at rest — never store the plaintext column.
@@ -122,14 +117,14 @@ def update_employee(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
     
-    # Check if email is being updated and if it's already taken
-    if payload.email and payload.email != employee.email:
-        existing = db.query(Employee).filter(Employee.email == payload.email).first()
-        if existing:
-            raise HTTPException(status_code=400, detail="Email already registered")
-        existing_user = db.query(User).filter(User.email == payload.email).first()
-        if existing_user:
-            raise HTTPException(status_code=400, detail="User email already registered")
+    # Ensure update doesn't introduce duplicate email or phone for another person
+    if payload.email or payload.phone:
+        check_duplicate_identity(
+            db,
+            email=payload.email if payload.email is not None else employee.email,
+            phone=payload.phone if payload.phone is not None else employee.phone,
+            exclude_employee_id=employee_id
+        )
     
     update_data = payload.dict(exclude_unset=True)
     # Salary is encrypted at rest — divert it to the encrypted column and keep
