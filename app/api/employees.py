@@ -87,11 +87,14 @@ def create_employee(
 @router.get("", response_model=list[EmployeeResponse])
 def list_employees(
     status: str = None,
+    include_archived: bool = False,
     db: Session = Depends(get_db)
 ):
     query = db.query(Employee)
     if status:
         query = query.filter(Employee.status == status)
+    elif not include_archived:
+        query = query.filter(Employee.status != "archived")
     return query.all()
 
 
@@ -207,7 +210,7 @@ def convert_to_fulltime(
     return employee
 
 
-# ✅ DELETE EMPLOYEE
+# ✅ DELETE EMPLOYEE (SOFT-ARCHIVE)
 @router.delete("/{employee_id}")
 def delete_employee(
     employee_id: int,
@@ -219,19 +222,53 @@ def delete_employee(
         raise HTTPException(status_code=404, detail="Employee not found")
     
     try:
-        db.query(Allocation).filter(Allocation.employee_id == employee.id).delete(synchronize_session=False)
-        db.query(Leave).filter(Leave.employee_id == employee.id).delete(synchronize_session=False)
-        db.query(SideProject).filter(SideProject.employee_id == employee.id).delete(synchronize_session=False)
+        employee.status = "archived"
+        
+        # Deactivate associated user account
+        linked_user = db.query(User).filter(User.employee_id == employee.id).first()
+        if not linked_user:
+            linked_user = db.query(User).filter(User.email == employee.email).first()
+        if linked_user:
+            linked_user.is_active = False
 
-        db.query(User).filter(User.employee_id == employee.id).delete(synchronize_session=False)
+        # Clear allocations for this employee
+        db.query(Allocation).filter(Allocation.employee_id == employee.id).delete(synchronize_session=False)
         db.flush()
 
-        db.delete(employee)
         db.commit()
-        return {"message": "Employee deleted successfully"}
+        return {"message": "Employee archived successfully"}
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to delete employee and related records")
+        raise HTTPException(status_code=500, detail="Failed to archive employee")
+
+
+# ✅ RESTORE ARCHIVED EMPLOYEE
+@router.post("/{employee_id}/restore", response_model=EmployeeResponse)
+def restore_employee(
+    employee_id: int,
+    db: Session = Depends(get_db),
+):
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    
+    try:
+        employee.status = "active"
+        
+        # Reactivate associated user account
+        linked_user = db.query(User).filter(User.employee_id == employee.id).first()
+        if not linked_user:
+            linked_user = db.query(User).filter(User.email == employee.email).first()
+        if linked_user:
+            linked_user.is_active = True
+
+        db.commit()
+        db.refresh(employee)
+        return employee
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to restore employee")
 
 
 # ✅ EMPLOYEE AVAILABILITY (±30 days)
