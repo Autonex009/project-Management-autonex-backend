@@ -86,11 +86,34 @@ def list_employees(
     db: Session = Depends(get_db)
 ):
     query = db.query(Employee)
-    if status:
+    if status == "idle":
+        allocated_employee_ids = db.query(Allocation.employee_id).distinct()
+        query = query.filter(Employee.status == "active", Employee.id.notin_(allocated_employee_ids))
+    elif status:
         query = query.filter(Employee.status == status)
     elif not include_archived:
         query = query.filter(Employee.status != "archived")
     return query.all()
+
+
+@router.get("/status/active", response_model=list[EmployeeResponse])
+def get_active_employees(db: Session = Depends(get_db)):
+    return db.query(Employee).filter(Employee.status == "active").all()
+
+
+@router.get("/status/inactive", response_model=list[EmployeeResponse])
+def get_inactive_employees(db: Session = Depends(get_db)):
+    return db.query(Employee).filter(Employee.status == "inactive").all()
+
+
+@router.get("/status/idle", response_model=list[EmployeeResponse])
+def get_idle_employees(db: Session = Depends(get_db)):
+    allocated_employee_ids = db.query(Allocation.employee_id).distinct()
+    return db.query(Employee).filter(
+        Employee.status == "active",
+        Employee.id.notin_(allocated_employee_ids)
+    ).all()
+
 
 
 # ✅ GET EMPLOYEE BY ID
