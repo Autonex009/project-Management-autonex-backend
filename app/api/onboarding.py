@@ -82,19 +82,72 @@ def is_module_locked(user_id: int, module_id: int, db: Session) -> bool:
     return False
 
 
+# ── Serialization helpers (control quiz-answer exposure) ─────────────
+# The correct answer (correct_option_index) must never reach the candidate's
+# browser, and is not needed by any list view. It is included only when an
+# admin/PM fetches a single module to edit it in the builder.
+
+def _serialize_question(question: OnboardingQuizQuestion, include_answer: bool) -> dict:
+    data = {
+        "id": question.id,
+        "section_id": question.section_id,
+        "question": question.question,
+        "options": question.options,
+    }
+    if include_answer:
+        data["correct_option_index"] = question.correct_option_index
+    return data
+
+
+def _serialize_section(section: OnboardingSection, include_answers: bool) -> dict:
+    return {
+        "id": section.id,
+        "module_id": section.module_id,
+        "title": section.title,
+        "description": section.description,
+        "video_url": section.video_url,
+        "video_duration": section.video_duration,
+        "quiz_passing_score": section.quiz_passing_score,
+        "order": section.order,
+        "documents": [
+            {"id": d.id, "section_id": d.section_id, "title": d.title, "type": d.type, "url": d.url}
+            for d in section.documents
+        ],
+        "questions": [_serialize_question(q, include_answers) for q in section.questions],
+    }
+
+
+def _serialize_module(module: OnboardingModule, include_answers: bool) -> dict:
+    return {
+        "id": module.id,
+        "title": module.title,
+        "description": module.description,
+        "status": module.status,
+        "assessment_url": module.assessment_url,
+        "order": module.order,
+        "created_at": module.created_at,
+        "updated_at": module.updated_at,
+        "sections": [
+            _serialize_section(s, include_answers)
+            for s in sorted(module.sections, key=lambda x: (x.order or 0))
+        ],
+    }
+
+
 # ── Modules Endpoints ───────────────────────────────────────────────
 
-@router.get("/modules", response_model=List[OnboardingModuleResponse])
+@router.get("/modules")
 def get_modules(
     include_drafts: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Get all onboarding modules sorted by order."""
+    """Get all onboarding modules sorted by order. Quiz answers are never included in the list."""
     query = db.query(OnboardingModule)
     if not include_drafts and current_user.role == "employee":
         query = query.filter(OnboardingModule.status.ilike("PUBLISHED"))
-    return query.order_by(OnboardingModule.order.asc()).all()
+    modules = query.order_by(OnboardingModule.order.asc()).all()
+    return [_serialize_module(m, include_answers=False) for m in modules]
 
 
 # ── Excel Import / Templates (placed above to avoid shadowing) ──────────
@@ -129,22 +182,27 @@ def download_quiz_sample():
     )
 
 
-@router.get("/modules/{module_id}", response_model=OnboardingModuleResponse)
+@router.get("/modules/{module_id}")
 def get_module(
     module_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Retrieve a single module with its sections, documents, and questions."""
+    """Retrieve a single module with its sections, documents, and questions.
+
+    Correct quiz answers are returned only to admins/PMs (the module builder needs
+    them to edit); candidates never receive them.
+    """
     module = db.query(OnboardingModule).filter(OnboardingModule.id == module_id).first()
     if not module:
         raise HTTPException(status_code=404, detail="Module not found")
-        
+
     if current_user.role == "employee":
         if is_module_locked(current_user.id, module_id, db):
             raise HTTPException(status_code=403, detail="This module is locked.")
-            
-    return module
+
+    include_answers = current_user.role in ("admin", "pm")
+    return _serialize_module(module, include_answers=include_answers)
 
 
 @router.post("/modules", response_model=OnboardingModuleResponse, status_code=status.HTTP_201_CREATED)
