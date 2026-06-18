@@ -22,7 +22,6 @@ from app.schemas.employee import (
     EmployeeResponse,
 )
 from app.services.auth_service import hash_password
-from app.services.identity_validator import check_duplicate_identity
 
 router = APIRouter(
     prefix="/api/employees",
@@ -51,8 +50,14 @@ def create_employee(
     payload: EmployeeCreate,
     db: Session = Depends(get_db)
 ):
-    # Enforce unique physical identity check
-    check_duplicate_identity(db, email=payload.email, phone=payload.phone)
+    # Check if email already exists
+    existing = db.query(Employee).filter(Employee.email == payload.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    existing_user = db.query(User).filter(User.email == payload.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="User email already registered")
 
     data = payload.dict()
     # Salary is encrypted at rest — never store the plaintext column.
@@ -82,38 +87,12 @@ def create_employee(
 @router.get("", response_model=list[EmployeeResponse])
 def list_employees(
     status: str = None,
-    include_archived: bool = False,
     db: Session = Depends(get_db)
 ):
     query = db.query(Employee)
-    if status == "idle":
-        allocated_employee_ids = db.query(Allocation.employee_id).distinct()
-        query = query.filter(Employee.status == "active", Employee.id.notin_(allocated_employee_ids))
-    elif status:
+    if status:
         query = query.filter(Employee.status == status)
-    elif not include_archived:
-        query = query.filter(Employee.status != "archived")
     return query.all()
-
-
-@router.get("/status/active", response_model=list[EmployeeResponse])
-def get_active_employees(db: Session = Depends(get_db)):
-    return db.query(Employee).filter(Employee.status == "active").all()
-
-
-@router.get("/status/inactive", response_model=list[EmployeeResponse])
-def get_inactive_employees(db: Session = Depends(get_db)):
-    return db.query(Employee).filter(Employee.status == "inactive").all()
-
-
-@router.get("/status/idle", response_model=list[EmployeeResponse])
-def get_idle_employees(db: Session = Depends(get_db)):
-    allocated_employee_ids = db.query(Allocation.employee_id).distinct()
-    return db.query(Employee).filter(
-        Employee.status == "active",
-        Employee.id.notin_(allocated_employee_ids)
-    ).all()
-
 
 
 # ✅ GET EMPLOYEE BY ID
@@ -140,14 +119,14 @@ def update_employee(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
     
-    # Ensure update doesn't introduce duplicate email or phone for another person
-    if payload.email or payload.phone:
-        check_duplicate_identity(
-            db,
-            email=payload.email if payload.email is not None else employee.email,
-            phone=payload.phone if payload.phone is not None else employee.phone,
-            exclude_employee_id=employee_id
-        )
+    # Check if email is being updated and if it's already taken
+    if payload.email and payload.email != employee.email:
+        existing = db.query(Employee).filter(Employee.email == payload.email).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        existing_user = db.query(User).filter(User.email == payload.email).first()
+        if existing_user:
+            raise HTTPException(status_code=400, detail="User email already registered")
     
     update_data = payload.dict(exclude_unset=True)
     # Salary is encrypted at rest — divert it to the encrypted column and keep
@@ -228,7 +207,7 @@ def convert_to_fulltime(
     return employee
 
 
-# ✅ DELETE EMPLOYEE (SOFT-ARCHIVE)
+# ✅ DELETE EMPLOYEE
 @router.delete("/{employee_id}")
 def delete_employee(
     employee_id: int,
@@ -240,53 +219,19 @@ def delete_employee(
         raise HTTPException(status_code=404, detail="Employee not found")
     
     try:
-        employee.status = "archived"
-        
-        # Deactivate associated user account
-        linked_user = db.query(User).filter(User.employee_id == employee.id).first()
-        if not linked_user:
-            linked_user = db.query(User).filter(User.email == employee.email).first()
-        if linked_user:
-            linked_user.is_active = False
-
-        # Clear allocations for this employee
         db.query(Allocation).filter(Allocation.employee_id == employee.id).delete(synchronize_session=False)
+        db.query(Leave).filter(Leave.employee_id == employee.id).delete(synchronize_session=False)
+        db.query(SideProject).filter(SideProject.employee_id == employee.id).delete(synchronize_session=False)
+
+        db.query(User).filter(User.employee_id == employee.id).delete(synchronize_session=False)
         db.flush()
 
+        db.delete(employee)
         db.commit()
-        return {"message": "Employee archived successfully"}
+        return {"message": "Employee deleted successfully"}
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to archive employee")
-
-
-# ✅ RESTORE ARCHIVED EMPLOYEE
-@router.post("/{employee_id}/restore", response_model=EmployeeResponse)
-def restore_employee(
-    employee_id: int,
-    db: Session = Depends(get_db),
-):
-    employee = db.query(Employee).filter(Employee.id == employee_id).first()
-    
-    if not employee:
-        raise HTTPException(status_code=404, detail="Employee not found")
-    
-    try:
-        employee.status = "active"
-        
-        # Reactivate associated user account
-        linked_user = db.query(User).filter(User.employee_id == employee.id).first()
-        if not linked_user:
-            linked_user = db.query(User).filter(User.email == employee.email).first()
-        if linked_user:
-            linked_user.is_active = True
-
-        db.commit()
-        db.refresh(employee)
-        return employee
-    except SQLAlchemyError:
-        db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to restore employee")
+        raise HTTPException(status_code=500, detail="Failed to delete employee and related records")
 
 
 # ✅ EMPLOYEE AVAILABILITY (±30 days)

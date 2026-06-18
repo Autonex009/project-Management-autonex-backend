@@ -1,44 +1,8 @@
 import json
 import os
-from datetime import timedelta, date as date_type, timezone, datetime, time as time_type
+from datetime import timedelta, date as date_type
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-
-
-def get_current_ist_datetime() -> datetime:
-    utc_now = datetime.now(timezone.utc)
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-    return utc_now.astimezone(ist_tz)
-
-
-def validate_half_day_timing(start_date: date_type, half_day_slot: str) -> None:
-    current_dt = get_current_ist_datetime()
-    current_date = current_dt.date()
-    current_time = current_dt.time()
-
-    if half_day_slot == "first_half":
-        if current_date >= start_date:
-            raise HTTPException(
-                status_code=400,
-                detail="First-half leaves must be applied at least one day in advance.",
-            )
-    elif half_day_slot == "second_half":
-        if current_date > start_date:
-            raise HTTPException(
-                status_code=400,
-                detail="Cannot apply for a second-half leave after the request date has passed.",
-            )
-        elif current_date == start_date:
-            if current_time > time_type(14, 0):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Second-half leaves must be applied before 2:00 PM on the same day.",
-                )
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid half-day slot. Must be 'first_half' or 'second_half'.",
-        )
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.orm import Session
@@ -345,7 +309,7 @@ def get_all_leaves(
     if employee_id:
         query = query.filter(Leave.employee_id == employee_id)
 
-    leaves = query.order_by(Leave.id.desc()).all()
+    leaves = query.all()
     return [
         LeaveSchema(
             leave_id=leave.id,
@@ -359,8 +323,6 @@ def get_all_leaves(
             razorpay_applied=leave.razorpay_applied or False,
             flagged=leave.flagged or False,
             approval_remark=leave.approval_remark,
-            is_half_day=leave.is_half_day or False,
-            half_day_slot=leave.half_day_slot,
         )
         for leave in leaves
     ]
@@ -414,8 +376,6 @@ def get_calendar(
             "status": leave.status,
             "reason": leave.reason,
             "flagged": leave.flagged or False,
-            "is_half_day": leave.is_half_day or False,
-            "half_day_slot": leave.half_day_slot,
         })
 
     wfh_events = []
@@ -449,8 +409,6 @@ def get_leave(leave_id: int, db: Session = Depends(get_db)):
         status=leave.status or "pending",
         approved_by=leave.approved_by,
         razorpay_applied=leave.razorpay_applied or False,
-        is_half_day=leave.is_half_day or False,
-        half_day_slot=leave.half_day_slot,
     )
 
 
@@ -459,9 +417,6 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
     employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
-
-    if payload.is_half_day:
-        validate_half_day_timing(payload.start_date, payload.half_day_slot)
 
     # Reject if any existing leave (pending or approved) overlaps the requested range
     overlap = (
@@ -486,9 +441,6 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
         if not is_weekend(payload.start_date + timedelta(days=i))
         and not is_fixed_holiday(payload.start_date + timedelta(days=i))
     )
-    if payload.is_half_day:
-        working_day_count = 0.5 if working_day_count > 0 else 0.0
-
     if working_day_count == 0:
         raise HTTPException(
             status_code=400,
@@ -543,8 +495,6 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
         reason=payload.reason,
         status="pending",
         flagged=flagged,
-        is_half_day=payload.is_half_day or False,
-        half_day_slot=payload.half_day_slot,
     )
     db.add(leave)
     db.commit()
@@ -571,7 +521,7 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
         end_date=leave.end_date.isoformat(),
     )
 
-    duration_days = 0.5 if leave.is_half_day else (leave.end_date - leave.start_date).days + 1
+    duration_days = (leave.end_date - leave.start_date).days + 1
     # PMs route their own leave requests straight to Admin for approval. Everyone
     # else routes to the PM(s) of their allocated projects, falling back to Admin.
     is_pm_applicant = emp_user is not None and emp_user.role == "pm"
@@ -630,8 +580,6 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
         razorpay_applied=leave.razorpay_applied or False,
         flagged=leave.flagged or False,
         approval_remark=leave.approval_remark,
-        is_half_day=leave.is_half_day or False,
-        half_day_slot=leave.half_day_slot,
     )
 
 
@@ -644,9 +592,6 @@ def apply_leave_to_razorpay(leave_id: int, db: Session = Depends(get_db)):
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
-
-    if getattr(leave, "is_half_day", False):
-        raise HTTPException(status_code=400, detail="Half-day leaves do not sync to Razorpay")
 
     if (leave.status or "pending") != "approved":
         raise HTTPException(status_code=400, detail="Only approved leaves can be applied to Razorpay")
@@ -670,9 +615,6 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
         raise HTTPException(status_code=404, detail="Leave not found")
     if leave.start_date <= date_type.today():
         raise HTTPException(status_code=400, detail="Cannot edit a leave that has already started")
-
-    if payload.is_half_day:
-        validate_half_day_timing(payload.start_date, payload.half_day_slot)
 
     # Check for overlapping leaves (excluding this one)
     overlap = (
@@ -698,9 +640,6 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
         if not is_weekend(payload.start_date + timedelta(days=i))
         and not is_fixed_holiday(payload.start_date + timedelta(days=i))
     )
-    if payload.is_half_day:
-        working_day_count = 0.5 if working_day_count > 0 else 0.0
-
     if working_day_count == 0:
         raise HTTPException(
             status_code=400,
@@ -741,8 +680,6 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
     leave.leave_type = payload.leave_type
     leave.reason = payload.reason
     leave.status = "pending"  # reset to pending so PM re-reviews the edited request
-    leave.is_half_day = payload.is_half_day or False
-    leave.half_day_slot = payload.half_day_slot
     db.commit()
     db.refresh(leave)
     return LeaveSchema(
@@ -757,8 +694,6 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
         razorpay_applied=leave.razorpay_applied or False,
         flagged=leave.flagged or False,
         approval_remark=leave.approval_remark,
-        is_half_day=leave.is_half_day or False,
-        half_day_slot=leave.half_day_slot,
     )
 
 
@@ -795,7 +730,7 @@ def approve_leave(
 
     # Attempt Razorpay sync; if it fails, leave razorpay_applied=False for later retry
     sync_warning = None
-    if not leave.razorpay_applied and not getattr(leave, "is_half_day", False):
+    if not leave.razorpay_applied:
         try:
             sync_leave_to_razorpay(employee, leave)
             leave.razorpay_applied = True
@@ -830,16 +765,8 @@ def approve_leave(
         approved=True,
     )
 
-    msg = "Leave approved"
-    if getattr(leave, "is_half_day", False):
-        msg = "Leave approved (half-day leaves do not sync to Razorpay)"
-    elif leave.razorpay_applied:
-        msg = "Leave approved and synced to Razorpay"
-    else:
-        msg = "Leave approved (Razorpay sync pending — use 'Apply to Razorpay' to retry)"
-
     result = {
-        "message": msg,
+        "message": "Leave approved and synced to Razorpay" if leave.razorpay_applied else "Leave approved (Razorpay sync pending — use 'Apply to Razorpay' to retry)",
         "leave_id": leave_id,
         "status": "approved",
         "razorpay_applied": leave.razorpay_applied or False,

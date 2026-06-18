@@ -55,13 +55,3 @@ def mark_all_read(user_id: int, db: Session = Depends(get_db)):
     ).update({"is_read": True})
     db.commit()
     return {"ok": True}
-
-
-@router.delete("/clear-read")
-def clear_read_notifications(user_id: int, db: Session = Depends(get_db)):
-    db.query(Notification).filter(
-        Notification.user_id == user_id,
-        Notification.is_read == True,
-    ).delete(synchronize_session=False)
-    db.commit()
-    return {"ok": True}

@@ -29,7 +29,6 @@ Session = sessionmaker(bind=engine)
 # Step 1: Import models and create tables
 # ────────────────────────────────────────────────────
 from app.db.database import Base
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, onboarding, company_settings, wifi_network
 from app.models.employee import Employee
 from app.models.project import DailySheet
 from app.models.sub_project import SubProject
@@ -42,12 +41,7 @@ from app.models.guideline import Guideline
 from app.services.auth_service import hash_password
 
 print("🔧 Dropping and recreating all tables...")
-if engine.dialect.name == "postgresql":
-    with engine.begin() as conn:
-        conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE;"))
-        conn.execute(text("CREATE SCHEMA public;"))
-else:
-    Base.metadata.drop_all(bind=engine)
+Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 print("✅ Tables created!\n")
 

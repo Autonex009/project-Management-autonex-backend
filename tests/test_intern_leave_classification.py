@@ -27,11 +27,11 @@ class _Leave:
 
 
 def _paid(cls, leave_id):
-    return set(cls[leave_id]["paid_dates"].keys())
+    return cls[leave_id]["paid_dates"]
 
 
 def _unpaid(cls, leave_id):
-    return set(cls[leave_id]["unpaid_dates"].keys())
+    return cls[leave_id]["unpaid_dates"]
 
 
 def test_intern_first_paid_rest_unpaid_and_monthly_reset():

@@ -25,7 +25,6 @@ from app.services.auth_service import (
     get_current_user,
 )
 from app.services.email_service import send_password_reset_email
-from app.services.identity_validator import check_duplicate_identity, check_duplicate_user_for_employee
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +150,10 @@ def signup(body: SignupRequest, db: Session = Depends(get_db)):
     """Register a new user. Defaults to 'employee' role."""
     logger.info("[signup] Attempt: email=%s role=%s", body.email, body.role)
 
-    check_duplicate_identity(db, email=body.email)
+    existing = db.query(User).filter(User.email == body.email).first()
+    if existing:
+        logger.warning("[signup] Duplicate email: %s", body.email)
+        raise HTTPException(status_code=400, detail="Email already registered")
 
     # Only allow 'employee' or 'pm' via signup; admin is seed-only
     role = body.role if body.role in ("employee", "pm") else "employee"
@@ -229,7 +231,6 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
             db.add(employee)
             db.flush()
         if employee is not None:
-            check_duplicate_user_for_employee(db, employee.id, exclude_user_id=user.id)
             user.employee_id = employee.id
             db.commit()
             db.refresh(user)
