@@ -156,7 +156,8 @@ def get_modules(
 ):
     """Get all onboarding modules sorted by order. Quiz answers are never included in the list."""
     query = db.query(OnboardingModule)
-    if not include_drafts and current_user.role == "employee":
+    # Employees only ever see published modules, regardless of include_drafts.
+    if current_user.role == "employee" or not include_drafts:
         query = query.filter(OnboardingModule.status.ilike("PUBLISHED"))
     modules = query.order_by(OnboardingModule.order.asc()).all()
     return [_serialize_module(m, include_answers=False) for m in modules]
@@ -210,6 +211,8 @@ def get_module(
         raise HTTPException(status_code=404, detail="Module not found")
 
     if current_user.role == "employee":
+        if (module.status or "").upper() != "PUBLISHED":
+            raise HTTPException(status_code=404, detail="Module not found")
         if is_module_locked(current_user.id, module_id, db):
             raise HTTPException(status_code=403, detail="This module is locked.")
 
