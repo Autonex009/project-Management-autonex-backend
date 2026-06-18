@@ -79,6 +79,21 @@ def is_module_locked(user_id: int, module_id: int, db: Session) -> bool:
     return False
 
 
+# ── Authorization helpers ────────────────────────────────────────────
+# Employees may only act on / read their own onboarding data. Admins and PMs
+# may target another user by passing an explicit user_id.
+
+def _resolve_target_user_id(current_user: User, requested_user_id: Optional[int]) -> int:
+    if current_user.role in ("admin", "pm") and requested_user_id:
+        return requested_user_id
+    return current_user.id
+
+
+def _ensure_can_view_user(current_user: User, user_id: int) -> None:
+    if current_user.role not in ("admin", "pm") and current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this user's onboarding data.")
+
+
 # ── Serialization helpers (control quiz-answer exposure) ─────────────
 # The correct answer (correct_option_index) must never reach the candidate's
 # browser, and is not needed by any list view. It is included only when an
@@ -499,7 +514,7 @@ def record_progress(
     current_user: User = Depends(get_current_user)
 ):
     """Mark a section complete for an employee."""
-    user_id = payload.user_id or current_user.id
+    user_id = _resolve_target_user_id(current_user, payload.user_id)
 
     section = db.query(OnboardingSection).filter(OnboardingSection.id == payload.section_id).first()
     if not section:
@@ -556,6 +571,7 @@ def get_user_progress(
     current_user: User = Depends(get_current_user)
 ):
     """Retrieve all completed sections for a candidate."""
+    _ensure_can_view_user(current_user, user_id)
     return db.query(OnboardingProgress).filter(OnboardingProgress.user_id == user_id).all()
 
 
@@ -579,8 +595,8 @@ def submit_quiz(
     current_user: User = Depends(get_current_user)
 ):
     """Submit quiz answers, scores them, and updates attempts."""
-    user_id = payload.user_id or current_user.id
-    
+    user_id = _resolve_target_user_id(current_user, payload.user_id)
+
     section = db.query(OnboardingSection).filter(OnboardingSection.id == payload.section_id).first()
     if not section:
         raise HTTPException(status_code=404, detail="Section not found")
@@ -647,6 +663,7 @@ def get_candidate_dashboard(
     current_user: User = Depends(get_current_user)
 ):
     """Retrieve full onboarding progress metrics for a candidate."""
+    _ensure_can_view_user(current_user, user_id)
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Candidate not found")
