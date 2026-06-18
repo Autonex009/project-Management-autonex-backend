@@ -278,3 +278,125 @@ def test_half_day_bypasses_razorpay_sync(client_and_db):
     resp = client.post(f"/api/leaves/{leave.id}/apply-to-razorpay")
     assert resp.status_code == 400
     assert "Half-day leaves do not sync to Razorpay" in resp.json()["detail"]
+
+
+def test_consecutive_leaves_blocking_basic(client_and_db):
+    client, db = client_and_db
+    emp, admin = _seed_employee(db)
+
+    # 4 consecutive working days (Monday 2026-06-22 to Thursday 2026-06-25) -> Should FAIL
+    payload = {
+        "employee_id": emp.id,
+        "leave_type": "paid",
+        "start_date": "2026-06-22",
+        "end_date": "2026-06-25",
+        "reason": "4 consecutive days"
+    }
+    resp = client.post("/api/leaves", json=payload)
+    assert resp.status_code == 400
+    assert "Safe guard triggered" in resp.json()["detail"]
+
+
+def test_consecutive_leaves_across_weekend_split(client_and_db):
+    client, db = client_and_db
+    emp, admin = _seed_employee(db)
+
+    # Apply for Friday (2026-06-19) -> Should SUCCEED
+    db.add(Leave(employee_id=emp.id, leave_type="paid",
+                 start_date=date(2026, 6, 19), end_date=date(2026, 6, 19),
+                 status="approved"))
+    db.commit()
+
+    # Now apply for Monday (2026-06-22) to Wednesday (2026-06-24) -> Should FAIL
+    # (Friday + Mon + Tue + Wed = 4 consecutive working days, bridging Sat/Sun)
+    payload = {
+        "employee_id": emp.id,
+        "leave_type": "paid",
+        "start_date": "2026-06-22",
+        "end_date": "2026-06-24",
+        "reason": "Split bridging weekend"
+    }
+    resp = client.post("/api/leaves", json=payload)
+    assert resp.status_code == 400
+    assert "Safe guard triggered" in resp.json()["detail"]
+
+
+def test_consecutive_leaves_half_days_ignored(client_and_db):
+    client, db = client_and_db
+    emp, admin = _seed_employee(db)
+
+    # India time is mocked to 2026-06-16 10:00:00 IST
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    mocked_dt = datetime(2026, 6, 16, 10, 0, tzinfo=ist_tz)
+    
+    with patch("app.api.leaves.get_current_ist_datetime", return_value=mocked_dt):
+        # 1. Existing half-day on Friday (2026-06-19)
+        db.add(Leave(employee_id=emp.id, leave_type="first_half",
+                     start_date=date(2026, 6, 19), end_date=date(2026, 6, 19),
+                     status="approved", is_half_day=True, half_day_slot="first_half"))
+        db.commit()
+
+        # Apply for Monday (2026-06-22) to Wednesday (2026-06-24) (3 days)
+        # Friday is half-day, so it shouldn't bridge/count towards the 4-day block.
+        # Total full days = 3. Should SUCCEED.
+        payload = {
+            "employee_id": emp.id,
+            "leave_type": "paid",
+            "start_date": "2026-06-22",
+            "end_date": "2026-06-24",
+            "reason": "Full leaves after half-day"
+        }
+        resp = client.post("/api/leaves", json=payload)
+        assert resp.status_code == 201
+
+        # Clear leaves for next check
+        db.query(Leave).delete()
+        db.commit()
+
+        # 2. Applying for a half-day itself should always succeed, even with adjacent leaves.
+        # Thursday (2026-06-18) full, Monday (2026-06-22) full, Tuesday (2026-06-23) full.
+        db.add(Leave(employee_id=emp.id, leave_type="paid",
+                     start_date=date(2026, 6, 18), end_date=date(2026, 6, 18),
+                     status="approved"))
+        db.add(Leave(employee_id=emp.id, leave_type="paid",
+                     start_date=date(2026, 6, 22), end_date=date(2026, 6, 23),
+                     status="approved"))
+        db.commit()
+
+        # Request Friday (2026-06-19) as first_half -> Should SUCCEED (even though adjacent working days are leave)
+        payload_half = {
+            "employee_id": emp.id,
+            "leave_type": "first_half",
+            "start_date": "2026-06-19",
+            "end_date": "2026-06-19",
+            "reason": "Half-day in between"
+        }
+        resp = client.post("/api/leaves", json=payload_half)
+        assert resp.status_code == 201
+
+
+def test_consecutive_leaves_fixed_holiday_ignored(client_and_db):
+    client, db = client_and_db
+    emp, admin = _seed_employee(db)
+
+    # Muharram is June 26, 2026 (Friday) - a fixed holiday.
+    # Apply for Tuesday (2026-06-23) to Thursday (2026-06-25) -> 3 days.
+    db.add(Leave(employee_id=emp.id, leave_type="paid",
+                 start_date=date(2026, 6, 23), end_date=date(2026, 6, 25),
+                 status="approved"))
+    db.commit()
+
+    # Now apply for Monday (2026-06-29) -> 1 day.
+    # Tuesday-Thursday (3 days) + Friday (Holiday, skipped) + Sat/Sun (Weekend, skipped) + Monday (1 day)
+    # Total consecutive = 4 days -> Should FAIL
+    payload = {
+        "employee_id": emp.id,
+        "leave_type": "paid",
+        "start_date": "2026-06-29",
+        "end_date": "2026-06-29",
+        "reason": "Split bridging weekend and holiday"
+    }
+    resp = client.post("/api/leaves", json=payload)
+    assert resp.status_code == 400
+    assert "Safe guard triggered" in resp.json()["detail"]
+

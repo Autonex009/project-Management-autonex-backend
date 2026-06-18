@@ -454,6 +454,72 @@ def get_leave(leave_id: int, db: Session = Depends(get_db)):
     )
 
 
+def validate_consecutive_leaves(
+    employee_id: int,
+    start_date: date_type,
+    end_date: date_type,
+    db: Session,
+    exclude_leave_id: Optional[int] = None,
+    is_half_day: bool = False
+) -> None:
+    if is_half_day:
+        return
+
+    # Define window of 10 days before and after the requested range
+    window_start = start_date - timedelta(days=10)
+    window_end = end_date + timedelta(days=10)
+
+    # Query existing non-rejected leaves of this employee in the window
+    query = db.query(Leave).filter(
+        Leave.employee_id == employee_id,
+        Leave.status != "rejected",
+        Leave.start_date <= window_end,
+        Leave.end_date >= window_start
+    )
+    if exclude_leave_id:
+        query = query.filter(Leave.id != exclude_leave_id)
+        
+    existing_leaves = query.all()
+
+    # Collect all working days of existing leaves + new leave
+    leave_working_days = set()
+    
+    # Add new leave's working days
+    cur = start_date
+    while cur <= end_date:
+        if not is_weekend(cur) and not is_fixed_holiday(cur):
+            leave_working_days.add(cur)
+        cur += timedelta(days=1)
+
+    # Add existing leaves' working days
+    for l in existing_leaves:
+        if getattr(l, "is_half_day", False) or l.leave_type in ("first_half", "second_half"):
+            continue
+        cur = max(l.start_date, window_start)
+        l_end = min(l.end_date, window_end)
+        while cur <= l_end:
+            if not is_weekend(cur) and not is_fixed_holiday(cur):
+                leave_working_days.add(cur)
+            cur += timedelta(days=1)
+
+    # Loop day-by-day in the window and track consecutive working day run
+    consecutive_run = 0
+    cur = window_start
+    while cur <= window_end:
+        if not is_weekend(cur) and not is_fixed_holiday(cur):
+            if cur in leave_working_days:
+                consecutive_run += 1
+                if consecutive_run >= 4:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Safe guard triggered: You cannot apply for 4 or more consecutive leaves."
+                    )
+            else:
+                consecutive_run = 0
+        cur += timedelta(days=1)
+
+
+
 @router.post("", response_model=LeaveSchema, status_code=201)
 def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
     employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
@@ -462,6 +528,9 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
 
     if payload.is_half_day:
         validate_half_day_timing(payload.start_date, payload.half_day_slot)
+
+    # Validate consecutive leaves safeguard
+    validate_consecutive_leaves(payload.employee_id, payload.start_date, payload.end_date, db, is_half_day=payload.is_half_day)
 
     # Reject if any existing leave (pending or approved) overlaps the requested range
     overlap = (
@@ -673,6 +742,9 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
 
     if payload.is_half_day:
         validate_half_day_timing(payload.start_date, payload.half_day_slot)
+
+    # Validate consecutive leaves safeguard (excluding this leave ID)
+    validate_consecutive_leaves(payload.employee_id, payload.start_date, payload.end_date, db, exclude_leave_id=leave_id, is_half_day=payload.is_half_day)
 
     # Check for overlapping leaves (excluding this one)
     overlap = (
