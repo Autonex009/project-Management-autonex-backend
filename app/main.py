@@ -75,20 +75,49 @@ sync_main_project_schema()
 
 
 def sync_leave_schema() -> None:
-    """Backfill missing leave columns on existing local databases."""
+    """Backfill missing leave columns on existing local and production databases."""
     inspector = inspect(engine)
     try:
         columns = {column["name"] for column in inspector.get_columns("leaves")}
     except Exception:
         return
 
-    if "razorpay_applied" in columns:
+    statements = []
+    dialect = engine.dialect.name
+
+    if "reason" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN reason TEXT")
+    if "status" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN status VARCHAR(50) DEFAULT 'pending'")
+    if "approved_by" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN approved_by INTEGER")
+    if "razorpay_applied" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN razorpay_applied BOOLEAN DEFAULT FALSE")
+    if "flagged" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN flagged BOOLEAN DEFAULT FALSE")
+    if "approval_remark" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN approval_remark TEXT")
+    if "is_half_day" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN is_half_day BOOLEAN DEFAULT FALSE")
+    if "half_day_slot" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN half_day_slot VARCHAR(50)")
+    if "created_at" not in columns:
+        if dialect == "sqlite":
+            statements.append("ALTER TABLE leaves ADD COLUMN created_at TIMESTAMP")
+        else:
+            statements.append("ALTER TABLE leaves ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    if "updated_at" not in columns:
+        if dialect == "sqlite":
+            statements.append("ALTER TABLE leaves ADD COLUMN updated_at TIMESTAMP")
+        else:
+            statements.append("ALTER TABLE leaves ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+
+    if not statements:
         return
 
     with engine.begin() as connection:
-        connection.execute(
-            text("ALTER TABLE leaves ADD COLUMN razorpay_applied BOOLEAN NOT NULL DEFAULT FALSE")
-        )
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 sync_leave_schema()
