@@ -213,6 +213,11 @@ def create_module(
 ):
     """Create a new module. Restricted to Admins and PMs."""
     module_data = payload.model_dump(exclude={"sections"})
+    # New modules append to the end of the sequence; ordering is managed from the
+    # module list via the reorder endpoint, not by a manual number on create.
+    if not module_data.get("order"):
+        max_order = db.query(func.max(OnboardingModule.order)).scalar()
+        module_data["order"] = (max_order or 0) + 1
     module = OnboardingModule(**module_data)
     db.add(module)
     db.flush()
@@ -321,6 +326,31 @@ def delete_module(
     db.delete(module)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class ModuleReorderPayload(BaseModel):
+    ordered_ids: List[int]
+
+
+@router.post("/modules/reorder")
+def reorder_modules(
+    payload: ModuleReorderPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm"))
+):
+    """Persist a new module display order.
+
+    Sets each module's `order` to its index in `ordered_ids`. Only updates the
+    existing integer column — no schema change.
+    """
+    modules = db.query(OnboardingModule).filter(OnboardingModule.id.in_(payload.ordered_ids)).all()
+    module_map = {m.id: m for m in modules}
+    for index, module_id in enumerate(payload.ordered_ids):
+        module = module_map.get(module_id)
+        if module is not None:
+            module.order = index
+    db.commit()
+    return {"message": "Module order updated", "count": len(module_map)}
 
 
 # ── Nested Sections CRUD ──────────────────────────────────────────
