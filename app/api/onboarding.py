@@ -608,17 +608,27 @@ def submit_quiz(
         if is_module_locked(user_id, section.module_id, db):
             raise HTTPException(status_code=403, detail="Cannot submit quiz for a locked module.")
     
-    question_ids = [ans.question_id for ans in payload.answers]
-    questions = db.query(OnboardingQuizQuestion).filter(OnboardingQuizQuestion.id.in_(question_ids)).all()
-    question_map = {q.id: q for q in questions}
+    # Score against the section's actual questions, not just whatever was submitted.
+    section_questions = db.query(OnboardingQuizQuestion).filter(
+        OnboardingQuizQuestion.section_id == payload.section_id
+    ).all()
+    question_map = {q.id: q for q in section_questions}
+    total_questions = len(section_questions)
+
+    # Require every question in the section to be answered before scoring.
+    answered_ids = {
+        ans.question_id for ans in payload.answers
+        if ans.question_id in question_map and ans.chosen_index >= 0
+    }
+    if total_questions > 0 and len(answered_ids) < total_questions:
+        raise HTTPException(status_code=400, detail="All questions must be answered before submitting.")
 
     correct_count = 0
-    results = []
 
     for answer in payload.answers:
         question = question_map.get(answer.question_id)
         if not question:
-            continue
+            continue  # ignore answers that don't belong to this section
 
         is_correct = question.correct_option_index == answer.chosen_index
         if is_correct:
@@ -634,7 +644,6 @@ def submit_quiz(
             existing_attempt.chosen_index = answer.chosen_index
             existing_attempt.is_correct = is_correct
             existing_attempt.attempted_at = datetime.utcnow()
-            results.append(existing_attempt)
         else:
             attempt = OnboardingQuizAttempt(
                 user_id=user_id,
@@ -644,16 +653,15 @@ def submit_quiz(
                 is_correct=is_correct
             )
             db.add(attempt)
-            results.append(attempt)
 
     db.commit()
-    score_percent = int((correct_count / len(payload.answers)) * 100) if payload.answers else 0
+    score_percent = int((correct_count / total_questions) * 100) if total_questions else 0
 
     return {
         "message": "Quiz submitted successfully",
         "score": score_percent,
         "correctCount": correct_count,
-        "totalQuestions": len(payload.answers),
+        "totalQuestions": total_questions,
     }
 
 
