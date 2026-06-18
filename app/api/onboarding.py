@@ -22,7 +22,6 @@ from app.models.onboarding import (
     OnboardingQuizQuestion,
     OnboardingProgress,
     OnboardingQuizAttempt,
-    OnboardingTeamMember,
 )
 from app.schemas.onboarding import (
     OnboardingModuleCreate,
@@ -33,8 +32,6 @@ from app.schemas.onboarding import (
     OnboardingQuizAttemptResponse,
     OnboardingProgressCreate,
     OnboardingProgressResponse,
-    OnboardingTeamMemberCreate,
-    OnboardingTeamMemberResponse,
     OnboardingDocumentCreate,
     OnboardingQuizQuestionCreate,
 )
@@ -82,19 +79,88 @@ def is_module_locked(user_id: int, module_id: int, db: Session) -> bool:
     return False
 
 
+# ── Authorization helpers ────────────────────────────────────────────
+# Employees may only act on / read their own onboarding data. Admins and PMs
+# may target another user by passing an explicit user_id.
+
+def _resolve_target_user_id(current_user: User, requested_user_id: Optional[int]) -> int:
+    if current_user.role in ("admin", "pm") and requested_user_id:
+        return requested_user_id
+    return current_user.id
+
+
+def _ensure_can_view_user(current_user: User, user_id: int) -> None:
+    if current_user.role not in ("admin", "pm") and current_user.id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this user's onboarding data.")
+
+
+# ── Serialization helpers (control quiz-answer exposure) ─────────────
+# The correct answer (correct_option_index) must never reach the candidate's
+# browser, and is not needed by any list view. It is included only when an
+# admin/PM fetches a single module to edit it in the builder.
+
+def _serialize_question(question: OnboardingQuizQuestion, include_answer: bool) -> dict:
+    data = {
+        "id": question.id,
+        "section_id": question.section_id,
+        "question": question.question,
+        "options": question.options,
+    }
+    if include_answer:
+        data["correct_option_index"] = question.correct_option_index
+    return data
+
+
+def _serialize_section(section: OnboardingSection, include_answers: bool) -> dict:
+    return {
+        "id": section.id,
+        "module_id": section.module_id,
+        "title": section.title,
+        "description": section.description,
+        "video_url": section.video_url,
+        "video_duration": section.video_duration,
+        "quiz_passing_score": section.quiz_passing_score,
+        "order": section.order,
+        "documents": [
+            {"id": d.id, "section_id": d.section_id, "title": d.title, "type": d.type, "url": d.url}
+            for d in section.documents
+        ],
+        "questions": [_serialize_question(q, include_answers) for q in section.questions],
+    }
+
+
+def _serialize_module(module: OnboardingModule, include_answers: bool) -> dict:
+    return {
+        "id": module.id,
+        "title": module.title,
+        "description": module.description,
+        "status": module.status,
+        "assessment_url": module.assessment_url,
+        "order": module.order,
+        "created_at": module.created_at,
+        "updated_at": module.updated_at,
+        "sections": [
+            _serialize_section(s, include_answers)
+            for s in sorted(module.sections, key=lambda x: (x.order or 0))
+        ],
+    }
+
+
 # ── Modules Endpoints ───────────────────────────────────────────────
 
-@router.get("/modules", response_model=List[OnboardingModuleResponse])
+@router.get("/modules")
 def get_modules(
     include_drafts: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Get all onboarding modules sorted by order."""
+    """Get all onboarding modules sorted by order. Quiz answers are never included in the list."""
     query = db.query(OnboardingModule)
-    if not include_drafts and current_user.role == "employee":
+    # Employees only ever see published modules, regardless of include_drafts.
+    if current_user.role == "employee" or not include_drafts:
         query = query.filter(OnboardingModule.status.ilike("PUBLISHED"))
-    return query.order_by(OnboardingModule.order.asc()).all()
+    modules = query.order_by(OnboardingModule.order.asc()).all()
+    return [_serialize_module(m, include_answers=False) for m in modules]
 
 
 # ── Excel Import / Templates (placed above to avoid shadowing) ──────────
@@ -129,22 +195,29 @@ def download_quiz_sample():
     )
 
 
-@router.get("/modules/{module_id}", response_model=OnboardingModuleResponse)
+@router.get("/modules/{module_id}")
 def get_module(
     module_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """Retrieve a single module with its sections, documents, and questions."""
+    """Retrieve a single module with its sections, documents, and questions.
+
+    Correct quiz answers are returned only to admins/PMs (the module builder needs
+    them to edit); candidates never receive them.
+    """
     module = db.query(OnboardingModule).filter(OnboardingModule.id == module_id).first()
     if not module:
         raise HTTPException(status_code=404, detail="Module not found")
-        
+
     if current_user.role == "employee":
+        if (module.status or "").upper() != "PUBLISHED":
+            raise HTTPException(status_code=404, detail="Module not found")
         if is_module_locked(current_user.id, module_id, db):
             raise HTTPException(status_code=403, detail="This module is locked.")
-            
-    return module
+
+    include_answers = current_user.role in ("admin", "pm")
+    return _serialize_module(module, include_answers=include_answers)
 
 
 @router.post("/modules", response_model=OnboardingModuleResponse, status_code=status.HTTP_201_CREATED)
@@ -155,6 +228,11 @@ def create_module(
 ):
     """Create a new module. Restricted to Admins and PMs."""
     module_data = payload.model_dump(exclude={"sections"})
+    # New modules append to the end of the sequence; ordering is managed from the
+    # module list via the reorder endpoint, not by a manual number on create.
+    if not module_data.get("order"):
+        max_order = db.query(func.max(OnboardingModule.order)).scalar()
+        module_data["order"] = (max_order or 0) + 1
     module = OnboardingModule(**module_data)
     db.add(module)
     db.flush()
@@ -263,6 +341,31 @@ def delete_module(
     db.delete(module)
     db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+class ModuleReorderPayload(BaseModel):
+    ordered_ids: List[int]
+
+
+@router.post("/modules/reorder")
+def reorder_modules(
+    payload: ModuleReorderPayload,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm"))
+):
+    """Persist a new module display order.
+
+    Sets each module's `order` to its index in `ordered_ids`. Only updates the
+    existing integer column — no schema change.
+    """
+    modules = db.query(OnboardingModule).filter(OnboardingModule.id.in_(payload.ordered_ids)).all()
+    module_map = {m.id: m for m in modules}
+    for index, module_id in enumerate(payload.ordered_ids):
+        module = module_map.get(module_id)
+        if module is not None:
+            module.order = index
+    db.commit()
+    return {"message": "Module order updated", "count": len(module_map)}
 
 
 # ── Nested Sections CRUD ──────────────────────────────────────────
@@ -414,7 +517,7 @@ def record_progress(
     current_user: User = Depends(get_current_user)
 ):
     """Mark a section complete for an employee."""
-    user_id = payload.user_id or current_user.id
+    user_id = _resolve_target_user_id(current_user, payload.user_id)
 
     section = db.query(OnboardingSection).filter(OnboardingSection.id == payload.section_id).first()
     if not section:
@@ -471,6 +574,7 @@ def get_user_progress(
     current_user: User = Depends(get_current_user)
 ):
     """Retrieve all completed sections for a candidate."""
+    _ensure_can_view_user(current_user, user_id)
     return db.query(OnboardingProgress).filter(OnboardingProgress.user_id == user_id).all()
 
 
@@ -494,8 +598,8 @@ def submit_quiz(
     current_user: User = Depends(get_current_user)
 ):
     """Submit quiz answers, scores them, and updates attempts."""
-    user_id = payload.user_id or current_user.id
-    
+    user_id = _resolve_target_user_id(current_user, payload.user_id)
+
     section = db.query(OnboardingSection).filter(OnboardingSection.id == payload.section_id).first()
     if not section:
         raise HTTPException(status_code=404, detail="Section not found")
@@ -504,17 +608,27 @@ def submit_quiz(
         if is_module_locked(user_id, section.module_id, db):
             raise HTTPException(status_code=403, detail="Cannot submit quiz for a locked module.")
     
-    question_ids = [ans.question_id for ans in payload.answers]
-    questions = db.query(OnboardingQuizQuestion).filter(OnboardingQuizQuestion.id.in_(question_ids)).all()
-    question_map = {q.id: q for q in questions}
+    # Score against the section's actual questions, not just whatever was submitted.
+    section_questions = db.query(OnboardingQuizQuestion).filter(
+        OnboardingQuizQuestion.section_id == payload.section_id
+    ).all()
+    question_map = {q.id: q for q in section_questions}
+    total_questions = len(section_questions)
+
+    # Require every question in the section to be answered before scoring.
+    answered_ids = {
+        ans.question_id for ans in payload.answers
+        if ans.question_id in question_map and ans.chosen_index >= 0
+    }
+    if total_questions > 0 and len(answered_ids) < total_questions:
+        raise HTTPException(status_code=400, detail="All questions must be answered before submitting.")
 
     correct_count = 0
-    results = []
 
     for answer in payload.answers:
         question = question_map.get(answer.question_id)
         if not question:
-            continue
+            continue  # ignore answers that don't belong to this section
 
         is_correct = question.correct_option_index == answer.chosen_index
         if is_correct:
@@ -530,7 +644,6 @@ def submit_quiz(
             existing_attempt.chosen_index = answer.chosen_index
             existing_attempt.is_correct = is_correct
             existing_attempt.attempted_at = datetime.utcnow()
-            results.append(existing_attempt)
         else:
             attempt = OnboardingQuizAttempt(
                 user_id=user_id,
@@ -540,168 +653,16 @@ def submit_quiz(
                 is_correct=is_correct
             )
             db.add(attempt)
-            results.append(attempt)
 
     db.commit()
-    score_percent = int((correct_count / len(payload.answers)) * 100) if payload.answers else 0
+    score_percent = int((correct_count / total_questions) * 100) if total_questions else 0
 
     return {
         "message": "Quiz submitted successfully",
         "score": score_percent,
         "correctCount": correct_count,
-        "totalQuestions": len(payload.answers),
+        "totalQuestions": total_questions,
     }
-
-
-# ── Team Members CRUD ─────────────────────────────────────────────────
-
-@router.get("/team", response_model=List[OnboardingTeamMemberResponse])
-def get_team_members(db: Session = Depends(get_db)):
-    """Retrieve all team contacts sorted by department."""
-    return db.query(OnboardingTeamMember).order_by(
-        OnboardingTeamMember.department.asc(),
-        OnboardingTeamMember.name.asc()
-    ).all()
-
-
-@router.post("/team", response_model=OnboardingTeamMemberResponse, status_code=status.HTTP_201_CREATED)
-def create_team_member(
-    payload: OnboardingTeamMemberCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
-):
-    """Add a team member contact."""
-    member = OnboardingTeamMember(**payload.model_dump())
-    db.add(member)
-    db.commit()
-    db.refresh(member)
-    return member
-
-
-@router.put("/team/{member_id}", response_model=OnboardingTeamMemberResponse)
-def update_team_member(
-    member_id: int,
-    payload: OnboardingTeamMemberCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
-):
-    """Edit a team member contact."""
-    member = db.query(OnboardingTeamMember).filter(OnboardingTeamMember.id == member_id).first()
-    if not member:
-        raise HTTPException(status_code=404, detail="Team member not found")
-
-    for key, value in payload.model_dump(exclude_unset=True).items():
-        setattr(member, key, value)
-
-    db.commit()
-    db.refresh(member)
-    return member
-
-
-@router.delete("/team/{member_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_team_member(
-    member_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
-):
-    """Remove a team member contact."""
-    member = db.query(OnboardingTeamMember).filter(OnboardingTeamMember.id == member_id).first()
-    if not member:
-        raise HTTPException(status_code=404, detail="Team member not found")
-    db.delete(member)
-    db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-@router.get("/team/sample-excel")
-def download_team_sample():
-    """Download template Excel for team bulk import."""
-    if not OPENPYXL_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Excel library (openpyxl) is not installed on the server.")
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Team Members"
-
-    headers = ['name', 'role', 'department', 'email', 'linkedin', 'slack']
-    ws.append(headers)
-
-    ws.append(['Emily Rodriguez', 'HR Business Partner', 'Human Resources', 'emily@company.com', 'https://linkedin.com/in/emily', ''])
-    ws.append(['Raj Malhotra', 'Engineering Manager', 'Engineering', 'raj@company.com', '', ''])
-
-    file_stream = io.BytesIO()
-    wb.save(file_stream)
-    file_stream.seek(0)
-
-    return StreamingResponse(
-        file_stream,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=autonex_team_sample.xlsx"}
-    )
-
-
-@router.post("/team/bulk-import")
-async def bulk_import_team(
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
-):
-    """Bulk import team members from an uploaded Excel file."""
-    if not OPENPYXL_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Excel library (openpyxl) is not installed on the server.")
-
-    content = await file.read()
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid Excel file.") from exc
-
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-
-    if not rows or len(rows) < 2:
-        raise HTTPException(status_code=400, detail="Empty sheet or missing headers.")
-
-    headers = [str(h).strip().lower() for h in rows[0]]
-    required = ['name', 'role', 'department']
-    for req in required:
-        if req not in headers:
-            raise HTTPException(status_code=400, detail=f"Missing required header column: {req}")
-
-    n_idx = headers.index('name')
-    r_idx = headers.index('role')
-    d_idx = headers.index('department')
-    e_idx = headers.index('email') if 'email' in headers else None
-    l_idx = headers.index('linkedin') if 'linkedin' in headers else None
-    s_idx = headers.index('slack') if 'slack' in headers else None
-
-    created = 0
-    errors = []
-
-    for row_num, row in enumerate(rows[1:], start=2):
-        if not row or all(v is None for v in row):
-            continue
-
-        name = str(row[n_idx]).strip() if row[n_idx] is not None else ""
-        role = str(row[r_idx]).strip() if row[r_idx] is not None else ""
-        dept = str(row[d_idx]).strip() if row[d_idx] is not None else ""
-        email = str(row[e_idx]).strip() if e_idx is not None and row[e_idx] is not None else None
-        linkedin = str(row[l_idx]).strip() if l_idx is not None and row[l_idx] is not None else None
-        slack = str(row[s_idx]).strip() if s_idx is not None and row[s_idx] is not None else None
-
-        if not name or not role or not dept:
-            errors.append(f"Row {row_num}: Name, role, and department are required.")
-            continue
-
-        member = OnboardingTeamMember(
-            name=name, role=role, department=dept,
-            email=email, linkedin=linkedin, slack=slack
-        )
-        db.add(member)
-        created += 1
-
-    db.commit()
-    return {"message": f"Bulk import complete: {created} contacts created", "created": created, "errors": errors}
 
 
 # ── Candidates / Dashboard Endpoints ────────────────────────────────────
@@ -713,6 +674,7 @@ def get_candidate_dashboard(
     current_user: User = Depends(get_current_user)
 ):
     """Retrieve full onboarding progress metrics for a candidate."""
+    _ensure_can_view_user(current_user, user_id)
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Candidate not found")

@@ -128,25 +128,3 @@ class OnboardingQuizAttemptResponse(OnboardingQuizAttemptBase):
 
     class Config:
         from_attributes = True
-
-
-# ── Team Member Schemas ────────────────────────────────────────────────────────
-class OnboardingTeamMemberBase(BaseModel):
-    name: str
-    role: str
-    department: str
-    email: Optional[str] = None
-    linkedin: Optional[str] = None
-    slack: Optional[str] = None
-
-
-class OnboardingTeamMemberCreate(OnboardingTeamMemberBase):
-    pass
-
-
-class OnboardingTeamMemberResponse(OnboardingTeamMemberBase):
-    id: int
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
