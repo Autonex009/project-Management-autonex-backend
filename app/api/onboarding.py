@@ -97,6 +97,38 @@ def get_modules(
     return query.order_by(OnboardingModule.order.asc()).all()
 
 
+# ── Excel Import / Templates (placed above to avoid shadowing) ──────────
+
+@router.get("/modules/quiz-sample-excel")
+def download_quiz_sample():
+    """Generate and return a sample Excel template for quiz import."""
+    if not OPENPYXL_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Excel library (openpyxl) is not installed on the server.")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Quiz Questions"
+
+    # Header
+    headers = ['question', 'option1', 'option2', 'option3', 'option4', 'correctOption']
+    ws.append(headers)
+
+    # Samples
+    ws.append(['What year was the company founded?', '2005', '2008', '2010', '2012', '2'])
+    ws.append(['What is our core value?', 'Speed', 'Innovation', 'Profit', 'Scale', '2'])
+    ws.append(['Who is the CEO?', 'John', 'Jane', 'Mike', 'Sarah', '1'])
+
+    file_stream = io.BytesIO()
+    wb.save(file_stream)
+    file_stream.seek(0)
+
+    return StreamingResponse(
+        file_stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": "attachment; filename=autonex_quiz_sample.xlsx"}
+    )
+
+
 @router.get("/modules/{module_id}", response_model=OnboardingModuleResponse)
 def get_module(
     module_id: int,
@@ -299,36 +331,6 @@ def delete_section(
 
 # ── Excel Import / Templates ──────────────────────────────────────────
 
-@router.get("/modules/quiz-sample-excel")
-def download_quiz_sample():
-    """Generate and return a sample Excel template for quiz import."""
-    if not OPENPYXL_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Excel library (openpyxl) is not installed on the server.")
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Quiz Questions"
-
-    # Header
-    headers = ['question', 'option1', 'option2', 'option3', 'option4', 'correctOption']
-    ws.append(headers)
-
-    # Samples
-    ws.append(['What year was the company founded?', '2005', '2008', '2010', '2012', '2'])
-    ws.append(['What is our core value?', 'Speed', 'Innovation', 'Profit', 'Scale', '2'])
-    ws.append(['Who is the CEO?', 'John', 'Jane', 'Mike', 'Sarah', '1'])
-
-    file_stream = io.BytesIO()
-    wb.save(file_stream)
-    file_stream.seek(0)
-
-    return StreamingResponse(
-        file_stream,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=autonex_quiz_sample.xlsx"}
-    )
-
-
 @router.post("/modules/{module_id}/sections/{section_id}/import-questions")
 async def import_quiz_questions(
     module_id: int,
@@ -382,7 +384,7 @@ async def import_quiz_questions(
         try:
             correct_opt = int(row[c_idx])
         except (ValueError, TypeError):
-            errors.push(f"Row {row_num}: Invalid correctOption value.")
+            errors.append(f"Row {row_num}: Invalid correctOption value.")
             continue
 
         if not question_text or not opt1 or not opt2 or not opt3 or not opt4 or correct_opt < 1 or correct_opt > 4:

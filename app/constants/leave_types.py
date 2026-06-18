@@ -1,11 +1,14 @@
 from datetime import date
 
-LEAVE_TYPE_CHOICES = ("paid", "casual_sick", "floater")
+LEAVE_TYPE_CHOICES = ("paid", "casual_sick", "floater", "half_day", "first_half", "second_half")
 
 LEAVE_TYPE_LABELS = {
     "paid": "Paid Leave",
     "casual_sick": "Casual/Sick Leave",
     "floater": "Floater Leave",
+    "half_day": "Half-Day Leave",
+    "first_half": "First Half-Day Leave",
+    "second_half": "Second Half-Day Leave",
 }
 
 # Legacy values are still accepted so existing records continue to sync safely.
@@ -72,7 +75,6 @@ FLOATER_DATES_2026: frozenset[date] = frozenset([
     date(2026, 4, 3),    # Good Friday
     date(2026, 4, 14),   # Ambedkar Jayanti
     date(2026, 5, 27),   # Bakrid
-    date(2026, 6, 26),   # Muharram
     date(2026, 8, 15),   # Independence Day
     date(2026, 8, 26),   # Onam
     date(2026, 8, 28),   # Raksha Bandhan
@@ -90,6 +92,7 @@ FIXED_HOLIDAYS_2026: frozenset[date] = frozenset([
     date(2026, 1, 26),   # Republic Day
     date(2026, 3, 4),    # Holi
     date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 6, 26),   # Muharram
     date(2026, 9, 14),   # Ganesh Chaturthi
     date(2026, 10, 2),   # Mahatma Gandhi Jayanti
     date(2026, 11, 9),   # Govardhan Puja

@@ -134,7 +134,20 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
 
     for leave in sorted(leaves, key=lambda lv: (lv.start_date, lv.id)):
         ltype = normalize_leave_type(leave.leave_type)
-        paid_dates, unpaid_dates = set(), set()
+        paid_dates, unpaid_dates = {}, {}
+
+        if getattr(leave, "is_half_day", False):
+            # Half-day leave is always unpaid and does not consume any quotas.
+            for wd in _working_dates(leave.start_date, leave.end_date, year):
+                unpaid_dates[wd] = 0.5
+            classification[leave.id] = {
+                "paid_dates": {},
+                "unpaid_dates": unpaid_dates,
+                "type": "unpaid",
+                "weight": 0.5,
+            }
+            continue
+
         for wd in _working_dates(leave.start_date, leave.end_date, year):
             use_monthly = ltype == "paid" and (intern or (intern_until is not None and wd < intern_until))
             if use_monthly:
@@ -142,16 +155,16 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
                 key = (wd.year, wd.month)
                 used_paid_by_month[key] = used_paid_by_month.get(key, 0) + 1
                 if used_paid_by_month[key] <= INTERN_MONTHLY_PAID_QUOTA:
-                    paid_dates.add(wd)
+                    paid_dates[wd] = 1.0
                 else:
-                    unpaid_dates.add(wd)
+                    unpaid_dates[wd] = 1.0
             else:
                 quota = get_annual_leave_quota(ltype)
                 used[ltype] = used.get(ltype, 0) + 1
                 if used[ltype] <= quota:
-                    paid_dates.add(wd)
+                    paid_dates[wd] = 1.0
                 else:
-                    unpaid_dates.add(wd)
+                    unpaid_dates[wd] = 1.0
         classification[leave.id] = {"paid_dates": paid_dates, "unpaid_dates": unpaid_dates, "type": ltype}
 
     balances = {}
@@ -209,9 +222,9 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
         snap = saved_adjustments.get(leave_id) if saved_adjustments is not None else None
         if snap is not None:
             if snap.get("unpaid_days") is not None:
-                unpaid_days = max(0, min(int(snap["unpaid_days"]), days))
+                unpaid_days = max(0.0, min(float(snap["unpaid_days"]), days))
             else:  # legacy boolean-only row
-                unpaid_days = days if snap.get("deduct", True) else 0
+                unpaid_days = days if snap.get("deduct", True) else 0.0
             source = "manual"
         else:
             unpaid_days = auto_unpaid
@@ -332,9 +345,9 @@ def preview_payroll(
         for leave in sorted(emp_year_leaves, key=lambda lv: (lv.start_date, lv.id)):
             if leave.start_date > month_end or leave.end_date < month_start:
                 continue
-            cls = classification.get(leave.id, {"paid_dates": set(), "unpaid_dates": set()})
-            paid_in_month = sum(1 for d in cls["paid_dates"] if month_start <= d <= month_end)
-            unpaid_in_month = sum(1 for d in cls["unpaid_dates"] if month_start <= d <= month_end)
+            cls = classification.get(leave.id, {"paid_dates": {}, "unpaid_dates": {}})
+            paid_in_month = sum(cls["paid_dates"][d] for d in cls["paid_dates"] if month_start <= d <= month_end)
+            unpaid_in_month = sum(cls["unpaid_dates"][d] for d in cls["unpaid_dates"] if month_start <= d <= month_end)
             days_in_month = paid_in_month + unpaid_in_month
             if days_in_month <= 0:
                 continue
@@ -370,7 +383,7 @@ class LeaveAdjustmentIn(BaseModel):
     employee_id: int
     leave_id: int
     deduct: bool
-    unpaid_days: Optional[int] = None   # snapshot of unpaid working-days; preserves partial classifications
+    unpaid_days: Optional[float] = None   # snapshot of unpaid working-days; preserves partial classifications
 
 
 class SavePayrollBody(BaseModel):

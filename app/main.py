@@ -4,7 +4,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, onboarding
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, onboarding, company_settings, wifi_network
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -26,6 +26,8 @@ from app.api.referrals import router as referrals_router, external_router as ref
 from app.api.payroll import router as payroll_router
 from app.api.performance_reviews import router as performance_reviews_router
 from app.api.onboarding import router as onboarding_router
+from app.api.company_settings import router as company_settings_router
+from app.api.wifi_networks import router as wifi_networks_router
 from app.seed_skills import seed_skills
 
 Base.metadata.create_all(bind=engine)
@@ -73,20 +75,49 @@ sync_main_project_schema()
 
 
 def sync_leave_schema() -> None:
-    """Backfill missing leave columns on existing local databases."""
+    """Backfill missing leave columns on existing local and production databases."""
     inspector = inspect(engine)
     try:
         columns = {column["name"] for column in inspector.get_columns("leaves")}
     except Exception:
         return
 
-    if "razorpay_applied" in columns:
+    statements = []
+    dialect = engine.dialect.name
+
+    if "reason" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN reason TEXT")
+    if "status" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN status VARCHAR(50) DEFAULT 'pending'")
+    if "approved_by" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN approved_by INTEGER")
+    if "razorpay_applied" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN razorpay_applied BOOLEAN DEFAULT FALSE")
+    if "flagged" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN flagged BOOLEAN DEFAULT FALSE")
+    if "approval_remark" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN approval_remark TEXT")
+    if "is_half_day" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN is_half_day BOOLEAN DEFAULT FALSE")
+    if "half_day_slot" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN half_day_slot VARCHAR(50)")
+    if "created_at" not in columns:
+        if dialect == "sqlite":
+            statements.append("ALTER TABLE leaves ADD COLUMN created_at TIMESTAMP")
+        else:
+            statements.append("ALTER TABLE leaves ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    if "updated_at" not in columns:
+        if dialect == "sqlite":
+            statements.append("ALTER TABLE leaves ADD COLUMN updated_at TIMESTAMP")
+        else:
+            statements.append("ALTER TABLE leaves ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+
+    if not statements:
         return
 
     with engine.begin() as connection:
-        connection.execute(
-            text("ALTER TABLE leaves ADD COLUMN razorpay_applied BOOLEAN NOT NULL DEFAULT FALSE")
-        )
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 sync_leave_schema()
@@ -421,6 +452,48 @@ def sync_payroll_schema() -> None:
 
 
 sync_payroll_schema()
+
+
+def sync_company_settings_schema() -> None:
+    """Create the company_settings table on existing databases if missing."""
+    inspector = inspect(engine)
+    try:
+        tables = set(inspector.get_table_names())
+    except Exception:
+        return
+    if "company_settings" not in tables:
+        company_settings.Base.metadata.tables["company_settings"].create(bind=engine)
+
+    # Seed default generic settings if missing
+    from sqlalchemy.orm import Session as _Session
+    with _Session(engine) as session:
+        from app.models.company_settings import CompanySetting
+        
+        default_settings = {
+            "office_address": "703, Lodha Supremus\nSaki Vihar Road, Opposite L&T Gate No. 6\nPowai, Mumbai, Maharashtra – 400072\nIndia",
+            "google_maps_link": "https://maps.google.com/?q=703+Lodha+Supremus+Saki+Vihar+Road+Powai+Mumbai",
+            "company_perks": "Flexible working hours with remote work options\nHealth insurance coverage for employees\nProfessional development & learning budget\nFestival and performance-based bonuses\nPaid national holidays and floater leaves\nWeekend contribution compensation"
+        }
+        
+        for key, value in default_settings.items():
+            if session.query(CompanySetting).filter_by(key=key).count() == 0:
+                session.add(CompanySetting(key=key, value=value))
+        
+        session.commit()
+
+
+def sync_wifi_networks_schema() -> None:
+    """Create the wifi_networks table on existing databases if missing."""
+    inspector = inspect(engine)
+    try:
+        tables = set(inspector.get_table_names())
+    except Exception:
+        return
+    if "wifi_networks" not in tables:
+        wifi_network.Base.metadata.tables["wifi_networks"].create(bind=engine)
+
+sync_company_settings_schema()
+sync_wifi_networks_schema()
 seed_skills()
 
 app = FastAPI(title="Autonex Resource Planning Tool V2")
@@ -459,4 +532,6 @@ app.include_router(referrals_external_router)
 app.include_router(payroll_router)
 app.include_router(performance_reviews_router)
 app.include_router(onboarding_router)
+app.include_router(company_settings_router)
+app.include_router(wifi_networks_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
