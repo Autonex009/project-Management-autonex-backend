@@ -345,7 +345,7 @@ def get_all_leaves(
     if employee_id:
         query = query.filter(Leave.employee_id == employee_id)
 
-    leaves = query.all()
+    leaves = query.order_by(Leave.id.desc()).all()
     return [
         LeaveSchema(
             leave_id=leave.id,
