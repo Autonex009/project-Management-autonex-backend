@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from sqlalchemy import inspect, text
@@ -28,7 +29,9 @@ from app.api.performance_reviews import router as performance_reviews_router
 from app.api.onboarding import router as onboarding_router
 from app.api.company_settings import router as company_settings_router
 from app.api.wifi_networks import router as wifi_networks_router
+from app.api.hiring_sync import router as hiring_sync_router
 from app.seed_skills import seed_skills
+from app.services.scheduler_service import start_scheduler, shutdown_scheduler
 
 Base.metadata.create_all(bind=engine)
 
@@ -496,7 +499,15 @@ sync_company_settings_schema()
 sync_wifi_networks_schema()
 seed_skills()
 
-app = FastAPI(title="Autonex Resource Planning Tool V2")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    start_scheduler()
+    yield
+    shutdown_scheduler()
+
+
+app = FastAPI(title="Autonex Resource Planning Tool V2", lifespan=lifespan)
+
 
 if os.environ.get("VERCEL"):
     uploads_dir = Path("/tmp/uploads")
@@ -534,4 +545,5 @@ app.include_router(performance_reviews_router)
 app.include_router(onboarding_router)
 app.include_router(company_settings_router)
 app.include_router(wifi_networks_router)
+app.include_router(hiring_sync_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
