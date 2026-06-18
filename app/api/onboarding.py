@@ -22,7 +22,6 @@ from app.models.onboarding import (
     OnboardingQuizQuestion,
     OnboardingProgress,
     OnboardingQuizAttempt,
-    OnboardingTeamMember,
 )
 from app.schemas.onboarding import (
     OnboardingModuleCreate,
@@ -33,8 +32,6 @@ from app.schemas.onboarding import (
     OnboardingQuizAttemptResponse,
     OnboardingProgressCreate,
     OnboardingProgressResponse,
-    OnboardingTeamMemberCreate,
-    OnboardingTeamMemberResponse,
     OnboardingDocumentCreate,
     OnboardingQuizQuestionCreate,
 )
@@ -639,157 +636,6 @@ def submit_quiz(
         "correctCount": correct_count,
         "totalQuestions": len(payload.answers),
     }
-
-
-# ── Team Members CRUD ─────────────────────────────────────────────────
-
-@router.get("/team", response_model=List[OnboardingTeamMemberResponse])
-def get_team_members(db: Session = Depends(get_db)):
-    """Retrieve all team contacts sorted by department."""
-    return db.query(OnboardingTeamMember).order_by(
-        OnboardingTeamMember.department.asc(),
-        OnboardingTeamMember.name.asc()
-    ).all()
-
-
-@router.post("/team", response_model=OnboardingTeamMemberResponse, status_code=status.HTTP_201_CREATED)
-def create_team_member(
-    payload: OnboardingTeamMemberCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
-):
-    """Add a team member contact."""
-    member = OnboardingTeamMember(**payload.model_dump())
-    db.add(member)
-    db.commit()
-    db.refresh(member)
-    return member
-
-
-@router.put("/team/{member_id}", response_model=OnboardingTeamMemberResponse)
-def update_team_member(
-    member_id: int,
-    payload: OnboardingTeamMemberCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
-):
-    """Edit a team member contact."""
-    member = db.query(OnboardingTeamMember).filter(OnboardingTeamMember.id == member_id).first()
-    if not member:
-        raise HTTPException(status_code=404, detail="Team member not found")
-
-    for key, value in payload.model_dump(exclude_unset=True).items():
-        setattr(member, key, value)
-
-    db.commit()
-    db.refresh(member)
-    return member
-
-
-@router.delete("/team/{member_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_team_member(
-    member_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
-):
-    """Remove a team member contact."""
-    member = db.query(OnboardingTeamMember).filter(OnboardingTeamMember.id == member_id).first()
-    if not member:
-        raise HTTPException(status_code=404, detail="Team member not found")
-    db.delete(member)
-    db.commit()
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
-
-
-@router.get("/team/sample-excel")
-def download_team_sample():
-    """Download template Excel for team bulk import."""
-    if not OPENPYXL_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Excel library (openpyxl) is not installed on the server.")
-
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Team Members"
-
-    headers = ['name', 'role', 'department', 'email', 'linkedin', 'slack']
-    ws.append(headers)
-
-    ws.append(['Emily Rodriguez', 'HR Business Partner', 'Human Resources', 'emily@company.com', 'https://linkedin.com/in/emily', ''])
-    ws.append(['Raj Malhotra', 'Engineering Manager', 'Engineering', 'raj@company.com', '', ''])
-
-    file_stream = io.BytesIO()
-    wb.save(file_stream)
-    file_stream.seek(0)
-
-    return StreamingResponse(
-        file_stream,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=autonex_team_sample.xlsx"}
-    )
-
-
-@router.post("/team/bulk-import")
-async def bulk_import_team(
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
-):
-    """Bulk import team members from an uploaded Excel file."""
-    if not OPENPYXL_AVAILABLE:
-        raise HTTPException(status_code=501, detail="Excel library (openpyxl) is not installed on the server.")
-
-    content = await file.read()
-    try:
-        wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Invalid Excel file.") from exc
-
-    ws = wb.active
-    rows = list(ws.iter_rows(values_only=True))
-
-    if not rows or len(rows) < 2:
-        raise HTTPException(status_code=400, detail="Empty sheet or missing headers.")
-
-    headers = [str(h).strip().lower() for h in rows[0]]
-    required = ['name', 'role', 'department']
-    for req in required:
-        if req not in headers:
-            raise HTTPException(status_code=400, detail=f"Missing required header column: {req}")
-
-    n_idx = headers.index('name')
-    r_idx = headers.index('role')
-    d_idx = headers.index('department')
-    e_idx = headers.index('email') if 'email' in headers else None
-    l_idx = headers.index('linkedin') if 'linkedin' in headers else None
-    s_idx = headers.index('slack') if 'slack' in headers else None
-
-    created = 0
-    errors = []
-
-    for row_num, row in enumerate(rows[1:], start=2):
-        if not row or all(v is None for v in row):
-            continue
-
-        name = str(row[n_idx]).strip() if row[n_idx] is not None else ""
-        role = str(row[r_idx]).strip() if row[r_idx] is not None else ""
-        dept = str(row[d_idx]).strip() if row[d_idx] is not None else ""
-        email = str(row[e_idx]).strip() if e_idx is not None and row[e_idx] is not None else None
-        linkedin = str(row[l_idx]).strip() if l_idx is not None and row[l_idx] is not None else None
-        slack = str(row[s_idx]).strip() if s_idx is not None and row[s_idx] is not None else None
-
-        if not name or not role or not dept:
-            errors.append(f"Row {row_num}: Name, role, and department are required.")
-            continue
-
-        member = OnboardingTeamMember(
-            name=name, role=role, department=dept,
-            email=email, linkedin=linkedin, slack=slack
-        )
-        db.add(member)
-        created += 1
-
-    db.commit()
-    return {"message": f"Bulk import complete: {created} contacts created", "created": created, "errors": errors}
 
 
 # ── Candidates / Dashboard Endpoints ────────────────────────────────────
