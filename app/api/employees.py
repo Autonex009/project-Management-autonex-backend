@@ -23,6 +23,7 @@ from app.schemas.employee import (
 )
 from app.services.auth_service import hash_password
 from app.services.identity_validator import check_duplicate_identity
+from app.services.slack_service import try_get_or_cache_employee_slack_user_id
 
 router = APIRouter(
     prefix="/api/employees",
@@ -395,4 +396,33 @@ def get_employee_availability(employee_id: int, db: Session = Depends(get_db)):
             {"id": w.id, "date": w.wfh_date.isoformat(), "status": w.status, "reason": w.reason}
             for w in past_wfh
         ],
+    }
+
+
+# ✅ SLACK DM DEEP-LINK (resolve/cache the employee's Slack user id on demand)
+@router.get("/{employee_id}/slack-link")
+def get_employee_slack_link(employee_id: int, db: Session = Depends(get_db)):
+    """Return a browser deep-link that opens a Slack DM with the employee.
+
+    The Slack user id is resolved (and cached) on demand from the employee's
+    email when it isn't already stored. Returns 404 when the employee can't be
+    matched to a Slack account.
+    """
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
+    if not slack_user_id:
+        raise HTTPException(
+            status_code=404,
+            detail="No Slack account found for this employee",
+        )
+
+    # app_redirect opens the conversation in the browser (or the desktop app if
+    # installed) without needing the workspace/team id.
+    return {
+        "employee_id": employee.id,
+        "slack_user_id": slack_user_id,
+        "url": f"https://slack.com/app_redirect?channel={slack_user_id}",
     }
