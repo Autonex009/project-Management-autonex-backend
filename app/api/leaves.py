@@ -509,10 +509,10 @@ def validate_consecutive_leaves(
         if not is_weekend(cur) and not is_fixed_holiday(cur):
             if cur in leave_working_days:
                 consecutive_run += 1
-                if consecutive_run >= 4:
+                if consecutive_run >= 5:
                     raise HTTPException(
                         status_code=400,
-                        detail="Safe guard triggered: You cannot apply for 4 or more consecutive leaves."
+                        detail="Safe guard triggered: You cannot apply for 5 or more consecutive leaves."
                     )
             else:
                 consecutive_run = 0
