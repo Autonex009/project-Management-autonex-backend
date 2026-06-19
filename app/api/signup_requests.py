@@ -239,6 +239,35 @@ def approve_signup_request(
     }
 
 
+class UpdateSignupRequest(BaseModel):
+    employee_type: Optional[str] = None
+    designation: Optional[str] = None
+
+
+@router.patch("/{request_id}", response_model=SignupRequestResponse)
+def update_signup_request(
+    request_id: int,
+    payload: UpdateSignupRequest,
+    db: Session = Depends(get_db),
+):
+    """Update editable fields (employee_type, designation) on a pending signup request."""
+    req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Signup request not found")
+    if req.status != "pending":
+        raise HTTPException(status_code=400, detail="Only pending requests can be edited")
+
+    if payload.employee_type is not None:
+        req.employee_type = payload.employee_type
+    if payload.designation is not None:
+        req.designation = payload.designation
+
+    db.commit()
+    db.refresh(req)
+    logger.info("[signup-request] Updated id=%s employee_type=%s", req.id, req.employee_type)
+    return _to_response(req)
+
+
 @router.patch("/{request_id}/reject")
 def reject_signup_request(
     request_id: int,

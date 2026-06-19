@@ -1,24 +1,19 @@
 import json
 import logging
 import os
-import secrets
-import string
 import urllib.error
 import urllib.request
 
 from sqlalchemy.orm import Session
 
-from app.api.employees import get_user_role_from_designation
 from app.models.employee import Employee
+from app.models.signup_request import SignupRequest
 from app.models.user import User
-from app.services.auth_service import hash_password
-from app.services.email_service import try_send_signup_approved_email
 
 logger = logging.getLogger(__name__)
 
 HIRING_PORTAL_BASE_URL = os.getenv("HIRING_PORTAL_BASE_URL", "http://127.0.0.1:8001")
 HIRING_PORTAL_API_KEY = os.getenv("HIRING_PORTAL_API_KEY", "")
-PORTAL_URL = os.getenv("PORTAL_URL", "http://localhost:5173")
 
 _JOB_TYPE_MAP = {
     "full-time": "Full-time",
@@ -34,11 +29,6 @@ _JOB_TYPE_MAP = {
 _VALID_DESIGNATIONS = {"Program Manager", "Developer", "QA", "Reviewer", "Annotator"}
 
 
-def _gen_temp_password(length: int = 10) -> str:
-    alphabet = string.ascii_letters + string.digits + "!@#$"
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
 def _map_employee_type(job_type: str | None) -> str:
     return _JOB_TYPE_MAP.get((job_type or "").lower(), "Full-time")
 
@@ -49,10 +39,10 @@ def _map_designation(job_title: str | None) -> str:
 
 def fetch_hired_candidates() -> list[dict]:
     """Fetch hired candidates from the hiring portal. Raises RuntimeError on failure."""
-    url = f"{HIRING_PORTAL_BASE_URL}/api/hr/hired-candidates"
+    url = f"{HIRING_PORTAL_BASE_URL}/api/integrations/pm/hired-candidates"
     req = urllib.request.Request(url)
     if HIRING_PORTAL_API_KEY:
-        req.add_header("Authorization", f"Bearer {HIRING_PORTAL_API_KEY}")
+        req.add_header("X-PM-API-Key", HIRING_PORTAL_API_KEY)
     req.add_header("Accept", "application/json")
 
     try:
@@ -70,13 +60,16 @@ def fetch_hired_candidates() -> list[dict]:
 
 def run_sync(db: Session) -> dict:
     """
-    Pull hired candidates from the hiring portal and create them as employees.
+    Pull hired candidates from the hiring portal and create SignupRequests.
 
-    - Skips candidates already present in the PM portal (matched by email).
-    - Creates both an Employee row and a linked User account with a random temp password.
-    - Emails credentials to each new hire via Brevo.
-    - Uses savepoints so one failure does not roll back successfully imported records.
-    - Raises RuntimeError if the hiring portal cannot be reached.
+    Flow:
+      - Fetch all candidates with hr_status == "hired"
+      - Skip if already in employees, users, or signup_requests (pending/approved)
+      - Create a SignupRequest (status=pending) for each new hire
+      - Admin reviews and approves in the Signup Requests panel
+      - On approval, existing logic creates Employee + User and sends email credentials
+
+    Raises RuntimeError if the hiring portal cannot be reached.
     """
     candidates = fetch_hired_candidates()
 
@@ -87,7 +80,7 @@ def run_sync(db: Session) -> dict:
             continue
 
         email = c.get("email", "").strip()
-        name = c.get("name", "").strip()
+        name  = c.get("name", "").strip()
 
         if not email or not name:
             errors.append({
@@ -96,82 +89,74 @@ def run_sync(db: Session) -> dict:
             })
             continue
 
-        #  check both tables — Employee row can be deleted while User row persists,
-        # which would cause a unique-email constraint violation on User creation.
-        employee_exists = db.query(Employee).filter(Employee.email == email).first() is not None
-        user_exists = db.query(User).filter(User.email == email).first() is not None
-        if employee_exists or user_exists:
-            skipped.append({"email": email, "reason": "Already exists in PM portal"})
+        # Skip if already fully onboarded (Employee or User row exists)
+        if db.query(Employee).filter(Employee.email == email).first():
+            skipped.append({"email": email, "reason": "Already exists as employee"})
+            continue
+        if db.query(User).filter(User.email == email).first():
+            skipped.append({"email": email, "reason": "Already has a user account"})
             continue
 
+        # Skip if a signup request already exists (pending or approved)
+        # Rejected ones are allowed to re-enter
+        existing_req = db.query(SignupRequest).filter(SignupRequest.email == email).first()
+        if existing_req and existing_req.status != "rejected":
+            skipped.append({
+                "email": email,
+                "reason": f"Signup request already exists (status: {existing_req.status})",
+            })
+            continue
+
+        # If a rejected request exists for this email, remove it first (allow re-import)
+        if existing_req and existing_req.status == "rejected":
+            db.delete(existing_req)
+            db.flush()
+
         employee_type = _map_employee_type(c.get("job_type"))
-        designation = _map_designation(c.get("job_title"))
-        temp_password = _gen_temp_password()
+        designation   = _map_designation(c.get("job_title"))
 
         try:
             with db.begin_nested():
-                employee = Employee(
+                signup_req = SignupRequest(
                     name=name,
                     email=email,
                     phone=c.get("phone"),
-                    employee_type=employee_type,
                     designation=designation,
-                    working_hours_per_day=8.0,
-                    weekly_availability=40.0,
+                    employee_type=employee_type,
                     skills=[],
-                    productivity_baseline=1.0,
-                    status="active",
+                    # reason field used to track this came from the hiring portal
+                    reason=f"Auto-imported from hiring portal | Job: {c.get('job_title')} | App ID: {c.get('application_id')}",
+                    status="pending",
                 )
-                db.add(employee)
-                db.flush()
-
-                user = User(
-                    email=email,
-                    password_hash=hash_password(temp_password),
-                    name=name,
-                    role=get_user_role_from_designation(designation),
-                    employee_id=employee.id,
-                    skills=[],
-                    is_active=True,
-                )
-                db.add(user)
-                db.flush()
-
-            email_sent = try_send_signup_approved_email(
-                to_email=email,
-                to_name=name,
-                temp_password=temp_password,
-                portal_url=PORTAL_URL,
-            )
+                db.add(signup_req)
 
             imported.append({
-                "name": name,
-                "email": email,
-                "employee_type": employee_type,
-                "designation": designation,
-                "doc_status": c.get("doc_status"),
+                "name":           name,
+                "email":          email,
+                "employee_type":  employee_type,
+                "designation":    designation,
+                "doc_status":     c.get("doc_status"),
                 "application_id": c.get("application_id"),
-                "email_sent": email_sent,
             })
 
         except Exception as exc:
-            logger.error("[hiring_sync] Failed to import %s: %s", email, exc)
+            logger.error("[hiring_sync] Failed to create signup request for %s: %s", email, exc)
             errors.append({"email": email, "reason": str(exc)})
 
     db.commit()
 
     result = {
         "imported": len(imported),
-        "skipped": len(skipped),
-        "errors": len(errors),
+        "skipped":  len(skipped),
+        "errors":   len(errors),
         "details": {
             "imported": imported,
-            "skipped": skipped,
-            "errors": errors,
+            "skipped":  skipped,
+            "errors":   errors,
         },
     }
     logger.info(
-        "[hiring_sync] Done — imported=%s skipped=%s errors=%s",
+        "[hiring_sync] Done — signup_requests created=%s skipped=%s errors=%s",
         result["imported"], result["skipped"], result["errors"],
     )
     return result
