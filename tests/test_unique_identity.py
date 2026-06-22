@@ -44,7 +44,10 @@ import app.services.auth_service as auth_service
 
 # Stub password hashing/verification so passlib/bcrypt combination issues in python-bcrypt do not break tests
 employees_api.hash_password = lambda pw: "hashed-pw"
-signup_requests_api.bcrypt = type('dummy', (object,), {'hashpw': lambda pw, salt: b"hashed-pw"})
+signup_requests_api.bcrypt = type('dummy', (object,), {
+    'hashpw': lambda pw, salt: b"hashed-pw",
+    'gensalt': lambda: b"dummy-salt"
+})
 auth_api.hash_password = lambda pw: "hashed-pw"
 auth_api.verify_password = lambda plain, hashed: True
 
@@ -254,3 +257,35 @@ def test_auto_link_prevents_duplicate_user(client_and_db):
     })
     assert resp.status_code == 409
     assert "already linked" in resp.json()["detail"]
+
+
+def test_update_employee_with_existing_signup_request(client_and_db):
+    client, db = client_and_db
+    
+    # 1. Submit signup request
+    signup_resp = client.post("/api/signup-requests", json={
+        "name": "Jane Doe",
+        "email": "jane@autonex.com",
+        "phone": "9876543219",
+        "designation": "Developer",
+        "employee_type": "Full-time"
+    })
+    assert signup_resp.status_code == 201
+    signup_id = signup_resp.json()["id"]
+
+    # 2. Approve it to create the Employee + User
+    approve_resp = client.patch(f"/api/signup-requests/{signup_id}/approve")
+    assert approve_resp.status_code == 200
+    employee_id = approve_resp.json()["employee_id"]
+
+    # 3. Update the employee (e.g. set status to inactive, sending the email and phone)
+    update_resp = client.put(f"/api/employees/{employee_id}", json={
+        "name": "Jane Doe",
+        "email": "jane@autonex.com",
+        "phone": "9876543219",
+        "employee_type": "Full-time",
+        "status": "inactive"
+    })
+    assert update_resp.status_code == 200
+    assert update_resp.json()["status"] == "inactive"
+

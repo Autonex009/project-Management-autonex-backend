@@ -25,6 +25,15 @@ def check_duplicate_identity(
     """
     normalized_incoming_phone = normalize_phone(phone)
 
+    # Find the existing employee if updating an existing record (by employee_id or user_id)
+    existing_employee = None
+    if exclude_employee_id:
+        existing_employee = db.query(Employee).filter(Employee.id == exclude_employee_id).first()
+    elif exclude_user_id:
+        user = db.query(User).filter(User.id == exclude_user_id).first()
+        if user and user.employee_id:
+            existing_employee = db.query(Employee).filter(Employee.id == user.employee_id).first()
+
     # 1. Check existing Employees
     employees = db.query(Employee).all()
     for emp in employees:
@@ -80,6 +89,24 @@ def check_duplicate_identity(
         if exclude_signup_request_id and req.id == exclude_signup_request_id:
             continue
         
+        # If this signup request belongs to the employee being updated, skip it.
+        if existing_employee:
+            is_own_request = False
+            if existing_employee.email and req.email and req.email.lower().strip() == existing_employee.email.lower().strip():
+                is_own_request = True
+            if not is_own_request and existing_employee.phone and req.phone:
+                req_phone_normalized = normalize_phone(req.phone)
+                emp_phone_normalized = normalize_phone(existing_employee.phone)
+                if req_phone_normalized and emp_phone_normalized and (
+                    req_phone_normalized == emp_phone_normalized or (
+                        len(req_phone_normalized) >= 10 and len(emp_phone_normalized) >= 10 and
+                        req_phone_normalized[-10:] == emp_phone_normalized[-10:]
+                    )
+                ):
+                    is_own_request = True
+            if is_own_request:
+                continue
+
         # Check email match
         if email:
             incoming_email_lower = email.lower().strip()
