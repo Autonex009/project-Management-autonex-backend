@@ -920,20 +920,58 @@ def get_full_analytics(
 def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] = None) -> List[dict]:
     if candidates is None:
         candidates = get_onboarding_candidates(db)
+
     modules = db.query(OnboardingModule).filter(OnboardingModule.status.ilike("PUBLISHED")).all()
+    if not candidates:
+        return []
+
+    # Batch-load the module → section → question structure once (avoids per-candidate
+    # lazy-loaded relationship round-trips, which are very slow against a remote DB).
+    module_ids = [m.id for m in modules]
+    sections = db.query(OnboardingSection).filter(
+        OnboardingSection.module_id.in_(module_ids)
+    ).all() if module_ids else []
+    section_ids = [s.id for s in sections]
+    questions = db.query(OnboardingQuizQuestion).filter(
+        OnboardingQuizQuestion.section_id.in_(section_ids)
+    ).all() if section_ids else []
+
+    total_sections_by_module: dict = {}
+    for s in sections:
+        total_sections_by_module[s.module_id] = total_sections_by_module.get(s.module_id, 0) + 1
+    section_module = {s.id: s.module_id for s in sections}
+    questions_by_module: dict = {}
+    for q in questions:
+        mid = section_module.get(q.section_id)
+        if mid is not None:
+            questions_by_module.setdefault(mid, []).append(q)
+
+    # Batch-load per-candidate data with one query each (.in_(ids) + group in Python).
+    candidate_user_ids = [c.id for c in candidates]
+    employee_ids = [c.employee_id for c in candidates if c.employee_id]
+    employees_by_id = {
+        e.id: e for e in db.query(Employee).filter(Employee.id.in_(employee_ids)).all()
+    } if employee_ids else {}
+
+    progress_by_user: dict = {}
+    for p in db.query(OnboardingProgress).filter(OnboardingProgress.user_id.in_(candidate_user_ids)).all():
+        progress_by_user.setdefault(p.user_id, []).append(p)
+
+    attempts_by_user: dict = {}
+    for a in db.query(OnboardingQuizAttempt).filter(OnboardingQuizAttempt.user_id.in_(candidate_user_ids)).all():
+        attempts_by_user.setdefault(a.user_id, []).append(a)
 
     reports = []
     for c in candidates:
-        employee = db.query(Employee).filter(Employee.id == c.employee_id).first()
+        employee = employees_by_id.get(c.employee_id)
         dept = employee.designation if employee else "Annotator"
 
-        progress_records = db.query(OnboardingProgress).filter(OnboardingProgress.user_id == c.id).all()
-        completed_section_ids = {p.section_id for p in progress_records}
+        progress_records = progress_by_user.get(c.id, [])
         completed_module_sections = {}
         for p in progress_records:
             completed_module_sections[p.module_id] = completed_module_sections.get(p.module_id, 0) + 1
 
-        quiz_attempts = db.query(OnboardingQuizAttempt).filter(OnboardingQuizAttempt.user_id == c.id).all()
+        quiz_attempts = attempts_by_user.get(c.id, [])
         attempt_map = {a.question_id: a.is_correct for a in quiz_attempts}
 
         total_progress = 0
@@ -943,20 +981,19 @@ def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] 
 
         module_stats = []
         for m in modules:
-            total_sections = len(m.sections)
+            total_sections = total_sections_by_module.get(m.id, 0)
             completed = completed_module_sections.get(m.id, 0)
             progress = int((completed / total_sections) * 100) if total_sections > 0 else 0
             total_progress += progress
 
             module_questions = 0
             module_correct = 0
-            for s in m.sections:
-                for q in s.questions:
-                    module_questions += 1
-                    total_questions += 1
-                    if attempt_map.get(q.id):
-                        module_correct += 1
-                        correct_answers += 1
+            for q in questions_by_module.get(m.id, []):
+                module_questions += 1
+                total_questions += 1
+                if attempt_map.get(q.id):
+                    module_correct += 1
+                    correct_answers += 1
 
             score = int((module_correct / module_questions) * 100) if module_questions > 0 else 0
             module_stats.append({
