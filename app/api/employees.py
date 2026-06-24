@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.database import get_db
-from app.constants.leave_types import is_intern
+from app.constants.leave_types import is_intern, is_intern_or_contractor
 from app.services.salary_crypto import encrypt_salary
 from app.models.allocation import Allocation
 from app.models.employee import Employee
@@ -195,10 +195,10 @@ def convert_to_fulltime(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    if not is_intern(employee.employee_type):
+    if not is_intern_or_contractor(employee.employee_type):
         raise HTTPException(
             status_code=400,
-            detail=f"Only interns can be converted to full-time (current type: {employee.employee_type}).",
+            detail=f"Only interns or contractors can be converted to full-time (current type: {employee.employee_type}).",
         )
 
     employee.previous_employee_type = employee.employee_type

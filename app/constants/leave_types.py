@@ -62,6 +62,17 @@ def is_intern(employee_type: str | None) -> bool:
     return (employee_type or "").strip().lower() == "intern"
 
 
+def is_contractor(employee_type: str | None) -> bool:
+    """True if the employee_type denotes a contractor/contract employee (case/space-insensitive)."""
+    val = (employee_type or "").strip().lower()
+    return val in ("contractor", "contract")
+
+
+def is_intern_or_contractor(employee_type: str | None) -> bool:
+    """True if the employee_type denotes an intern or a contractor."""
+    return is_intern(employee_type) or is_contractor(employee_type)
+
+
 # ── Approved floater holiday dates (2026) ───────────────────────────
 # Employees may only apply Floater Leave on these specific dates.
 FLOATER_DATES_2026: frozenset[date] = frozenset([

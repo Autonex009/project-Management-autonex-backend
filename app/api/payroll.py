@@ -35,6 +35,7 @@ from app.constants.leave_types import (
     ANNUAL_LEAVE_QUOTA,
     INTERN_MONTHLY_PAID_QUOTA,
     is_intern,
+    is_intern_or_contractor,
     get_leave_type_label,
 )
 from app.services.salary_crypto import decrypt_salary
@@ -159,12 +160,16 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
                 else:
                     unpaid_dates[wd] = 1.0
             else:
-                quota = get_annual_leave_quota(ltype)
-                used[ltype] = used.get(ltype, 0) + 1
-                if used[ltype] <= quota:
-                    paid_dates[wd] = 1.0
-                else:
+                is_intern_for_date = intern or (intern_until is not None and wd < intern_until)
+                if is_intern_for_date and ltype == "casual_sick":
                     unpaid_dates[wd] = 1.0
+                else:
+                    quota = get_annual_leave_quota(ltype)
+                    used[ltype] = used.get(ltype, 0) + 1
+                    if used[ltype] <= quota:
+                        paid_dates[wd] = 1.0
+                    else:
+                        unpaid_dates[wd] = 1.0
         classification[leave.id] = {"paid_dates": paid_dates, "unpaid_dates": unpaid_dates, "type": ltype}
 
     balances = {}
@@ -178,6 +183,10 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
                 "period": "month",
             }
             continue
+
+        if intern and ltype == "casual_sick":
+            quota = 0
+
         used_days = used.get(ltype, 0)
         balances[ltype] = {
             "quota": quota,
@@ -318,7 +327,7 @@ def preview_payroll(
     rows = []
     for emp in employees:
         emp_year_leaves = leaves_by_emp.get(emp.id, [])
-        emp_is_intern = is_intern(emp.employee_type)
+        emp_is_intern = is_intern_or_contractor(emp.employee_type)
         # A promoted intern keeps the monthly rule for leave taken before the promotion.
         intern_until = emp.converted_to_fulltime_at.date() if emp.converted_to_fulltime_at else None
         classification, balances = _classify_year_leaves(emp_year_leaves, year, emp_is_intern, intern_until)

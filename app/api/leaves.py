@@ -50,6 +50,7 @@ from app.constants.leave_types import (
     RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type,
     is_valid_floater_date, get_floater_dates_for_year,
     is_weekend, is_fixed_holiday, get_fixed_holidays_for_year,
+    is_intern_or_contractor,
 )
 from app.models.allocation import Allocation
 from app.models.employee import Employee
@@ -601,7 +602,8 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
             )
             .count()
         )
-        if paid_this_month >= 2:
+        limit = 1 if is_intern_or_contractor(employee.employee_type) else 2
+        if paid_this_month >= limit:
             flagged = True
 
     leave = Leave(
