@@ -126,6 +126,27 @@ def sync_leave_schema() -> None:
 sync_leave_schema()
 
 
+def sync_leave_half_day_schema() -> None:
+    """Backfill is_half_day and half_day_slot columns added in dev-staging."""
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns("leaves")}
+    except Exception:
+        return
+    statements = []
+    if "is_half_day" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN is_half_day BOOLEAN NOT NULL DEFAULT FALSE")
+    if "half_day_slot" not in columns:
+        statements.append("ALTER TABLE leaves ADD COLUMN half_day_slot TEXT")
+    if statements:
+        with engine.begin() as connection:
+            for stmt in statements:
+                connection.execute(text(stmt))
+
+
+sync_leave_half_day_schema()
+
+
 def sync_guideline_schema() -> None:
     """Create or backfill the guidelines table on existing databases."""
     inspector = inspect(engine)

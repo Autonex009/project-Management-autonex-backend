@@ -5,14 +5,21 @@ Automated pytest suite for the hiring sync pipeline.
 No real database, no real email, no real hiring portal needed —
 everything external is mocked so tests run fast and offline.
 
+New flow (as of hiring sync v2):
+  - run_sync() creates SignupRequest (pending) — NOT Employee/User directly
+  - Admin approves signup request → existing approval logic creates Employee+User+email
+  - Email is sent by signup_requests.py approve endpoint, NOT by run_sync
+
 Tests cover:
-  - New candidate creates Employee + User rows and fires email
-  - Duplicate detection via Employee table (normal case)
-  - Duplicate detection via User table (orphaned row edge case)
+  - New candidate creates a SignupRequest row (pending)
+  - Duplicate detection via Employee table
+  - Duplicate detection via User table (orphaned row)
+  - Duplicate detection via SignupRequest table (pending/approved)
+  - Rejected signup request is replaced on re-import
   - Candidate with hr_status != "hired" is silently ignored
   - Candidate missing name or email lands in errors[], not a crash
-  - job_type / job_title mapping to internal designation values
-  - /preview endpoint reports would_import correctly before any DB writes
+  - job_type / job_title mapping stored correctly in SignupRequest
+  - /preview endpoint reports would_import correctly
   - /sync endpoint returns correct summary counts
   - Both endpoints return 502 when hiring portal is unreachable
 
@@ -20,7 +27,6 @@ Run:
     venv/Scripts/python -m pytest tests/test_hiring_sync.py -v
 """
 import os
-# Remove SLACK_BOT_TOKEN so the Slack client doesn't try to connect during import
 os.environ.pop("SLACK_BOT_TOKEN", None)
 
 import sys
@@ -33,7 +39,6 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-# Make sure the backend root is on the path when running from the tests/ folder
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import app.db.database as database
@@ -61,29 +66,23 @@ import app.models.user             # noqa: F401
 import app.models.wfh              # noqa: F401
 
 from app.models.employee import Employee
+from app.models.signup_request import SignupRequest
 from app.models.user import User
 from app.api.hiring_sync import router as hiring_sync_router
 from app.services.hiring_sync_service import run_sync
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
-# Each test gets a completely fresh in-memory SQLite database.
-# Tables are created before the test and dropped after, so tests never share state.
 
 @pytest.fixture()
 def client_and_db():
-    """
-    Fixture for API-level tests.
-    Returns (TestClient, db_session) so a test can both call HTTP endpoints
-    and query the database directly to verify what was stored.
-    """
+    """Fixture for API-level tests — returns (TestClient, db_session)."""
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
     Base.metadata.create_all(bind=engine)
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-    # Replace the real get_db dependency with one that uses our test DB
     def override_get_db():
         db = TestingSessionLocal()
         try:
@@ -103,10 +102,7 @@ def client_and_db():
 
 @pytest.fixture()
 def db_only():
-    """
-    Fixture for unit-level tests that call run_sync() directly.
-    Only a db session is needed — no HTTP client.
-    """
+    """Fixture for unit-level tests that call run_sync() directly."""
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
     )
@@ -119,8 +115,6 @@ def db_only():
 
 
 # ── Helper: build a fake candidate dict ──────────────────────────────────────
-# Mirrors the shape returned by the hiring portal API.
-# Default values represent a normal hired developer — override only what a test needs.
 
 def _candidate(
     name="Alice Smith",
@@ -143,83 +137,47 @@ def _candidate(
 
 
 # ── Unit tests: run_sync() ────────────────────────────────────────────────────
-# These test the core service function directly, bypassing HTTP.
-# fetch_hired_candidates and try_send_signup_approved_email are always mocked
-# so no real hiring portal or Brevo account is needed.
 
-def test_new_candidate_creates_employee_and_user(db_only):
-    # Happy path: a hired candidate should result in one Employee + one User row
+def test_new_candidate_creates_signup_request(db_only):
+    # Happy path: a hired candidate creates a pending SignupRequest — NOT Employee/User
     candidates = [_candidate()]
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True):
-
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
         result = run_sync(db_only)
 
-    # Summary counts
     assert result["imported"] == 1
     assert result["skipped"] == 0
     assert result["errors"] == 0
 
-    # Employee row stored correctly
-    emp = db_only.query(Employee).filter(Employee.email == "alice@example.com").first()
-    assert emp is not None
-    assert emp.name == "Alice Smith"
-    assert emp.designation == "Developer"
-    assert emp.employee_type == "Full-time"
+    # SignupRequest created with correct data
+    req = db_only.query(SignupRequest).filter(SignupRequest.email == "alice@example.com").first()
+    assert req is not None
+    assert req.name == "Alice Smith"
+    assert req.status == "pending"
+    assert req.employee_type == "Full-time"
+    assert req.designation == "Developer"
 
-    # User row linked to Employee, active, with a hashed password (never plaintext)
-    user = db_only.query(User).filter(User.email == "alice@example.com").first()
-    assert user is not None
-    assert user.employee_id == emp.id   # FK correctly linked
-    assert user.is_active is True
-    assert user.password_hash != ""     # bcrypt hash stored, not empty
+    # Employee and User must NOT be created yet — only after admin approves
+    assert db_only.query(Employee).filter(Employee.email == "alice@example.com").first() is None
+    assert db_only.query(User).filter(User.email == "alice@example.com").first() is None
 
 
-def test_email_sent_flag_in_result(db_only):
-    # Verify the email function is called with the right arguments
-    # and that email_sent=True appears in the imported record
-    candidates = [_candidate()]
+def test_hiring_portal_source_recorded_in_reason(db_only):
+    # The reason field should record that this came from the hiring portal
+    candidates = [_candidate(application_id="APP-999")]
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True) as mock_email:
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
+        run_sync(db_only)
 
-        result = run_sync(db_only)
-
-    # Email must be called exactly once per imported candidate
-    mock_email.assert_called_once()
-    call_kwargs = mock_email.call_args.kwargs
-    assert call_kwargs["to_email"] == "alice@example.com"
-    assert call_kwargs["to_name"] == "Alice Smith"
-    # Password passed to email must be the same one stored in the DB (10 chars by default)
-    assert len(call_kwargs["temp_password"]) == 10
-
-    assert result["details"]["imported"][0]["email_sent"] is True
-
-
-def test_email_failure_does_not_roll_back_user(db_only):
-    # If Brevo is down, the account must still be created.
-    # The candidate can reset their password later — losing the account entirely is worse.
-    candidates = [_candidate()]
-
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=False):
-
-        result = run_sync(db_only)
-
-    # Account created despite email failure
-    assert result["imported"] == 1
-    assert db_only.query(User).filter(User.email == "alice@example.com").first() is not None
-    # Result honestly reports email was not sent
-    assert result["details"]["imported"][0]["email_sent"] is False
+    req = db_only.query(SignupRequest).filter(SignupRequest.email == "alice@example.com").first()
+    assert "hiring portal" in req.reason.lower()
+    assert "APP-999" in req.reason
 
 
 def test_duplicate_via_employee_table_is_skipped(db_only):
-    # Normal duplicate case: the candidate's email already exists in the employees table.
-    # Should skip silently, not create a second row or crash.
+    # If Employee already exists for the email, skip — don't create another signup request
     candidates = [_candidate()]
 
-    # Seed an existing Employee before the sync runs
     existing_emp = Employee(
         name="Alice Smith", email="alice@example.com",
         employee_type="Full-time", status="active",
@@ -227,22 +185,18 @@ def test_duplicate_via_employee_table_is_skipped(db_only):
     db_only.add(existing_emp)
     db_only.commit()
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True):
-
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
         result = run_sync(db_only)
 
     assert result["imported"] == 0
     assert result["skipped"] == 1
-    assert result["details"]["skipped"][0]["email"] == "alice@example.com"
+    assert db_only.query(SignupRequest).count() == 0
 
 
 def test_duplicate_via_user_table_is_skipped(db_only):
-    # Edge case: Employee row was manually deleted but the User row still exists.
-    # Without this check, creating a new User would cause a unique-email constraint crash.
+    # If User already exists (orphaned — no Employee row), skip gracefully
     candidates = [_candidate()]
 
-    # Only a User row exists — no matching Employee row
     existing_user = User(
         name="Alice Smith", email="alice@example.com",
         password_hash="irrelevant", role="employee", is_active=True,
@@ -250,41 +204,69 @@ def test_duplicate_via_user_table_is_skipped(db_only):
     db_only.add(existing_user)
     db_only.commit()
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True):
-
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
         result = run_sync(db_only)
 
-    # Should skip gracefully, not crash with IntegrityError
     assert result["imported"] == 0
     assert result["skipped"] == 1
 
 
-def test_non_hired_candidate_is_ignored(db_only):
-    # Candidates still in interview/screening must not be imported.
-    # Only hr_status == "hired" triggers account creation.
-    candidates = [_candidate(hr_status="interviewing")]
+def test_duplicate_via_pending_signup_request_is_skipped(db_only):
+    # If a pending SignupRequest already exists, don't create another one
+    candidates = [_candidate()]
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True):
+    existing_req = SignupRequest(
+        name="Alice Smith", email="alice@example.com",
+        employee_type="Full-time", status="pending",
+    )
+    db_only.add(existing_req)
+    db_only.commit()
 
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
         result = run_sync(db_only)
 
-    # Not imported, not skipped, not an error — just silently ignored
+    assert result["imported"] == 0
+    assert result["skipped"] == 1
+    assert db_only.query(SignupRequest).count() == 1  # still only the original
+
+
+def test_rejected_signup_request_is_replaced(db_only):
+    # A previously rejected request should be replaced on re-import (allow second chance)
+    candidates = [_candidate()]
+
+    rejected_req = SignupRequest(
+        name="Alice Smith", email="alice@example.com",
+        employee_type="Full-time", status="rejected",
+    )
+    db_only.add(rejected_req)
+    db_only.commit()
+
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
+        result = run_sync(db_only)
+
+    assert result["imported"] == 1
+    new_req = db_only.query(SignupRequest).filter(SignupRequest.email == "alice@example.com").first()
+    assert new_req.status == "pending"
+
+
+def test_non_hired_candidate_is_ignored(db_only):
+    # Only hr_status == "hired" triggers import — interviewing/screening are ignored
+    candidates = [_candidate(hr_status="interviewing")]
+
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
+        result = run_sync(db_only)
+
     assert result["imported"] == 0
     assert result["skipped"] == 0
     assert result["errors"] == 0
-    assert db_only.query(Employee).count() == 0
+    assert db_only.query(SignupRequest).count() == 0
 
 
 def test_missing_email_recorded_as_error(db_only):
-    # Bad data from the hiring portal (empty email) must not crash the whole sync.
-    # It should be recorded in errors[] and the loop continues to the next candidate.
+    # Bad data from hiring portal — empty email must not crash the sync
     candidates = [_candidate(email="")]
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True):
-
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
         result = run_sync(db_only)
 
     assert result["errors"] == 1
@@ -292,77 +274,57 @@ def test_missing_email_recorded_as_error(db_only):
 
 
 def test_missing_name_recorded_as_error(db_only):
-    # Same as above but for empty name — both fields are required to create an account
     candidates = [_candidate(name="")]
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True):
-
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
         result = run_sync(db_only)
 
     assert result["errors"] == 1
 
 
 def test_job_type_mapping(db_only):
-    # "internship" from the hiring portal must map to "Intern" employee_type
-    # "Reviewer" job_title must map to "Reviewer" designation (valid known title)
+    # "internship" → employee_type "Intern", "Reviewer" → designation "Reviewer"
     candidates = [_candidate(job_type="internship", job_title="Reviewer")]
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True):
-
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
         run_sync(db_only)
 
-    emp = db_only.query(Employee).filter(Employee.email == "alice@example.com").first()
-    assert emp.employee_type == "Intern"
-    assert emp.designation == "Reviewer"
+    req = db_only.query(SignupRequest).filter(SignupRequest.email == "alice@example.com").first()
+    assert req.employee_type == "Intern"
+    assert req.designation == "Reviewer"
 
 
 def test_unknown_job_title_defaults_to_annotator(db_only):
-    # If the hiring portal sends a job title we don't recognise,
-    # fall back to "Annotator" rather than storing garbage or crashing
+    # Unknown job title falls back to "Annotator"
     candidates = [_candidate(job_title="Wizard")]
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True):
-
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
         run_sync(db_only)
 
-    emp = db_only.query(Employee).filter(Employee.email == "alice@example.com").first()
-    assert emp.designation == "Annotator"
+    req = db_only.query(SignupRequest).filter(SignupRequest.email == "alice@example.com").first()
+    assert req.designation == "Annotator"
 
 
 def test_multiple_candidates_mixed_result(db_only):
-    # Real-world sync will have a mix: some imported, some not-hired, some bad data.
-    # Verifies the loop handles all three in one pass without aborting early.
     candidates = [
-        _candidate(name="Alice", email="alice@x.com", application_id="A1"),               # should import
-        _candidate(name="Bob",   email="bob@x.com",   application_id="A2", hr_status="interviewing"),  # ignored
-        _candidate(name="",      email="bad@x.com",   application_id="A3"),                # error
+        _candidate(name="Alice", email="alice@x.com", application_id="A1"),
+        _candidate(name="Bob",   email="bob@x.com",   application_id="A2", hr_status="interviewing"),
+        _candidate(name="",      email="bad@x.com",   application_id="A3"),
     ]
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True):
-
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
         result = run_sync(db_only)
 
     assert result["imported"] == 1   # Alice only
-    assert result["skipped"] == 0    # Bob was ignored (not hired), not counted as skipped
+    assert result["skipped"] == 0    # Bob ignored (not hired)
     assert result["errors"] == 1     # bad@x.com — missing name
+    assert db_only.query(SignupRequest).count() == 1
 
 
 # ── API tests: /preview and /sync endpoints ───────────────────────────────────
-# These tests call the actual FastAPI endpoints via HTTP (TestClient).
-# They verify that the API layer correctly delegates to the service layer
-# and converts RuntimeError → HTTP 502 when the hiring portal is unreachable.
-#
-# Note: preview patches app.api.hiring_sync.fetch_hired_candidates (import site),
-#       sync patches app.services.hiring_sync_service.fetch_hired_candidates (definition site).
-#       This is because preview calls it directly in the route handler,
-#       while sync goes through run_sync() which calls it internally.
 
 def test_preview_endpoint_shows_would_import(client_and_db):
-    # Fresh DB — candidate does not exist yet — preview should say would_import=True
+    # Fresh DB — no existing records — preview should say would_import=True
     client, _ = client_and_db
     candidates = [_candidate()]
 
@@ -376,8 +338,8 @@ def test_preview_endpoint_shows_would_import(client_and_db):
     assert data["candidates"][0]["skip_reason"] is None
 
 
-def test_preview_shows_skip_reason_for_existing(client_and_db):
-    # Candidate already in DB — preview must report would_import=False with a reason
+def test_preview_shows_skip_reason_for_existing_employee(client_and_db):
+    # Candidate already in employees table — preview must report would_import=False
     client, db = client_and_db
 
     db.add(Employee(name="Alice Smith", email="alice@example.com", employee_type="Full-time", status="active"))
@@ -393,13 +355,10 @@ def test_preview_shows_skip_reason_for_existing(client_and_db):
 
 
 def test_sync_endpoint_returns_summary(client_and_db):
-    # POST /api/hiring/sync should return the imported/skipped/errors counts
     client, _ = client_and_db
     candidates = [_candidate()]
 
-    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates), \
-         patch("app.services.hiring_sync_service.try_send_signup_approved_email", return_value=True):
-
+    with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=candidates):
         r = client.post("/api/hiring/sync")
 
     assert r.status_code == 200
@@ -410,8 +369,6 @@ def test_sync_endpoint_returns_summary(client_and_db):
 
 
 def test_sync_endpoint_returns_502_when_hiring_portal_unreachable(client_and_db):
-    # If the hiring portal is down, the API must return 502 Bad Gateway
-    # (not 500, not 200 with empty results)
     client, _ = client_and_db
 
     with patch(
@@ -425,11 +382,11 @@ def test_sync_endpoint_returns_502_when_hiring_portal_unreachable(client_and_db)
 
 
 def test_preview_endpoint_returns_502_when_hiring_portal_unreachable(client_and_db):
-    # Same 502 behaviour for the preview endpoint
     client, _ = client_and_db
 
+    # preview calls fetch_hired_candidates at the API module import site
     with patch(
-        "app.services.hiring_sync_service.fetch_hired_candidates",
+        "app.api.hiring_sync.fetch_hired_candidates",
         side_effect=RuntimeError("Cannot reach hiring portal: Connection refused"),
     ):
         r = client.get("/api/hiring/preview")

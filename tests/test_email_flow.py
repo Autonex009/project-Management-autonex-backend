@@ -43,11 +43,10 @@ os.environ["PORTAL_URL"] = "http://localhost:3000"
 from unittest.mock import patch
 
 # Import models so all DB tables exist when SessionLocal is used
-from app.models.employee import Employee
-from app.models.user import User
+from app.models.signup_request import SignupRequest
 
 # Import the same service function the scheduler calls — this is NOT a mock
-from app.services.hiring_sync_service import run_sync, _gen_temp_password
+from app.services.hiring_sync_service import run_sync
 
 # Use the real SessionLocal which connects to Neon DB via .env DATABASE_URL
 from app.db.database import SessionLocal
@@ -78,29 +77,17 @@ def cleanup():
     """
     Remove the test Employee and User rows from Neon DB.
     Must delete User first because users.employee_id has a FK reference to employees.id —
-    deleting Employee first would raise a ForeignKeyViolation.
+    deleting the SignupRequest row.
     """
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.email == TEST_EMAIL).first()
-        emp  = db.query(Employee).filter(Employee.email == TEST_EMAIL).first()
-
-        # Delete User first — it holds the FK reference to Employee
-        if user:
-            db.delete(user)
-            db.flush()                              # execute DELETE immediately so FK is released
-            print(f"Deleted User row     → {TEST_EMAIL}")
-
-        if emp:
-            db.delete(emp)
-            db.flush()
-            print(f"Deleted Employee row → {TEST_EMAIL}")
-
-        if user or emp:
+        req = db.query(SignupRequest).filter(SignupRequest.email == TEST_EMAIL).first()
+        if req:
+            db.delete(req)
             db.commit()
-            print("Cleanup done.")
+            print(f"Deleted SignupRequest → {TEST_EMAIL}")
         else:
-            print("Nothing to clean up — test account not found.")
+            print("Nothing to clean up — test signup request not found.")
     finally:
         db.close()
 
@@ -111,43 +98,27 @@ def run():
     """
     Run the hiring sync with a hardcoded test candidate.
 
-    Flow:
-      fetch_hired_candidates()          <- MOCKED  (returns TEST_CANDIDATE)
-      run_sync(db)                      <- REAL    (creates Employee + User in Neon DB)
-      try_send_signup_approved_email()  <- REAL    (calls Brevo API)
+    New flow:
+      fetch_hired_candidates()  <- MOCKED  (returns TEST_CANDIDATE)
+      run_sync(db)              <- REAL    (creates SignupRequest in Neon DB)
+
+    Email is sent when admin approves the signup request — not here.
+    Go to Admin panel → Signup Requests → Approve to test the email.
     """
     db = SessionLocal()
     try:
-        # Guard: if this email already exists in DB, skip to avoid duplicate error
-        emp_exists  = db.query(Employee).filter(Employee.email == TEST_EMAIL).first()
-        user_exists = db.query(User).filter(User.email == TEST_EMAIL).first()
-
-        if emp_exists or user_exists:
-            print(f"\n⚠️  {TEST_EMAIL} already exists in the DB.")
+        # Guard: if a signup request already exists, skip
+        existing = db.query(SignupRequest).filter(SignupRequest.email == TEST_EMAIL).first()
+        if existing:
+            print(f"\n⚠️  SignupRequest for {TEST_EMAIL} already exists (status: {existing.status}).")
             print("Run with --cleanup first, then re-run.\n")
             return
 
-        # Intercept _gen_temp_password so we can print the password in the terminal.
-        # The same password is stored (hashed) in the DB and sent in the email.
-        captured = {}
-        original_gen = __import__(
-            "app.services.hiring_sync_service", fromlist=["_gen_temp_password"]
-        )._gen_temp_password
-
-        def capturing_gen(length=10):
-            # Generate the password using the real function, then capture it
-            pwd = original_gen(length)
-            captured["password"] = pwd
-            return pwd
-
-        print(f"\nSending test email to: {TEST_EMAIL}")
-        print(f"Portal URL in email:   {os.environ['PORTAL_URL']}")
-        print(f"Sender:                {os.getenv('MAIL_FROM', '(MAIL_FROM not set)')}")
+        print(f"\nCreating SignupRequest for: {TEST_EMAIL}")
         print("-" * 50)
 
         # Run the actual sync — only the HTTP call to the hiring portal is mocked
-        with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=[TEST_CANDIDATE]), \
-             patch("app.services.hiring_sync_service._gen_temp_password", side_effect=capturing_gen):
+        with patch("app.services.hiring_sync_service.fetch_hired_candidates", return_value=[TEST_CANDIDATE]):
             result = run_sync(db)
 
         # Print summary
@@ -158,38 +129,22 @@ def run():
         print(f"{'='*50}")
 
         if result["imported"] == 1:
-            detail     = result["details"]["imported"][0]
-            email_sent = detail["email_sent"]
-            password   = captured.get("password", "(not captured)")
-
-            print(f"\n✅ Account created in Neon DB")
-            print(f"   Email       : {TEST_EMAIL}")
-            print(f"   Password    : {password}")   # same value that was emailed
-            print(f"   Role        : {detail['designation']}")
-            print(f"   email_sent  : {email_sent}")
-
-            if email_sent:
-                print(f"\n📧 Email sent via Brevo! Check {TEST_EMAIL}")
-            else:
-                # Account exists — candidate can still log in with the printed password
-                print(f"\n⚠️  Email NOT sent (Brevo error — check logs above)")
-                print(f"   You can still log in manually with password: {password}")
-
-            print(f"\n▶  Next steps:")
-            print(f"   1. Start backend:  uvicorn app.main:app --reload")
-            print(f"   2. Start frontend: npm run dev  (localhost:3000)")
-            print(f"   3. Log in at http://localhost:3000 with:")
-            print(f"        Email    : {TEST_EMAIL}")
-            print(f"        Password : {password}")
-            print(f"\n   To remove this test account afterwards:")
+            detail = result["details"]["imported"][0]
+            print(f"\n✅ SignupRequest created (status: pending)")
+            print(f"   Email         : {TEST_EMAIL}")
+            print(f"   Designation   : {detail['designation']}")
+            print(f"   Employee type : {detail['employee_type']}")
+            print(f"\n▶  Next steps to test email:")
+            print(f"   1. Go to Admin panel → Signup Requests")
+            print(f"   2. Find {TEST_EMAIL} → click Approve")
+            print(f"   3. Welcome email with temp password will be sent via Brevo")
+            print(f"\n   To remove this test request afterwards:")
             print(f"        venv/Scripts/python tests/test_email_flow.py --cleanup")
 
         elif result["skipped"]:
-            # Candidate was skipped — already exists in DB
             print(f"\n⏭  Skipped: {result['details']['skipped'][0]['reason']}")
 
         elif result["errors"]:
-            # Something went wrong during import
             print(f"\n❌ Error: {result['details']['errors'][0]}")
 
     finally:
