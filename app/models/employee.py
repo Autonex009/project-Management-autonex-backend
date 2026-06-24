@@ -26,7 +26,10 @@ class Employee(Base):
     skills = Column(JSON, nullable=True)
 
     slack_user_id = Column(String(64), nullable=True)
-    
+
+    # Profile picture URL (uploaded file under /uploads/avatars or a remote Slack/Razorpay URL)
+    avatar_url = Column(Text, nullable=True)
+
     productivity_baseline = Column(Float, nullable=False, default=1.0)
 
     # Monthly base salary (CTC) — used for payroll calculation.
