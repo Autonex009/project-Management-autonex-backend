@@ -126,7 +126,9 @@ def build_user_response(user: User, db: Session) -> UserResponse:
         designation=designation,
         employee_id=user.employee_id,
         employee_type=employee.employee_type if employee else None,
-        skills=user.skills,
+        # Prefer the Employee's canonical skills (employees created via the admin flow
+        # have skills there, not on User) so the client can gate onboarding by skill.
+        skills=(employee.skills if employee and employee.skills else user.skills),
     )
 
 

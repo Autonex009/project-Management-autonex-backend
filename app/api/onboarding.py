@@ -4,17 +4,18 @@ Onboarding API - Endpoints for modules, sections, quizzes, candidate progress, a
 import csv
 import io
 import json
-from datetime import datetime
+from datetime import datetime, date
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from pydantic import BaseModel
 
 from app.db.database import get_db
 from app.models.user import User
 from app.models.employee import Employee
+from app.models.allocation import Allocation
 from app.models.onboarding import (
     OnboardingModule,
     OnboardingSection,
@@ -48,13 +49,36 @@ except ImportError:
 
 
 # ── Helper: Get Candidates ──────────────────────────────────────────
+def _has_annotation_skill(skills) -> bool:
+    """True if the employee's skills JSON contains an 'Annotation' skill (case-insensitive)."""
+    if not skills:
+        return False
+    return any(str(s).strip().lower() == "annotation" for s in skills)
+
+
 def get_onboarding_candidates(db: Session) -> List[User]:
-    """Retrieve all users whose designation is Annotator or Reviewer."""
-    return db.query(User).join(
+    """Retrieve all annotation staff: designation contains Annotator/Reviewer,
+    OR the linked employee has the 'Annotation' skill in their profile."""
+    rows = db.query(User, Employee).join(
         Employee, User.employee_id == Employee.id
-    ).filter(
-        (Employee.designation.ilike("%Annotator%")) | (Employee.designation.ilike("%Reviewer%"))
     ).all()
+    candidates = []
+    for user, employee in rows:
+        designation = (employee.designation or "").lower()
+        if "annotator" in designation or "reviewer" in designation or _has_annotation_skill(employee.skills):
+            candidates.append(user)
+    return candidates
+
+
+def _actively_allocated_employee_ids(db: Session) -> set:
+    """Employee ids that have at least one allocation active as of today
+    (allocation window includes today; null start/end counts as open-ended/active)."""
+    today = date.today()
+    allocations = db.query(Allocation.employee_id).filter(
+        or_(Allocation.active_start_date.is_(None), Allocation.active_start_date <= today),
+        or_(Allocation.active_end_date.is_(None), Allocation.active_end_date >= today),
+    ).all()
+    return {row[0] for row in allocations}
 
 
 def is_module_locked(user_id: int, module_id: int, db: Session) -> bool:
@@ -893,8 +917,9 @@ def get_full_analytics(
 
 # ── Audit Progress Reports Endpoints ───────────────────────────────────
 
-def fetch_onboarding_reports_data(db: Session) -> List[dict]:
-    candidates = get_onboarding_candidates(db)
+def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] = None) -> List[dict]:
+    if candidates is None:
+        candidates = get_onboarding_candidates(db)
     modules = db.query(OnboardingModule).filter(OnboardingModule.status.ilike("PUBLISHED")).all()
 
     reports = []
@@ -946,14 +971,18 @@ def fetch_onboarding_reports_data(db: Session) -> List[dict]:
 
         overall_progress = int(total_progress / len(modules)) if modules else 0
         overall_score = int((correct_answers / total_questions) * 100) if total_questions > 0 else 0
+        completed_modules = sum(1 for ms in module_stats if ms["progress"] == 100)
 
         reports.append({
             "userId": c.id,
             "name": c.name,
             "email": c.email,
             "department": dept,
+            "designation": dept,
             "overallProgress": overall_progress,
             "overallScore": overall_score,
+            "completedModules": completed_modules,
+            "totalModules": len(modules),
             "attemptedQuestions": attempted_questions,
             "correctAnswers": correct_answers,
             "totalQuestions": total_questions,
@@ -970,6 +999,23 @@ def get_onboarding_reports(
 ):
     """Retrieve full detailed reports on candidate onboarding progress."""
     return fetch_onboarding_reports_data(db)
+
+
+@router.get("/newly-onboarded")
+def get_newly_onboarded(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm"))
+):
+    """Annotation employees not yet allocated to any project, with their onboarding
+    progress and MCQ stats. Lets all PMs/Admins triage new annotators by assessment
+    performance before deciding which project to assign them to.
+    """
+    candidates = get_onboarding_candidates(db)
+    allocated_ids = _actively_allocated_employee_ids(db)
+    pool = [c for c in candidates if c.employee_id not in allocated_ids]
+    reports = fetch_onboarding_reports_data(db, candidates=pool)
+    reports.sort(key=lambda r: r.get("overallScore", 0), reverse=True)
+    return reports
 
 
 @router.get("/reports/export")
