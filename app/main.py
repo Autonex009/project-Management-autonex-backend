@@ -219,6 +219,8 @@ def sync_employee_contact_schema() -> None:
         statements.append("ALTER TABLE employees ADD COLUMN phone TEXT")
     if "slack_user_id" not in columns:
         statements.append("ALTER TABLE employees ADD COLUMN slack_user_id TEXT")
+    if "avatar_url" not in columns:
+        statements.append("ALTER TABLE employees ADD COLUMN avatar_url TEXT")
 
     if not statements:
         return
