@@ -1018,6 +1018,7 @@ def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] 
             "email": c.email,
             "department": dept,
             "designation": dept,
+            "skills": (employee.skills if employee else []) or [],
             "overallProgress": overall_progress,
             "overallScore": overall_score,
             "completedModules": completed_modules,
