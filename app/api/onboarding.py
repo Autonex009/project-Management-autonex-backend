@@ -4,17 +4,19 @@ Onboarding API - Endpoints for modules, sections, quizzes, candidate progress, a
 import csv
 import io
 import json
-from datetime import datetime
+from datetime import datetime, date
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Response, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from pydantic import BaseModel
 
 from app.db.database import get_db
 from app.models.user import User
 from app.models.employee import Employee
+from app.models.allocation import Allocation
+from app.models.project import DailySheet
 from app.models.onboarding import (
     OnboardingModule,
     OnboardingSection,
@@ -48,13 +50,48 @@ except ImportError:
 
 
 # ── Helper: Get Candidates ──────────────────────────────────────────
+def _has_annotation_skill(skills) -> bool:
+    """True if any of the employee's skills mentions annotation (e.g. 'Yutori Annotation',
+    'Robotics Annotation'). Substring match — there is no skill literally named 'Annotation'."""
+    if not skills:
+        return False
+    return any("annotation" in str(s).lower() for s in skills)
+
+
+def _is_pm_or_admin(user: User, employee: Employee) -> bool:
+    """PMs/Admins can list annotation skills (many came from annotation roles) but must not
+    appear as onboarding candidates. Annotator/Reviewer designation is handled separately."""
+    if user.role in ("admin", "pm"):
+        return True
+    designation = (employee.designation or "").lower()
+    return "program manager" in designation or "project manager" in designation or "admin" in designation
+
+
 def get_onboarding_candidates(db: Session) -> List[User]:
-    """Retrieve all users whose designation is Annotator or Reviewer."""
-    return db.query(User).join(
+    """Retrieve all annotation staff: designation contains Annotator/Reviewer, OR the linked
+    employee has an annotation skill — but skill-only matches exclude PMs/Admins."""
+    rows = db.query(User, Employee).join(
         Employee, User.employee_id == Employee.id
-    ).filter(
-        (Employee.designation.ilike("%Annotator%")) | (Employee.designation.ilike("%Reviewer%"))
     ).all()
+    candidates = []
+    for user, employee in rows:
+        designation = (employee.designation or "").lower()
+        is_annotator_designation = "annotator" in designation or "reviewer" in designation
+        skill_based = _has_annotation_skill(employee.skills) and not _is_pm_or_admin(user, employee)
+        if is_annotator_designation or skill_based:
+            candidates.append(user)
+    return candidates
+
+
+def _actively_allocated_employee_ids(db: Session) -> set:
+    """Employee ids that have at least one allocation active as of today
+    (allocation window includes today; null start/end counts as open-ended/active)."""
+    today = date.today()
+    allocations = db.query(Allocation.employee_id).filter(
+        or_(Allocation.active_start_date.is_(None), Allocation.active_start_date <= today),
+        or_(Allocation.active_end_date.is_(None), Allocation.active_end_date >= today),
+    ).all()
+    return {row[0] for row in allocations}
 
 
 def is_module_locked(user_id: int, module_id: int, db: Session) -> bool:
@@ -893,22 +930,61 @@ def get_full_analytics(
 
 # ── Audit Progress Reports Endpoints ───────────────────────────────────
 
-def fetch_onboarding_reports_data(db: Session) -> List[dict]:
-    candidates = get_onboarding_candidates(db)
+def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] = None) -> List[dict]:
+    if candidates is None:
+        candidates = get_onboarding_candidates(db)
+
     modules = db.query(OnboardingModule).filter(OnboardingModule.status.ilike("PUBLISHED")).all()
+    if not candidates:
+        return []
+
+    # Batch-load the module → section → question structure once (avoids per-candidate
+    # lazy-loaded relationship round-trips, which are very slow against a remote DB).
+    module_ids = [m.id for m in modules]
+    sections = db.query(OnboardingSection).filter(
+        OnboardingSection.module_id.in_(module_ids)
+    ).all() if module_ids else []
+    section_ids = [s.id for s in sections]
+    questions = db.query(OnboardingQuizQuestion).filter(
+        OnboardingQuizQuestion.section_id.in_(section_ids)
+    ).all() if section_ids else []
+
+    total_sections_by_module: dict = {}
+    for s in sections:
+        total_sections_by_module[s.module_id] = total_sections_by_module.get(s.module_id, 0) + 1
+    section_module = {s.id: s.module_id for s in sections}
+    questions_by_module: dict = {}
+    for q in questions:
+        mid = section_module.get(q.section_id)
+        if mid is not None:
+            questions_by_module.setdefault(mid, []).append(q)
+
+    # Batch-load per-candidate data with one query each (.in_(ids) + group in Python).
+    candidate_user_ids = [c.id for c in candidates]
+    employee_ids = [c.employee_id for c in candidates if c.employee_id]
+    employees_by_id = {
+        e.id: e for e in db.query(Employee).filter(Employee.id.in_(employee_ids)).all()
+    } if employee_ids else {}
+
+    progress_by_user: dict = {}
+    for p in db.query(OnboardingProgress).filter(OnboardingProgress.user_id.in_(candidate_user_ids)).all():
+        progress_by_user.setdefault(p.user_id, []).append(p)
+
+    attempts_by_user: dict = {}
+    for a in db.query(OnboardingQuizAttempt).filter(OnboardingQuizAttempt.user_id.in_(candidate_user_ids)).all():
+        attempts_by_user.setdefault(a.user_id, []).append(a)
 
     reports = []
     for c in candidates:
-        employee = db.query(Employee).filter(Employee.id == c.employee_id).first()
+        employee = employees_by_id.get(c.employee_id)
         dept = employee.designation if employee else "Annotator"
 
-        progress_records = db.query(OnboardingProgress).filter(OnboardingProgress.user_id == c.id).all()
-        completed_section_ids = {p.section_id for p in progress_records}
+        progress_records = progress_by_user.get(c.id, [])
         completed_module_sections = {}
         for p in progress_records:
             completed_module_sections[p.module_id] = completed_module_sections.get(p.module_id, 0) + 1
 
-        quiz_attempts = db.query(OnboardingQuizAttempt).filter(OnboardingQuizAttempt.user_id == c.id).all()
+        quiz_attempts = attempts_by_user.get(c.id, [])
         attempt_map = {a.question_id: a.is_correct for a in quiz_attempts}
 
         total_progress = 0
@@ -918,20 +994,19 @@ def fetch_onboarding_reports_data(db: Session) -> List[dict]:
 
         module_stats = []
         for m in modules:
-            total_sections = len(m.sections)
+            total_sections = total_sections_by_module.get(m.id, 0)
             completed = completed_module_sections.get(m.id, 0)
             progress = int((completed / total_sections) * 100) if total_sections > 0 else 0
             total_progress += progress
 
             module_questions = 0
             module_correct = 0
-            for s in m.sections:
-                for q in s.questions:
-                    module_questions += 1
-                    total_questions += 1
-                    if attempt_map.get(q.id):
-                        module_correct += 1
-                        correct_answers += 1
+            for q in questions_by_module.get(m.id, []):
+                module_questions += 1
+                total_questions += 1
+                if attempt_map.get(q.id):
+                    module_correct += 1
+                    correct_answers += 1
 
             score = int((module_correct / module_questions) * 100) if module_questions > 0 else 0
             module_stats.append({
@@ -946,14 +1021,20 @@ def fetch_onboarding_reports_data(db: Session) -> List[dict]:
 
         overall_progress = int(total_progress / len(modules)) if modules else 0
         overall_score = int((correct_answers / total_questions) * 100) if total_questions > 0 else 0
+        completed_modules = sum(1 for ms in module_stats if ms["progress"] == 100)
 
         reports.append({
             "userId": c.id,
+            "employeeId": c.employee_id,
             "name": c.name,
             "email": c.email,
             "department": dept,
+            "designation": dept,
+            "skills": (employee.skills if employee else []) or [],
             "overallProgress": overall_progress,
             "overallScore": overall_score,
+            "completedModules": completed_modules,
+            "totalModules": len(modules),
             "attemptedQuestions": attempted_questions,
             "correctAnswers": correct_answers,
             "totalQuestions": total_questions,
@@ -970,6 +1051,62 @@ def get_onboarding_reports(
 ):
     """Retrieve full detailed reports on candidate onboarding progress."""
     return fetch_onboarding_reports_data(db)
+
+
+@router.get("/newly-onboarded")
+def get_newly_onboarded(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm"))
+):
+    """Annotation employees not yet allocated to any project, with their onboarding
+    progress and MCQ stats. Lets all PMs/Admins triage new annotators by assessment
+    performance before deciding which project to assign them to.
+    """
+    candidates = get_onboarding_candidates(db)
+    allocated_ids = _actively_allocated_employee_ids(db)
+    pool = [c for c in candidates if c.employee_id not in allocated_ids]
+    reports = fetch_onboarding_reports_data(db, candidates=pool)
+
+    # Enrich with each candidate's project allocations (history/context). Pool members
+    # have no ACTIVE allocation, but many have past/expired ones (end dates go stale) —
+    # surfacing these lets PMs see a candidate may still be engaged elsewhere.
+    emp_ids = [c.employee_id for c in pool if c.employee_id]
+    allocs_by_emp: dict = {}
+    if emp_ids:
+        allocs = db.query(Allocation).filter(Allocation.employee_id.in_(emp_ids)).all()
+        sheet_ids = list({a.sub_project_id for a in allocs if a.sub_project_id})
+        sheets = {
+            s.id: s for s in db.query(DailySheet).filter(DailySheet.id.in_(sheet_ids)).all()
+        } if sheet_ids else {}
+        today = date.today()
+        for a in allocs:
+            sheet = sheets.get(a.sub_project_id)
+            sd, ed = a.active_start_date, a.active_end_date
+            if (sd is None or sd <= today) and (ed is None or ed >= today):
+                status = "active"
+            elif ed is not None and ed < today:
+                status = "ended"
+            else:
+                status = "upcoming"
+            allocs_by_emp.setdefault(a.employee_id, []).append({
+                "allocationId": a.id,
+                "projectId": a.sub_project_id,
+                "projectName": sheet.name if sheet else "Unknown project",
+                "isAnnotation": bool(getattr(sheet, "is_annotation", False)) if sheet else False,
+                "hours": a.total_daily_hours,
+                "startDate": sd.isoformat() if sd else None,
+                "endDate": ed.isoformat() if ed else None,
+                "status": status,
+            })
+        # most recent first (by start date, then end date)
+        for items in allocs_by_emp.values():
+            items.sort(key=lambda x: (x["startDate"] or "", x["endDate"] or ""), reverse=True)
+
+    for r in reports:
+        r["allocations"] = allocs_by_emp.get(r["employeeId"], [])
+
+    reports.sort(key=lambda r: r.get("overallScore", 0), reverse=True)
+    return reports
 
 
 @router.get("/reports/export")
