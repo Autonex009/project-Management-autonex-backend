@@ -16,6 +16,7 @@ from app.db.database import get_db
 from app.models.user import User
 from app.models.employee import Employee
 from app.models.allocation import Allocation
+from app.models.project import DailySheet
 from app.models.onboarding import (
     OnboardingModule,
     OnboardingSection,
@@ -1052,6 +1053,45 @@ def get_newly_onboarded(
     allocated_ids = _actively_allocated_employee_ids(db)
     pool = [c for c in candidates if c.employee_id not in allocated_ids]
     reports = fetch_onboarding_reports_data(db, candidates=pool)
+
+    # Enrich with each candidate's project allocations (history/context). Pool members
+    # have no ACTIVE allocation, but many have past/expired ones (end dates go stale) —
+    # surfacing these lets PMs see a candidate may still be engaged elsewhere.
+    emp_ids = [c.employee_id for c in pool if c.employee_id]
+    allocs_by_emp: dict = {}
+    if emp_ids:
+        allocs = db.query(Allocation).filter(Allocation.employee_id.in_(emp_ids)).all()
+        sheet_ids = list({a.sub_project_id for a in allocs if a.sub_project_id})
+        sheets = {
+            s.id: s for s in db.query(DailySheet).filter(DailySheet.id.in_(sheet_ids)).all()
+        } if sheet_ids else {}
+        today = date.today()
+        for a in allocs:
+            sheet = sheets.get(a.sub_project_id)
+            sd, ed = a.active_start_date, a.active_end_date
+            if (sd is None or sd <= today) and (ed is None or ed >= today):
+                status = "active"
+            elif ed is not None and ed < today:
+                status = "ended"
+            else:
+                status = "upcoming"
+            allocs_by_emp.setdefault(a.employee_id, []).append({
+                "allocationId": a.id,
+                "projectId": a.sub_project_id,
+                "projectName": sheet.name if sheet else "Unknown project",
+                "isAnnotation": bool(getattr(sheet, "is_annotation", False)) if sheet else False,
+                "hours": a.total_daily_hours,
+                "startDate": sd.isoformat() if sd else None,
+                "endDate": ed.isoformat() if ed else None,
+                "status": status,
+            })
+        # most recent first (by start date, then end date)
+        for items in allocs_by_emp.values():
+            items.sort(key=lambda x: (x["startDate"] or "", x["endDate"] or ""), reverse=True)
+
+    for r in reports:
+        r["allocations"] = allocs_by_emp.get(r["employeeId"], [])
+
     reports.sort(key=lambda r: r.get("overallScore", 0), reverse=True)
     return reports
 
