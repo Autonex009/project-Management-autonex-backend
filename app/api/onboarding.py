@@ -51,22 +51,34 @@ except ImportError:
 
 # ── Helper: Get Candidates ──────────────────────────────────────────
 def _has_annotation_skill(skills) -> bool:
-    """True if the employee's skills JSON contains an 'Annotation' skill (case-insensitive)."""
+    """True if any of the employee's skills mentions annotation (e.g. 'Yutori Annotation',
+    'Robotics Annotation'). Substring match — there is no skill literally named 'Annotation'."""
     if not skills:
         return False
-    return any(str(s).strip().lower() == "annotation" for s in skills)
+    return any("annotation" in str(s).lower() for s in skills)
+
+
+def _is_pm_or_admin(user: User, employee: Employee) -> bool:
+    """PMs/Admins can list annotation skills (many came from annotation roles) but must not
+    appear as onboarding candidates. Annotator/Reviewer designation is handled separately."""
+    if user.role in ("admin", "pm"):
+        return True
+    designation = (employee.designation or "").lower()
+    return "program manager" in designation or "project manager" in designation or "admin" in designation
 
 
 def get_onboarding_candidates(db: Session) -> List[User]:
-    """Retrieve all annotation staff: designation contains Annotator/Reviewer,
-    OR the linked employee has the 'Annotation' skill in their profile."""
+    """Retrieve all annotation staff: designation contains Annotator/Reviewer, OR the linked
+    employee has an annotation skill — but skill-only matches exclude PMs/Admins."""
     rows = db.query(User, Employee).join(
         Employee, User.employee_id == Employee.id
     ).all()
     candidates = []
     for user, employee in rows:
         designation = (employee.designation or "").lower()
-        if "annotator" in designation or "reviewer" in designation or _has_annotation_skill(employee.skills):
+        is_annotator_designation = "annotator" in designation or "reviewer" in designation
+        skill_based = _has_annotation_skill(employee.skills) and not _is_pm_or_admin(user, employee)
+        if is_annotator_designation or skill_based:
             candidates.append(user)
     return candidates
 
