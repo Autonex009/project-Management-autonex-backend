@@ -1,7 +1,10 @@
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
+from uuid import uuid4
+import os
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
@@ -23,7 +26,18 @@ from app.schemas.employee import (
 )
 from app.services.auth_service import hash_password
 from app.services.identity_validator import check_duplicate_identity
-from app.services.slack_service import try_get_or_cache_employee_slack_user_id
+from app.services.slack_service import (
+    try_get_or_cache_employee_slack_user_id,
+    try_lookup_user_avatar_by_email,
+)
+
+# Avatar uploads live alongside the other static uploads served at /uploads.
+_avatar_base = Path("/tmp/uploads") if os.environ.get("VERCEL") else Path(__file__).resolve().parents[2] / "uploads"
+AVATAR_DIR = _avatar_base / "avatars"
+AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_AVATAR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+MAX_AVATAR_BYTES = 5 * 1024 * 1024  # 5 MB
 
 router = APIRouter(
     prefix="/api/employees",
@@ -426,3 +440,92 @@ def get_employee_slack_link(employee_id: int, db: Session = Depends(get_db)):
         "slack_user_id": slack_user_id,
         "url": f"https://slack.com/app_redirect?channel={slack_user_id}",
     }
+
+
+# ── Profile picture (avatar) ────────────────────────────────────────
+@router.post("/{employee_id}/avatar", response_model=EmployeeResponse)
+async def upload_employee_avatar(
+    employee_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Upload a profile picture for an employee and store its public URL."""
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    original_name = Path(file.filename or "").name
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in ALLOWED_AVATAR_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported image type. Use JPG, PNG, GIF or WEBP.",
+        )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    if len(file_bytes) > MAX_AVATAR_BYTES:
+        raise HTTPException(status_code=400, detail="Image is too large (max 5 MB)")
+
+    stored_name = f"{uuid4().hex}{suffix}"
+    destination = AVATAR_DIR / stored_name
+    destination.write_bytes(file_bytes)
+
+    # Remove the previous locally-stored avatar to avoid orphan files.
+    old_url = employee.avatar_url or ""
+    if "/uploads/avatars/" in old_url:
+        old_file = AVATAR_DIR / old_url.rsplit("/", 1)[-1]
+        if old_file.exists():
+            old_file.unlink()
+
+    employee.avatar_url = str(request.base_url).rstrip("/") + f"/uploads/avatars/{stored_name}"
+    try:
+        db.commit()
+        db.refresh(employee)
+        return employee
+    except SQLAlchemyError as exc:
+        db.rollback()
+        if destination.exists():
+            destination.unlink()
+        raise HTTPException(status_code=500, detail="Failed to save avatar") from exc
+
+
+@router.post("/{employee_id}/avatar/from-slack", response_model=EmployeeResponse)
+def set_employee_avatar_from_slack(employee_id: int, db: Session = Depends(get_db)):
+    """Fetch the employee's Slack profile photo and store it as their avatar."""
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    avatar_url = try_lookup_user_avatar_by_email(employee.email)
+    if not avatar_url:
+        raise HTTPException(
+            status_code=404,
+            detail="No Slack profile photo found for this employee",
+        )
+
+    employee.avatar_url = avatar_url
+    db.commit()
+    db.refresh(employee)
+    return employee
+
+
+@router.delete("/{employee_id}/avatar", response_model=EmployeeResponse)
+def delete_employee_avatar(employee_id: int, db: Session = Depends(get_db)):
+    """Remove an employee's profile picture."""
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    old_url = employee.avatar_url or ""
+    if "/uploads/avatars/" in old_url:
+        old_file = AVATAR_DIR / old_url.rsplit("/", 1)[-1]
+        if old_file.exists():
+            old_file.unlink()
+
+    employee.avatar_url = None
+    db.commit()
+    db.refresh(employee)
+    return employee
