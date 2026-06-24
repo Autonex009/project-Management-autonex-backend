@@ -1012,6 +1012,7 @@ def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] 
 
         reports.append({
             "userId": c.id,
+            "employeeId": c.employee_id,
             "name": c.name,
             "email": c.email,
             "department": dept,
