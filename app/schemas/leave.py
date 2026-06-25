@@ -7,8 +7,8 @@ class LeaveBase(BaseModel):
     employee_id: int = Field(..., gt=0)
     is_half_day: Optional[bool] = False
     half_day_slot: Optional[str] = None
-    start_date: date
-    end_date: date
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
     leave_type: str
     reason: Optional[str] = None
 
@@ -42,10 +42,13 @@ class LeaveBase(BaseModel):
     @validator("end_date")
     def end_after_start(cls, v, values):
         if "start_date" in values:
+            start_val = values["start_date"]
+            if start_val is None or v is None:
+                return v
             if values.get("is_half_day"):
-                if v != values["start_date"]:
+                if v != start_val:
                     raise ValueError("end_date must be equal to start_date for half-day leaves")
-            elif v < values["start_date"]:
+            elif v < start_val:
                 raise ValueError("end_date must be >= start_date")
         return v
 

@@ -496,6 +496,8 @@ def validate_consecutive_leaves(
     for l in existing_leaves:
         if getattr(l, "is_half_day", False) or l.leave_type in ("first_half", "second_half"):
             continue
+        if l.start_date is None or l.end_date is None:
+            continue
         cur = max(l.start_date, window_start)
         l_end = min(l.end_date, window_end)
         while cur <= l_end:

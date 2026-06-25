@@ -128,39 +128,56 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
     annual quota — so a promotion never retroactively reclassifies leave already taken.
 
     Returns:
-      classification: {leave_id: {"paid_dates": set, "unpaid_dates": set, "type": str}}
-      balances:       {leave_type: {"quota": int, "used": int, "remaining": int, "period": str}}
+      classification: {leave_id: {"paid_dates": dict, "unpaid_dates": dict, "type": str}}
+      balances:       {leave_type: {"quota": float, "used": float, "remaining": float, "period": str}}
                       For interns the "paid" balance is monthly; preview_payroll scopes it to
                       the month being run.
     """
-    used: dict[str, int] = {}                       # annual usage (employees; intern non-paid)
-    used_paid_by_month: dict[tuple, int] = {}       # (year, month) -> intern paid days used
+    used: dict[str, float] = {}                       # annual usage (employees; intern non-paid)
+    used_paid_by_month: dict[tuple, float] = {}       # (year, month) -> intern paid days used
     classification: dict[int, dict] = {}
 
-    for leave in sorted(leaves, key=lambda lv: (lv.start_date, lv.id)):
+    for leave in sorted(leaves, key=lambda lv: (lv.start_date or date_type.min, lv.id)):
         ltype = normalize_leave_type(leave.leave_type)
-        paid_dates, unpaid_dates = set(), set()
+        paid_dates, unpaid_dates = {}, {}
+        
+        # Bypass branch for sheet-synced placeholder leaves with NULL dates
+        if leave.start_date is None or leave.end_date is None:
+            duration = 0.5 if getattr(leave, "is_half_day", False) else 1.0
+            used[ltype] = used.get(ltype, 0.0) + duration
+            classification[leave.id] = {"paid_dates": {}, "unpaid_dates": {}, "type": ltype}
+            continue
+
+        weight = 0.5 if getattr(leave, "is_half_day", False) else 1.0
         for wd in _working_dates(leave.start_date, leave.end_date, year):
             use_monthly = ltype == "paid" and (intern or (intern_until is not None and wd < intern_until))
             if use_monthly:
                 # Monthly entitlement that resets each calendar month.
                 key = (wd.year, wd.month)
-                used_paid_by_month[key] = used_paid_by_month.get(key, 0) + 1
-                if used_paid_by_month[key] <= INTERN_MONTHLY_PAID_QUOTA:
-                    paid_dates.add(wd)
+                used_paid_by_month[key] = used_paid_by_month.get(key, 0.0) + weight
+                excess = used_paid_by_month[key] - INTERN_MONTHLY_PAID_QUOTA
+                if excess <= 0:
+                    paid_dates[wd] = weight
+                elif excess < weight:
+                    paid_dates[wd] = weight - excess
+                    unpaid_dates[wd] = excess
                 else:
-                    unpaid_dates.add(wd)
+                    unpaid_dates[wd] = weight
             else:
                 is_intern_for_date = intern or (intern_until is not None and wd < intern_until)
                 if is_intern_for_date and ltype == "casual_sick":
-                    unpaid_dates[wd] = 1.0
+                    unpaid_dates[wd] = weight
                 else:
                     quota = get_annual_leave_quota(ltype)
-                    used[ltype] = used.get(ltype, 0) + 1
-                    if used[ltype] <= quota:
-                        paid_dates[wd] = 1.0
+                    used[ltype] = used.get(ltype, 0.0) + weight
+                    excess = used[ltype] - quota
+                    if excess <= 0:
+                        paid_dates[wd] = weight
+                    elif excess < weight:
+                        paid_dates[wd] = weight - excess
+                        unpaid_dates[wd] = excess
                     else:
-                        unpaid_dates[wd] = 1.0
+                        unpaid_dates[wd] = weight
         classification[leave.id] = {"paid_dates": paid_dates, "unpaid_dates": unpaid_dates, "type": ltype}
 
     balances = {}
@@ -169,20 +186,20 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
             # Monthly entitlement — month-scoped figures are filled in by preview_payroll.
             balances[ltype] = {
                 "quota": INTERN_MONTHLY_PAID_QUOTA,
-                "used": 0,
+                "used": 0.0,
                 "remaining": INTERN_MONTHLY_PAID_QUOTA,
                 "period": "month",
             }
             continue
 
         if intern and ltype == "casual_sick":
-            quota = 0
+            quota = 0.0
 
-        used_days = used.get(ltype, 0)
+        used_days = used.get(ltype, 0.0)
         balances[ltype] = {
             "quota": quota,
             "used": used_days,
-            "remaining": max(quota - used_days, 0),
+            "remaining": max(quota - used_days, 0.0),
             "period": "year",
         }
     return classification, balances
@@ -354,13 +371,14 @@ def preview_payroll(
     for s in db.query(Salary).all():
         salary_by_name[_normalize_name(s.full_name)] = s
 
-    # Fetch the whole CALENDAR YEAR of approved leaves so the annual paid-leave
-    # entitlement can be applied chronologically (a leave's paid/unpaid split
-    # depends on how much of the year's quota was already consumed before it).
+    # Fetch the whole CALENDAR YEAR of approved leaves (including NULL dates placeholders)
+    # so the annual paid-leave entitlement can be applied chronologically.
     year_leaves = db.query(Leave).filter(
         Leave.status == "approved",
-        Leave.start_date <= year_end,
-        Leave.end_date >= year_start,
+        (
+            ((Leave.start_date <= year_end) & (Leave.end_date >= year_start)) |
+            Leave.start_date.is_(None)
+        )
     ).all()
 
     leaves_by_emp = {}
@@ -396,7 +414,7 @@ def preview_payroll(
         # Skip anyone explicitly marked Inactive in the salary table.
         if salary_row is not None and (salary_row.status or "").strip().lower() == "inactive":
             continue
-        emp_base_salary = _read_pay(salary_row.base_pay_monthly) if salary_row is not None else None
+        emp_base_salary = _read_pay(salary_row.base_pay_monthly) if salary_row is not None else decrypt_salary(emp.base_salary_enc)
         # Bonus cap comes from the salary table; the granted amount (if any) is saved on the run.
         emp_bonus_limit = (_read_pay(salary_row.opt_bonus_monthly) if salary_row is not None else None) or 0.0
         emp_bonus = saved_bonuses.get(emp.id, 0.0)
@@ -411,28 +429,30 @@ def preview_payroll(
         # Interns' paid leave is monthly — report the balance for THIS month.
         if emp_is_intern and "paid" in balances:
             paid_used_month = sum(
-                1
+                weight
                 for cls in classification.values()
                 if cls["type"] == "paid"
-                for d in cls["paid_dates"]
+                for d, weight in cls["paid_dates"].items()
                 if month_start <= d <= month_end
             )
             balances["paid"] = {
                 "quota": INTERN_MONTHLY_PAID_QUOTA,
                 "used": paid_used_month,
-                "remaining": max(INTERN_MONTHLY_PAID_QUOTA - paid_used_month, 0),
+                "remaining": max(INTERN_MONTHLY_PAID_QUOTA - paid_used_month, 0.0),
                 "period": "month",
             }
 
         # Build rows only for leaves that touch THIS month, scoping the auto
         # paid/unpaid day counts to the month being run.
         month_leaves = []
-        for leave in sorted(emp_year_leaves, key=lambda lv: (lv.start_date, lv.id)):
+        for leave in sorted(emp_year_leaves, key=lambda lv: (lv.start_date or date_type.min, lv.id)):
+            if leave.start_date is None or leave.end_date is None:
+                continue
             if leave.start_date > month_end or leave.end_date < month_start:
                 continue
-            cls = classification.get(leave.id, {"paid_dates": set(), "unpaid_dates": set()})
-            paid_in_month = sum(1 for d in cls["paid_dates"] if month_start <= d <= month_end)
-            unpaid_in_month = sum(1 for d in cls["unpaid_dates"] if month_start <= d <= month_end)
+            cls = classification.get(leave.id, {"paid_dates": {}, "unpaid_dates": {}})
+            paid_in_month = sum(weight for d, weight in cls["paid_dates"].items() if month_start <= d <= month_end)
+            unpaid_in_month = sum(weight for d, weight in cls["unpaid_dates"].items() if month_start <= d <= month_end)
             days_in_month = paid_in_month + unpaid_in_month
             if days_in_month <= 0:
                 continue
