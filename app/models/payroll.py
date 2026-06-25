@@ -36,6 +36,9 @@ class PayrollLeaveAdjustment(Base):
     # Snapshot of unpaid working-days for this leave within the run's month.
     # Null on legacy rows → fall back to (days_in_month if deduct else 0).
     unpaid_days = Column(Float, nullable=True)
+    # JSON array of the specific unpaid working-dates (ISO strings) the admin chose,
+    # e.g. '["2026-01-05","2026-01-06"]'. Null → derive from unpaid_days/deduct.
+    unpaid_dates = Column(Text, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
 
     __table_args__ = (UniqueConstraint("payroll_run_id", "leave_id", name="uq_payroll_adj_run_leave"),)
