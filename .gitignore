@@ -68,3 +68,5 @@ test_leaves_e2e.py
 test_slack_trial.py
 .env*.local
 .env.production
+leaves_backup.csv
+sync_leaves_from_sheet.py   

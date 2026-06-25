@@ -64,15 +64,16 @@ def test_intern_multiday_paid_leave_splits_first_day_paid():
     assert _unpaid(cls, 10) == {date(2026, 3, 10), date(2026, 3, 11)}
 
 
-def test_intern_casual_sick_still_annual():
-    # casual_sick keeps the annual quota (6) for interns — two same-month days both paid.
+def test_intern_casual_sick_quota_is_zero():
+    # casual_sick is 0 for interns/contractors — any day is unpaid.
     leaves = [
         _Leave(20, date(2026, 4, 6), date(2026, 4, 6), "casual_sick"),
         _Leave(21, date(2026, 4, 7), date(2026, 4, 7), "casual_sick"),
     ]
     cls, balances = _classify_year_leaves(leaves, 2026, intern=True)
-    assert _paid(cls, 20) and _paid(cls, 21)            # both paid (within annual 6)
-    assert not _unpaid(cls, 20) and not _unpaid(cls, 21)
+    assert not _paid(cls, 20) and _unpaid(cls, 20) == {date(2026, 4, 6)}
+    assert not _paid(cls, 21) and _unpaid(cls, 21) == {date(2026, 4, 7)}
+    assert balances["casual_sick"]["quota"] == 0
     assert balances["casual_sick"]["period"] == "year"
 
 
@@ -106,3 +107,11 @@ def test_employee_paid_exceeds_annual_quota_becomes_unpaid():
     assert paid_total == 12
     assert unpaid_total == 1
     assert balances["paid"]["remaining"] == 0
+
+
+def test_contractor_leave_classification():
+    from app.constants.leave_types import is_intern_or_contractor
+    assert is_intern_or_contractor("Contractor") is True
+    assert is_intern_or_contractor("Contract") is True
+    assert is_intern_or_contractor("Full-time") is False
+
