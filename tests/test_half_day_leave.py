@@ -22,7 +22,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import app.db.database as database
 from app.db.database import Base
 
-import app.models.admin            # noqa: F401
 import app.models.allocation       # noqa: F401
 import app.models.employee         # noqa: F401
 import app.models.guideline        # noqa: F401
@@ -30,7 +29,6 @@ import app.models.leave            # noqa: F401
 import app.models.notification     # noqa: F401
 import app.models.parent_project   # noqa: F401
 import app.models.payroll          # noqa: F401
-import app.models.product_manager  # noqa: F401
 import app.models.project          # noqa: F401
 import app.models.referral         # noqa: F401
 import app.models.side_project     # noqa: F401
@@ -204,29 +202,32 @@ def test_leave_overlaps_logic(client_and_db):
                  status="approved", is_half_day=True, half_day_slot="first_half"))
     db.commit()
 
-    # Reject trying to apply for another half-day leave on same date
-    payload = {
-        "employee_id": emp.id,
-        "leave_type": "second_half",
-        "start_date": "2026-06-22",
-        "end_date": "2026-06-22",
-        "reason": "Overlap test"
-    }
-    resp = client.post("/api/leaves", json=payload)
-    assert resp.status_code == 409
-    assert "A leave already exists for this period" in resp.json()["detail"]
+    ist_tz = timezone(timedelta(hours=5, minutes=30))
+    mocked_dt = datetime(2026, 6, 16, 10, 0, tzinfo=ist_tz)
+    with patch("app.api.leaves.get_current_ist_datetime", return_value=mocked_dt):
+        # Reject trying to apply for another half-day leave on same date
+        payload = {
+            "employee_id": emp.id,
+            "leave_type": "second_half",
+            "start_date": "2026-06-22",
+            "end_date": "2026-06-22",
+            "reason": "Overlap test"
+        }
+        resp = client.post("/api/leaves", json=payload)
+        assert resp.status_code == 409
+        assert "A leave already exists for this period" in resp.json()["detail"]
 
-    # Reject trying to apply for a full-day leave overlapping same date
-    payload = {
-        "employee_id": emp.id,
-        "leave_type": "paid",
-        "start_date": "2026-06-19",
-        "end_date": "2026-06-23",
-        "is_half_day": False,
-        "reason": "Overlap test full"
-    }
-    resp = client.post("/api/leaves", json=payload)
-    assert resp.status_code == 409
+        # Reject trying to apply for a full-day leave overlapping same date
+        payload = {
+            "employee_id": emp.id,
+            "leave_type": "paid",
+            "start_date": "2026-06-19",
+            "end_date": "2026-06-23",
+            "is_half_day": False,
+            "reason": "Overlap test full"
+        }
+        resp = client.post("/api/leaves", json=payload)
+        assert resp.status_code == 409
 
 
 def test_payroll_preview_and_direct_unpaid_calculation(client_and_db):
