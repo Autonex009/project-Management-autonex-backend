@@ -63,6 +63,7 @@ class UserResponse(BaseModel):
     designation: Optional[str] = None
     employee_id: Optional[int] = None
     employee_type: Optional[str] = None
+    avatar_url: Optional[str] = None
     skills: Optional[list] = None
 
     class Config:
@@ -126,6 +127,7 @@ def build_user_response(user: User, db: Session) -> UserResponse:
         designation=designation,
         employee_id=user.employee_id,
         employee_type=employee.employee_type if employee else None,
+        avatar_url=employee.avatar_url if employee else None,
         skills=user.skills,
     )
 

@@ -31,6 +31,7 @@ class EmployeeBase(BaseModel):
     razorpay_email: Optional[str] = Field(None, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
     phone: Optional[str] = None
     slack_user_id: Optional[str] = None
+    avatar_url: Optional[str] = None
     employee_type: str
     
     # Designation for role-based filtering
@@ -62,6 +63,7 @@ class EmployeeUpdate(BaseModel):
     razorpay_email: Optional[str] = Field(None, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
     phone: Optional[str] = None
     slack_user_id: Optional[str] = None
+    avatar_url: Optional[str] = None
     employee_type: Optional[str] = None
     designation: Optional[str] = None
     
