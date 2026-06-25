@@ -4,7 +4,7 @@ from datetime import date
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 
 from app.db.database import get_db
 from app.models.wfh import WFHRequest
@@ -22,7 +22,13 @@ class WFHCreate(BaseModel):
     employee_id: int
     wfh_date: date          # start date
     end_date: Optional[date] = None   # defaults to wfh_date for single-day
-    reason: Optional[str] = None
+    reason: str = Field(..., min_length=1)
+
+    @validator("reason")
+    def validate_reason(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Reason cannot be empty or just whitespace.")
+        return v.strip()
 
 
 class WFHResponse(BaseModel):

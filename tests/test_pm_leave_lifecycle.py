@@ -182,6 +182,7 @@ def test_pm_paid_leave_over_monthly_limit_is_flagged(client_and_db):
             "leave_type": "paid",
             "start_date": day.isoformat(),
             "end_date": day.isoformat(),
+            "reason": "Test reason",
         })
         assert resp.status_code == 201, resp.text
         flags.append(resp.json()["flagged"])
