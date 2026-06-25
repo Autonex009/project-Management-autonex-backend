@@ -528,3 +528,49 @@ def test_wfh_reason_validation(client_and_db):
     assert resp.status_code == 201
 
 
+def test_leaves_date_filtering(client_and_db):
+    client, db = client_and_db
+    emp, admin = _seed_employee(db)
+
+    # Add three leaves in different months
+    db.add(Leave(employee_id=emp.id, leave_type="paid",
+                 start_date=date(2026, 5, 10), end_date=date(2026, 5, 12),
+                 status="approved", reason="May leave"))
+    db.add(Leave(employee_id=emp.id, leave_type="paid",
+                 start_date=date(2026, 6, 15), end_date=date(2026, 6, 18),
+                 status="approved", reason="June leave"))
+    db.add(Leave(employee_id=emp.id, leave_type="paid",
+                 start_date=date(2026, 7, 20), end_date=date(2026, 7, 22),
+                 status="approved", reason="July leave"))
+    db.commit()
+
+    # Get all leaves (unfiltered)
+    resp = client.get("/api/leaves")
+    assert resp.status_code == 200
+    assert len(resp.json()) == 3
+
+    # Filter for June leaves (start_date=2026-06-01, end_date=2026-06-30)
+    resp = client.get("/api/leaves", params={"start_date": "2026-06-01", "end_date": "2026-06-30"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["reason"] == "June leave"
+
+    # Filter for leaves after June 1st (start_date=2026-06-01)
+    resp = client.get("/api/leaves", params={"start_date": "2026-06-01"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 2
+    reasons = {x["reason"] for x in data}
+    assert reasons == {"June leave", "July leave"}
+
+    # Filter for leaves before June 30th (end_date=2026-06-30)
+    resp = client.get("/api/leaves", params={"end_date": "2026-06-30"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 2
+    reasons = {x["reason"] for x in data}
+    assert reasons == {"May leave", "June leave"}
+
+
+
