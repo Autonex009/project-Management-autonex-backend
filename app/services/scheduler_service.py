@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 
 from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore
 
@@ -33,16 +34,13 @@ def start_scheduler() -> None:
             hours=12,
             id="hiring_sync",
             replace_existing=True,
+            next_run_time=datetime.now(),
         )
 
     if not _scheduler.running:
         _scheduler.start()
 
-    logger.info("[scheduler] Started — hiring sync scheduled every 12 hours")
-
-    # run immediately on first deploy so we don't wait 12 hours
-    logger.info("[scheduler] Running immediate hiring sync on startup")
-    _scheduled_hiring_sync()
+    logger.info("[scheduler] Started — hiring sync scheduled every 12 hours, running immediately in background")
 
 
 def shutdown_scheduler() -> None:
