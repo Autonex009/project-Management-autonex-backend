@@ -62,6 +62,17 @@ def is_intern(employee_type: str | None) -> bool:
     return (employee_type or "").strip().lower() == "intern"
 
 
+def is_contractor(employee_type: str | None) -> bool:
+    """True if the employee_type denotes a contractor/contract employee (case/space-insensitive)."""
+    val = (employee_type or "").strip().lower()
+    return val in ("contractor", "contract")
+
+
+def is_intern_or_contractor(employee_type: str | None) -> bool:
+    """True if the employee_type denotes an intern or a contractor."""
+    return is_intern(employee_type) or is_contractor(employee_type)
+
+
 # ── Approved floater holiday dates (2026) ───────────────────────────
 # Employees may only apply Floater Leave on these specific dates.
 FLOATER_DATES_2026: frozenset[date] = frozenset([
@@ -129,7 +140,10 @@ def is_weekend(d: date) -> bool:
 
 
 def is_non_working_day(d: date) -> bool:
-    return is_weekend(d) or is_fixed_holiday(d)
+    # Payroll treats fixed public holidays as WORKING days (they are paid days, not
+    # days off the salary divisor), so only weekends are non-working here. Leave-day
+    # counting in app/api/leaves.py still excludes holidays separately.
+    return is_weekend(d)
 
 
 def normalize_leave_type(leave_type: str) -> str:

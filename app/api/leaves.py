@@ -50,6 +50,7 @@ from app.constants.leave_types import (
     RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type,
     is_valid_floater_date, get_floater_dates_for_year,
     is_weekend, is_fixed_holiday, get_fixed_holidays_for_year,
+    is_intern_or_contractor,
 )
 from app.models.allocation import Allocation
 from app.models.employee import Employee
@@ -495,6 +496,8 @@ def validate_consecutive_leaves(
     for l in existing_leaves:
         if getattr(l, "is_half_day", False) or l.leave_type in ("first_half", "second_half"):
             continue
+        if l.start_date is None or l.end_date is None:
+            continue
         cur = max(l.start_date, window_start)
         l_end = min(l.end_date, window_end)
         while cur <= l_end:
@@ -509,10 +512,10 @@ def validate_consecutive_leaves(
         if not is_weekend(cur) and not is_fixed_holiday(cur):
             if cur in leave_working_days:
                 consecutive_run += 1
-                if consecutive_run >= 4:
+                if consecutive_run >= 5:
                     raise HTTPException(
                         status_code=400,
-                        detail="Safe guard triggered: You cannot apply for 4 or more consecutive leaves."
+                        detail="Safe guard triggered: You cannot apply for 5 or more consecutive leaves."
                     )
             else:
                 consecutive_run = 0
@@ -601,7 +604,8 @@ def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
             )
             .count()
         )
-        if paid_this_month >= 2:
+        limit = 1 if is_intern_or_contractor(employee.employee_type) else 2
+        if paid_this_month >= limit:
             flagged = True
 
     leave = Leave(

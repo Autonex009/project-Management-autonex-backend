@@ -16,6 +16,7 @@ caller must pass current_user_id which maps to a user with role=admin).
 import io
 import csv
 import os
+import json
 import hmac
 import hashlib
 from calendar import monthrange
@@ -39,6 +40,7 @@ from app.constants.leave_types import (
     ANNUAL_LEAVE_QUOTA,
     INTERN_MONTHLY_PAID_QUOTA,
     is_intern,
+    is_intern_or_contractor,
     get_leave_type_label,
 )
 from app.services.salary_crypto import decrypt_salary, encrypt_salary, encryption_enabled
@@ -127,35 +129,56 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
     annual quota — so a promotion never retroactively reclassifies leave already taken.
 
     Returns:
-      classification: {leave_id: {"paid_dates": set, "unpaid_dates": set, "type": str}}
-      balances:       {leave_type: {"quota": int, "used": int, "remaining": int, "period": str}}
+      classification: {leave_id: {"paid_dates": dict, "unpaid_dates": dict, "type": str}}
+      balances:       {leave_type: {"quota": float, "used": float, "remaining": float, "period": str}}
                       For interns the "paid" balance is monthly; preview_payroll scopes it to
                       the month being run.
     """
-    used: dict[str, int] = {}                       # annual usage (employees; intern non-paid)
-    used_paid_by_month: dict[tuple, int] = {}       # (year, month) -> intern paid days used
+    used: dict[str, float] = {}                       # annual usage (employees; intern non-paid)
+    used_paid_by_month: dict[tuple, float] = {}       # (year, month) -> intern paid days used
     classification: dict[int, dict] = {}
 
-    for leave in sorted(leaves, key=lambda lv: (lv.start_date, lv.id)):
+    for leave in sorted(leaves, key=lambda lv: (lv.start_date or date_type.min, lv.id)):
         ltype = normalize_leave_type(leave.leave_type)
-        paid_dates, unpaid_dates = set(), set()
+        paid_dates, unpaid_dates = {}, {}
+        
+        # Bypass branch for sheet-synced placeholder leaves with NULL dates
+        if leave.start_date is None or leave.end_date is None:
+            duration = 0.5 if getattr(leave, "is_half_day", False) else 1.0
+            used[ltype] = used.get(ltype, 0.0) + duration
+            classification[leave.id] = {"paid_dates": {}, "unpaid_dates": {}, "type": ltype}
+            continue
+
+        weight = 0.5 if getattr(leave, "is_half_day", False) else 1.0
         for wd in _working_dates(leave.start_date, leave.end_date, year):
             use_monthly = ltype == "paid" and (intern or (intern_until is not None and wd < intern_until))
             if use_monthly:
                 # Monthly entitlement that resets each calendar month.
                 key = (wd.year, wd.month)
-                used_paid_by_month[key] = used_paid_by_month.get(key, 0) + 1
-                if used_paid_by_month[key] <= INTERN_MONTHLY_PAID_QUOTA:
-                    paid_dates.add(wd)
+                used_paid_by_month[key] = used_paid_by_month.get(key, 0.0) + weight
+                excess = used_paid_by_month[key] - INTERN_MONTHLY_PAID_QUOTA
+                if excess <= 0:
+                    paid_dates[wd] = weight
+                elif excess < weight:
+                    paid_dates[wd] = weight - excess
+                    unpaid_dates[wd] = excess
                 else:
-                    unpaid_dates.add(wd)
+                    unpaid_dates[wd] = weight
             else:
-                quota = get_annual_leave_quota(ltype)
-                used[ltype] = used.get(ltype, 0) + 1
-                if used[ltype] <= quota:
-                    paid_dates.add(wd)
+                is_intern_for_date = intern or (intern_until is not None and wd < intern_until)
+                if is_intern_for_date and ltype == "casual_sick":
+                    unpaid_dates[wd] = weight
                 else:
-                    unpaid_dates.add(wd)
+                    quota = get_annual_leave_quota(ltype)
+                    used[ltype] = used.get(ltype, 0.0) + weight
+                    excess = used[ltype] - quota
+                    if excess <= 0:
+                        paid_dates[wd] = weight
+                    elif excess < weight:
+                        paid_dates[wd] = weight - excess
+                        unpaid_dates[wd] = excess
+                    else:
+                        unpaid_dates[wd] = weight
         classification[leave.id] = {"paid_dates": paid_dates, "unpaid_dates": unpaid_dates, "type": ltype}
 
     balances = {}
@@ -164,16 +187,20 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
             # Monthly entitlement — month-scoped figures are filled in by preview_payroll.
             balances[ltype] = {
                 "quota": INTERN_MONTHLY_PAID_QUOTA,
-                "used": 0,
+                "used": 0.0,
                 "remaining": INTERN_MONTHLY_PAID_QUOTA,
                 "period": "month",
             }
             continue
-        used_days = used.get(ltype, 0)
+
+        if intern and ltype == "casual_sick":
+            quota = 0.0
+
+        used_days = used.get(ltype, 0.0)
         balances[ltype] = {
             "quota": quota,
             "used": used_days,
-            "remaining": max(quota - used_days, 0),
+            "remaining": max(quota - used_days, 0.0),
             "period": "year",
         }
     return classification, balances
@@ -240,9 +267,11 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
     Each leave in `approved_leaves` carries `auto_unpaid_days` (from the annual-quota
     classifier) and `days_in_month` (working days within the month).
 
-    saved_adjustments: {leave_id: {"deduct": bool, "unpaid_days": int|None}} — a finalized
-    run's snapshot / admin override. When present it wins over the auto classification.
-    When None (live preview), the auto classification is used.
+    saved_adjustments: {leave_id: {"deduct": bool, "unpaid_days": int|None,
+    "unpaid_dates": list[str]|None}} — a finalized run's snapshot / admin override.
+    When present it wins over the auto classification (unpaid_dates is the most
+    precise: the exact dates the admin marked unpaid). When None (live preview),
+    the auto classification is used.
 
     base_salary: the monthly base pay to use for this employee. Passed in from the
     `salary` table (the Pay tab's source of truth). None means no salary on record.
@@ -256,19 +285,30 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
     for leave in approved_leaves:
         leave_id = leave["leave_id"]
         days = leave["days_in_month"]
-        auto_unpaid = leave.get("auto_unpaid_days", 0)
+        date_entries = leave.get("dates", [])            # [{"date", "auto_unpaid"}] for the month
+        ordered_dates = [d["date"] for d in date_entries]
+        auto_unpaid_set = {d["date"] for d in date_entries if d["auto_unpaid"]}
 
+        # Resolve which specific dates are unpaid, most-precise override first.
         snap = saved_adjustments.get(leave_id) if saved_adjustments is not None else None
-        if snap is not None:
-            if snap.get("unpaid_days") is not None:
-                unpaid_days = max(0, min(int(snap["unpaid_days"]), days))
-            else:  # legacy boolean-only row
-                unpaid_days = days if snap.get("deduct", True) else 0
+        if snap is not None and snap.get("unpaid_dates") is not None:
+            saved_set = set(snap["unpaid_dates"])
+            unpaid_set = {dt for dt in ordered_dates if dt in saved_set}
+            source = "manual"
+        elif snap is not None and snap.get("unpaid_days") is not None:
+            # Legacy count-only override → mark the first N working days unpaid.
+            n = max(0, min(int(snap["unpaid_days"]), days))
+            unpaid_set = set(ordered_dates[:n])
+            source = "manual"
+        elif snap is not None:
+            # Legacy boolean-only row.
+            unpaid_set = set(ordered_dates) if snap.get("deduct", True) else set()
             source = "manual"
         else:
-            unpaid_days = auto_unpaid
+            unpaid_set = set(auto_unpaid_set)
             source = "auto"
 
+        unpaid_days = len(unpaid_set)
         paid_days = days - unpaid_days
         deduct = unpaid_days > 0
         deduction_amount = round(unpaid_days * per_day, 2)
@@ -280,6 +320,12 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
             classification = "partial"
         total_deducted_days += unpaid_days
 
+        # Per-date breakdown for the UI: auto suggestion + the effective choice.
+        dates_out = [
+            {"date": d["date"], "auto_unpaid": d["auto_unpaid"], "unpaid": d["date"] in unpaid_set}
+            for d in date_entries
+        ]
+
         leave_rows.append({
             **leave,
             "deduct": deduct,
@@ -288,6 +334,7 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
             "classification": classification,
             "source": source,
             "deduction_amount": deduction_amount,
+            "dates": dates_out,
         })
 
     total_deduction = round(total_deducted_days * per_day, 2)
@@ -345,13 +392,14 @@ def preview_payroll(
     for s in db.query(Salary).all():
         salary_by_name[_normalize_name(s.full_name)] = s
 
-    # Fetch the whole CALENDAR YEAR of approved leaves so the annual paid-leave
-    # entitlement can be applied chronologically (a leave's paid/unpaid split
-    # depends on how much of the year's quota was already consumed before it).
+    # Fetch the whole CALENDAR YEAR of approved leaves (including NULL dates placeholders)
+    # so the annual paid-leave entitlement can be applied chronologically.
     year_leaves = db.query(Leave).filter(
         Leave.status == "approved",
-        Leave.start_date <= year_end,
-        Leave.end_date >= year_start,
+        (
+            ((Leave.start_date <= year_end) & (Leave.end_date >= year_start)) |
+            Leave.start_date.is_(None)
+        )
     ).all()
 
     leaves_by_emp = {}
@@ -365,7 +413,14 @@ def preview_payroll(
         adjs = db.query(PayrollLeaveAdjustment).filter(
             PayrollLeaveAdjustment.payroll_run_id == existing_run.id
         ).all()
-        saved_adjustments = {a.leave_id: {"deduct": a.deduct, "unpaid_days": a.unpaid_days} for a in adjs}
+        saved_adjustments = {
+            a.leave_id: {
+                "deduct": a.deduct,
+                "unpaid_days": a.unpaid_days,
+                "unpaid_dates": json.loads(a.unpaid_dates) if a.unpaid_dates else None,
+            }
+            for a in adjs
+        }
 
     # Discretionary bonuses persisted on this run (employee_id -> amount).
     saved_bonuses = {}
@@ -387,14 +442,14 @@ def preview_payroll(
         # Skip anyone explicitly marked Inactive in the salary table.
         if salary_row is not None and (salary_row.status or "").strip().lower() == "inactive":
             continue
-        emp_base_salary = _read_pay(salary_row.base_pay_monthly) if salary_row is not None else None
+        emp_base_salary = _read_pay(salary_row.base_pay_monthly) if salary_row is not None else decrypt_salary(emp.base_salary_enc)
         # Bonus cap comes from the salary table; the granted amount (if any) is saved on the run.
         emp_bonus_limit = (_read_pay(salary_row.opt_bonus_monthly) if salary_row is not None else None) or 0.0
         emp_bonus = saved_bonuses.get(emp.id, 0.0)
         emp_additional = saved_additional.get(emp.id, 0.0)
 
         emp_year_leaves = leaves_by_emp.get(emp.id, [])
-        emp_is_intern = is_intern(emp.employee_type)
+        emp_is_intern = is_intern_or_contractor(emp.employee_type)
         # A promoted intern keeps the monthly rule for leave taken before the promotion.
         intern_until = emp.converted_to_fulltime_at.date() if emp.converted_to_fulltime_at else None
         classification, balances = _classify_year_leaves(emp_year_leaves, year, emp_is_intern, intern_until)
@@ -402,31 +457,39 @@ def preview_payroll(
         # Interns' paid leave is monthly — report the balance for THIS month.
         if emp_is_intern and "paid" in balances:
             paid_used_month = sum(
-                1
+                weight
                 for cls in classification.values()
                 if cls["type"] == "paid"
-                for d in cls["paid_dates"]
+                for d, weight in cls["paid_dates"].items()
                 if month_start <= d <= month_end
             )
             balances["paid"] = {
                 "quota": INTERN_MONTHLY_PAID_QUOTA,
                 "used": paid_used_month,
-                "remaining": max(INTERN_MONTHLY_PAID_QUOTA - paid_used_month, 0),
+                "remaining": max(INTERN_MONTHLY_PAID_QUOTA - paid_used_month, 0.0),
                 "period": "month",
             }
 
         # Build rows only for leaves that touch THIS month, scoping the auto
         # paid/unpaid day counts to the month being run.
         month_leaves = []
-        for leave in sorted(emp_year_leaves, key=lambda lv: (lv.start_date, lv.id)):
+        for leave in sorted(emp_year_leaves, key=lambda lv: (lv.start_date or date_type.min, lv.id)):
+            if leave.start_date is None or leave.end_date is None:
+                continue
             if leave.start_date > month_end or leave.end_date < month_start:
                 continue
             cls = classification.get(leave.id, {"paid_dates": set(), "unpaid_dates": set()})
-            paid_in_month = sum(1 for d in cls["paid_dates"] if month_start <= d <= month_end)
-            unpaid_in_month = sum(1 for d in cls["unpaid_dates"] if month_start <= d <= month_end)
-            days_in_month = paid_in_month + unpaid_in_month
+            month_paid = [d for d in cls["paid_dates"] if month_start <= d <= month_end]
+            month_unpaid = [d for d in cls["unpaid_dates"] if month_start <= d <= month_end]
+            days_in_month = len(month_paid) + len(month_unpaid)
             if days_in_month <= 0:
                 continue
+            unpaid_set = set(month_unpaid)
+            # Every working date of this leave within the month, with its auto paid/unpaid.
+            date_entries = [
+                {"date": d.isoformat(), "auto_unpaid": d in unpaid_set}
+                for d in sorted(month_paid + month_unpaid)
+            ]
             month_leaves.append({
                 "leave_id": leave.id,
                 "leave_type": leave.leave_type,
@@ -434,7 +497,8 @@ def preview_payroll(
                 "start_date": leave.start_date.isoformat(),
                 "end_date": leave.end_date.isoformat(),
                 "days_in_month": days_in_month,
-                "auto_unpaid_days": unpaid_in_month,
+                "auto_unpaid_days": len(month_unpaid),
+                "dates": date_entries,
                 "reason": leave.reason or "",
             })
 
@@ -463,6 +527,7 @@ class LeaveAdjustmentIn(BaseModel):
     leave_id: int
     deduct: bool
     unpaid_days: Optional[int] = None   # snapshot of unpaid working-days; preserves partial classifications
+    unpaid_dates: Optional[List[str]] = None   # exact unpaid working-dates (ISO) the admin chose
 
 
 class BonusIn(BaseModel):
@@ -533,6 +598,7 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
             leave_id=adj.leave_id,
             deduct=adj.deduct,
             unpaid_days=adj.unpaid_days,
+            unpaid_dates=json.dumps(adj.unpaid_dates) if adj.unpaid_dates is not None else None,
         ))
 
     # Persist bonuses, clamped server-side to each employee's limit (the salary
