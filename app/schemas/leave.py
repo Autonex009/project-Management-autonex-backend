@@ -1,14 +1,26 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, root_validator
 from datetime import date
 from typing import Optional
 from app.constants.leave_types import LEAVE_TYPE_CHOICES, normalize_leave_type
 
 class LeaveBase(BaseModel):
     employee_id: int = Field(..., gt=0)
-    start_date: date
-    end_date: date
+    is_half_day: Optional[bool] = False
+    half_day_slot: Optional[str] = None
+    start_date: Optional[date] = None
+    end_date: Optional[date] = None
     leave_type: str
     reason: Optional[str] = None
+
+    @root_validator(pre=True)
+    def map_half_day_leave_type(cls, values):
+        leave_type = values.get("leave_type")
+        if leave_type in ("first_half", "second_half"):
+            values["is_half_day"] = True
+            values["half_day_slot"] = leave_type
+            if "start_date" in values:
+                values["end_date"] = values["start_date"]
+        return values
 
     @validator("leave_type")
     def validate_leave_type(cls, v):
@@ -17,10 +29,27 @@ class LeaveBase(BaseModel):
             raise ValueError(f"leave_type must be one of: {', '.join(LEAVE_TYPE_CHOICES)}")
         return normalized
 
+    @validator("half_day_slot")
+    def validate_half_day_slot(cls, v, values):
+        if values.get("is_half_day"):
+            if v not in ("first_half", "second_half"):
+                raise ValueError("half_day_slot must be 'first_half' or 'second_half' when is_half_day is True")
+        else:
+            if v is not None:
+                raise ValueError("half_day_slot must be None when is_half_day is False")
+        return v
+
     @validator("end_date")
     def end_after_start(cls, v, values):
-        if "start_date" in values and v < values["start_date"]:
-            raise ValueError("end_date must be >= start_date")
+        if "start_date" in values:
+            start_val = values["start_date"]
+            if start_val is None or v is None:
+                return v
+            if values.get("is_half_day"):
+                if v != start_val:
+                    raise ValueError("end_date must be equal to start_date for half-day leaves")
+            elif v < start_val:
+                raise ValueError("end_date must be >= start_date")
         return v
 
 

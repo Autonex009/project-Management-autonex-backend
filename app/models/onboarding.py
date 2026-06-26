@@ -84,16 +84,3 @@ class OnboardingQuizAttempt(Base):
     chosen_index = Column(Integer, nullable=False)
     is_correct = Column(Boolean, nullable=False)
     attempted_at = Column(TIMESTAMP, server_default=func.now())
-
-
-class OnboardingTeamMember(Base):
-    __tablename__ = "onboarding_team_members"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(Text, nullable=False)
-    role = Column(Text, nullable=False)
-    department = Column(Text, nullable=False)
-    email = Column(Text, nullable=True)
-    linkedin = Column(Text, nullable=True)
-    slack = Column(Text, nullable=True)
-    created_at = Column(TIMESTAMP, server_default=func.now())

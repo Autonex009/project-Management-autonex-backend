@@ -29,15 +29,31 @@ elif "postgresql" in DATABASE_URL:
     # For regular Postgres (non-Neon) we can set statement_timeout via startup options
     connect_args = {"connect_timeout": 10, "options": "-c statement_timeout=30000"}
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=3,
-    max_overflow=5,
-    pool_recycle=300,
-    pool_timeout=15,
-    connect_args=connect_args,
-)
+# On Vercel (serverless), each function instance is short-lived and there can be
+# many concurrent instances. Holding a connection pool there exhausts Supabase's
+# pooler (EMAXCONNSESSION). Use NullPool so every request opens/closes a single
+# connection and lets the Supabase transaction pooler (port 6543) do the pooling.
+if DATABASE_URL.startswith("sqlite"):
+    engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
+elif os.getenv("VERCEL"):
+    from sqlalchemy.pool import NullPool
+    engine = create_engine(
+        DATABASE_URL,
+        poolclass=NullPool,
+        pool_pre_ping=True,
+        connect_args=connect_args,
+    )
+else:
+    # Long-running server (local / Railway) — a small pool is fine.
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=3,
+        max_overflow=5,
+        pool_recycle=300,
+        pool_timeout=15,
+        connect_args=connect_args,
+    )
 
 SessionLocal = sessionmaker(
     autocommit=False,

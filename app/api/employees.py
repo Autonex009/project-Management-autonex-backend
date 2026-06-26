@@ -1,13 +1,16 @@
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
+from uuid import uuid4
+import os
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.db.database import get_db
-from app.constants.leave_types import is_intern
+from app.constants.leave_types import is_intern, is_intern_or_contractor
 from app.services.salary_crypto import encrypt_salary
 from app.models.allocation import Allocation
 from app.models.employee import Employee
@@ -22,6 +25,19 @@ from app.schemas.employee import (
     EmployeeResponse,
 )
 from app.services.auth_service import hash_password
+from app.services.identity_validator import check_duplicate_identity
+from app.services.slack_service import (
+    try_get_or_cache_employee_slack_user_id,
+    try_lookup_user_avatar_by_email,
+)
+
+# Avatar uploads live alongside the other static uploads served at /uploads.
+_avatar_base = Path("/tmp/uploads") if os.environ.get("VERCEL") else Path(__file__).resolve().parents[2] / "uploads"
+AVATAR_DIR = _avatar_base / "avatars"
+AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+
+ALLOWED_AVATAR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+MAX_AVATAR_BYTES = 5 * 1024 * 1024  # 5 MB
 
 router = APIRouter(
     prefix="/api/employees",
@@ -50,14 +66,8 @@ def create_employee(
     payload: EmployeeCreate,
     db: Session = Depends(get_db)
 ):
-    # Check if email already exists
-    existing = db.query(Employee).filter(Employee.email == payload.email).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    existing_user = db.query(User).filter(User.email == payload.email).first()
-    if existing_user:
-        raise HTTPException(status_code=400, detail="User email already registered")
+    # Enforce unique physical identity check
+    check_duplicate_identity(db, email=payload.email, phone=payload.phone)
 
     data = payload.dict()
     # Salary is encrypted at rest — never store the plaintext column.
@@ -87,12 +97,38 @@ def create_employee(
 @router.get("", response_model=list[EmployeeResponse])
 def list_employees(
     status: str = None,
+    include_archived: bool = False,
     db: Session = Depends(get_db)
 ):
     query = db.query(Employee)
-    if status:
+    if status == "idle":
+        allocated_employee_ids = db.query(Allocation.employee_id).distinct()
+        query = query.filter(Employee.status == "active", Employee.id.notin_(allocated_employee_ids))
+    elif status:
         query = query.filter(Employee.status == status)
+    elif not include_archived:
+        query = query.filter(Employee.status != "archived")
     return query.all()
+
+
+@router.get("/status/active", response_model=list[EmployeeResponse])
+def get_active_employees(db: Session = Depends(get_db)):
+    return db.query(Employee).filter(Employee.status == "active").all()
+
+
+@router.get("/status/inactive", response_model=list[EmployeeResponse])
+def get_inactive_employees(db: Session = Depends(get_db)):
+    return db.query(Employee).filter(Employee.status == "inactive").all()
+
+
+@router.get("/status/idle", response_model=list[EmployeeResponse])
+def get_idle_employees(db: Session = Depends(get_db)):
+    allocated_employee_ids = db.query(Allocation.employee_id).distinct()
+    return db.query(Employee).filter(
+        Employee.status == "active",
+        Employee.id.notin_(allocated_employee_ids)
+    ).all()
+
 
 
 # ✅ GET EMPLOYEE BY ID
@@ -119,14 +155,14 @@ def update_employee(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
     
-    # Check if email is being updated and if it's already taken
-    if payload.email and payload.email != employee.email:
-        existing = db.query(Employee).filter(Employee.email == payload.email).first()
-        if existing:
-            raise HTTPException(status_code=400, detail="Email already registered")
-        existing_user = db.query(User).filter(User.email == payload.email).first()
-        if existing_user:
-            raise HTTPException(status_code=400, detail="User email already registered")
+    # Ensure update doesn't introduce duplicate email or phone for another person
+    if payload.email or payload.phone:
+        check_duplicate_identity(
+            db,
+            email=payload.email if payload.email is not None else employee.email,
+            phone=payload.phone if payload.phone is not None else employee.phone,
+            exclude_employee_id=employee_id
+        )
     
     update_data = payload.dict(exclude_unset=True)
     # Salary is encrypted at rest — divert it to the encrypted column and keep
@@ -173,10 +209,10 @@ def convert_to_fulltime(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    if not is_intern(employee.employee_type):
+    if not is_intern_or_contractor(employee.employee_type):
         raise HTTPException(
             status_code=400,
-            detail=f"Only interns can be converted to full-time (current type: {employee.employee_type}).",
+            detail=f"Only interns or contractors can be converted to full-time (current type: {employee.employee_type}).",
         )
 
     employee.previous_employee_type = employee.employee_type
@@ -207,7 +243,7 @@ def convert_to_fulltime(
     return employee
 
 
-# ✅ DELETE EMPLOYEE
+# ✅ DELETE EMPLOYEE (SOFT-ARCHIVE)
 @router.delete("/{employee_id}")
 def delete_employee(
     employee_id: int,
@@ -219,19 +255,53 @@ def delete_employee(
         raise HTTPException(status_code=404, detail="Employee not found")
     
     try:
-        db.query(Allocation).filter(Allocation.employee_id == employee.id).delete(synchronize_session=False)
-        db.query(Leave).filter(Leave.employee_id == employee.id).delete(synchronize_session=False)
-        db.query(SideProject).filter(SideProject.employee_id == employee.id).delete(synchronize_session=False)
+        employee.status = "archived"
+        
+        # Deactivate associated user account
+        linked_user = db.query(User).filter(User.employee_id == employee.id).first()
+        if not linked_user:
+            linked_user = db.query(User).filter(User.email == employee.email).first()
+        if linked_user:
+            linked_user.is_active = False
 
-        db.query(User).filter(User.employee_id == employee.id).delete(synchronize_session=False)
+        # Clear allocations for this employee
+        db.query(Allocation).filter(Allocation.employee_id == employee.id).delete(synchronize_session=False)
         db.flush()
 
-        db.delete(employee)
         db.commit()
-        return {"message": "Employee deleted successfully"}
+        return {"message": "Employee archived successfully"}
     except SQLAlchemyError:
         db.rollback()
-        raise HTTPException(status_code=500, detail="Failed to delete employee and related records")
+        raise HTTPException(status_code=500, detail="Failed to archive employee")
+
+
+# ✅ RESTORE ARCHIVED EMPLOYEE
+@router.post("/{employee_id}/restore", response_model=EmployeeResponse)
+def restore_employee(
+    employee_id: int,
+    db: Session = Depends(get_db),
+):
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+    
+    try:
+        employee.status = "active"
+        
+        # Reactivate associated user account
+        linked_user = db.query(User).filter(User.employee_id == employee.id).first()
+        if not linked_user:
+            linked_user = db.query(User).filter(User.email == employee.email).first()
+        if linked_user:
+            linked_user.is_active = True
+
+        db.commit()
+        db.refresh(employee)
+        return employee
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to restore employee")
 
 
 # ✅ EMPLOYEE AVAILABILITY (±30 days)
@@ -341,3 +411,121 @@ def get_employee_availability(employee_id: int, db: Session = Depends(get_db)):
             for w in past_wfh
         ],
     }
+
+
+# ✅ SLACK DM DEEP-LINK (resolve/cache the employee's Slack user id on demand)
+@router.get("/{employee_id}/slack-link")
+def get_employee_slack_link(employee_id: int, db: Session = Depends(get_db)):
+    """Return a browser deep-link that opens a Slack DM with the employee.
+
+    The Slack user id is resolved (and cached) on demand from the employee's
+    email when it isn't already stored. Returns 404 when the employee can't be
+    matched to a Slack account.
+    """
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
+    if not slack_user_id:
+        raise HTTPException(
+            status_code=404,
+            detail="No Slack account found for this employee",
+        )
+
+    # app_redirect opens the conversation in the browser (or the desktop app if
+    # installed) without needing the workspace/team id.
+    return {
+        "employee_id": employee.id,
+        "slack_user_id": slack_user_id,
+        "url": f"https://slack.com/app_redirect?channel={slack_user_id}",
+    }
+
+
+# ── Profile picture (avatar) ────────────────────────────────────────
+@router.post("/{employee_id}/avatar", response_model=EmployeeResponse)
+async def upload_employee_avatar(
+    employee_id: int,
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """Upload a profile picture for an employee and store its public URL."""
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    original_name = Path(file.filename or "").name
+    suffix = Path(original_name).suffix.lower()
+    if suffix not in ALLOWED_AVATAR_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported image type. Use JPG, PNG, GIF or WEBP.",
+        )
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    if len(file_bytes) > MAX_AVATAR_BYTES:
+        raise HTTPException(status_code=400, detail="Image is too large (max 5 MB)")
+
+    stored_name = f"{uuid4().hex}{suffix}"
+    destination = AVATAR_DIR / stored_name
+    destination.write_bytes(file_bytes)
+
+    # Remove the previous locally-stored avatar to avoid orphan files.
+    old_url = employee.avatar_url or ""
+    if "/uploads/avatars/" in old_url:
+        old_file = AVATAR_DIR / old_url.rsplit("/", 1)[-1]
+        if old_file.exists():
+            old_file.unlink()
+
+    employee.avatar_url = str(request.base_url).rstrip("/") + f"/uploads/avatars/{stored_name}"
+    try:
+        db.commit()
+        db.refresh(employee)
+        return employee
+    except SQLAlchemyError as exc:
+        db.rollback()
+        if destination.exists():
+            destination.unlink()
+        raise HTTPException(status_code=500, detail="Failed to save avatar") from exc
+
+
+@router.post("/{employee_id}/avatar/from-slack", response_model=EmployeeResponse)
+def set_employee_avatar_from_slack(employee_id: int, db: Session = Depends(get_db)):
+    """Fetch the employee's Slack profile photo and store it as their avatar."""
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    avatar_url = try_lookup_user_avatar_by_email(employee.email)
+    if not avatar_url:
+        raise HTTPException(
+            status_code=404,
+            detail="No Slack profile photo found for this employee",
+        )
+
+    employee.avatar_url = avatar_url
+    db.commit()
+    db.refresh(employee)
+    return employee
+
+
+@router.delete("/{employee_id}/avatar", response_model=EmployeeResponse)
+def delete_employee_avatar(employee_id: int, db: Session = Depends(get_db)):
+    """Remove an employee's profile picture."""
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    old_url = employee.avatar_url or ""
+    if "/uploads/avatars/" in old_url:
+        old_file = AVATAR_DIR / old_url.rsplit("/", 1)[-1]
+        if old_file.exists():
+            old_file.unlink()
+
+    employee.avatar_url = None
+    db.commit()
+    db.refresh(employee)
+    return employee

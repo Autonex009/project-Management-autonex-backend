@@ -1,11 +1,14 @@
 from datetime import date
 
-LEAVE_TYPE_CHOICES = ("paid", "casual_sick", "floater")
+LEAVE_TYPE_CHOICES = ("paid", "casual_sick", "floater", "half_day", "first_half", "second_half")
 
 LEAVE_TYPE_LABELS = {
     "paid": "Paid Leave",
     "casual_sick": "Casual/Sick Leave",
     "floater": "Floater Leave",
+    "half_day": "Half-Day Leave",
+    "first_half": "First Half-Day Leave",
+    "second_half": "Second Half-Day Leave",
 }
 
 # Legacy values are still accepted so existing records continue to sync safely.
@@ -59,6 +62,17 @@ def is_intern(employee_type: str | None) -> bool:
     return (employee_type or "").strip().lower() == "intern"
 
 
+def is_contractor(employee_type: str | None) -> bool:
+    """True if the employee_type denotes a contractor/contract employee (case/space-insensitive)."""
+    val = (employee_type or "").strip().lower()
+    return val in ("contractor", "contract")
+
+
+def is_intern_or_contractor(employee_type: str | None) -> bool:
+    """True if the employee_type denotes an intern or a contractor."""
+    return is_intern(employee_type) or is_contractor(employee_type)
+
+
 # ── Approved floater holiday dates (2026) ───────────────────────────
 # Employees may only apply Floater Leave on these specific dates.
 FLOATER_DATES_2026: frozenset[date] = frozenset([
@@ -72,7 +86,6 @@ FLOATER_DATES_2026: frozenset[date] = frozenset([
     date(2026, 4, 3),    # Good Friday
     date(2026, 4, 14),   # Ambedkar Jayanti
     date(2026, 5, 27),   # Bakrid
-    date(2026, 6, 26),   # Muharram
     date(2026, 8, 15),   # Independence Day
     date(2026, 8, 26),   # Onam
     date(2026, 8, 28),   # Raksha Bandhan
@@ -90,6 +103,7 @@ FIXED_HOLIDAYS_2026: frozenset[date] = frozenset([
     date(2026, 1, 26),   # Republic Day
     date(2026, 3, 4),    # Holi
     date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 6, 26),   # Muharram
     date(2026, 9, 14),   # Ganesh Chaturthi
     date(2026, 10, 2),   # Mahatma Gandhi Jayanti
     date(2026, 11, 9),   # Govardhan Puja
@@ -126,7 +140,10 @@ def is_weekend(d: date) -> bool:
 
 
 def is_non_working_day(d: date) -> bool:
-    return is_weekend(d) or is_fixed_holiday(d)
+    # Payroll treats fixed public holidays as WORKING days (they are paid days, not
+    # days off the salary divisor), so only weekends are non-working here. Leave-day
+    # counting in app/api/leaves.py still excludes holidays separately.
+    return is_weekend(d)
 
 
 def normalize_leave_type(leave_type: str) -> str:

@@ -77,6 +77,33 @@ def get_employee_slack_email(employee) -> str | None:
     return getattr(employee, "email", None)
 
 
+def lookup_user_avatar_by_email(email: str) -> str | None:
+    """Return the best-resolution profile image URL for a Slack user, by email."""
+    response = _slack_request("/users.lookupByEmail", {"email": email}, method="GET")
+    if not response.get("ok"):
+        error_code = response.get("error")
+        if error_code == "users_not_found":
+            logger.warning("Slack avatar lookup skipped for %s: %s", email, error_code)
+            return None
+        raise RuntimeError(f"Slack lookup failed: {error_code or 'unknown_error'}")
+
+    profile = response.get("user", {}).get("profile", {}) or {}
+    # Prefer the largest available image; fall back through the size variants.
+    for key in ("image_original", "image_512", "image_192", "image_72", "image_48"):
+        url = profile.get(key)
+        if url:
+            return url
+    return None
+
+
+def try_lookup_user_avatar_by_email(email: str) -> str | None:
+    try:
+        return lookup_user_avatar_by_email(email)
+    except Exception as exc:
+        logger.warning("Slack avatar lookup skipped for %s: %s", email or "unknown", exc)
+        return None
+
+
 def get_or_cache_employee_slack_user_id(db, employee) -> str | None:
     if getattr(employee, "slack_user_id", None):
         return employee.slack_user_id

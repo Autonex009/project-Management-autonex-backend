@@ -239,6 +239,42 @@ def check_double_booking(
                 )
             )
         )
+    elif active_start and not active_end:
+        # Open-ended new allocation starting at active_start
+        query = query.filter(
+            or_(
+                # Case 1: Existing allocation has no dates (always overlaps)
+                and_(
+                    Allocation.active_start_date.is_(None),
+                    Allocation.active_end_date.is_(None)
+                ),
+                # Case 2: Existing allocation is also open-ended (both continue indefinitely)
+                Allocation.active_end_date.is_(None),
+                # Case 3: Existing allocation ends on or after active_start
+                and_(
+                    Allocation.active_end_date.isnot(None),
+                    Allocation.active_end_date >= active_start
+                )
+            )
+        )
+    elif not active_start and active_end:
+        # Allocation ends at active_end, but start date is unspecified
+        query = query.filter(
+            or_(
+                # Existing has no dates
+                and_(
+                    Allocation.active_start_date.is_(None),
+                    Allocation.active_end_date.is_(None)
+                ),
+                # Existing has no start date
+                Allocation.active_start_date.is_(None),
+                # Existing starts before or on active_end
+                and_(
+                    Allocation.active_start_date.isnot(None),
+                    Allocation.active_start_date <= active_end
+                )
+            )
+        )
     
     existing_allocations = query.all()
     
@@ -306,8 +342,17 @@ def get_employee_allocation_status(
     if not employee:
         return None
     
+    today = date.today()
     allocations = db.query(Allocation).filter(
-        Allocation.employee_id == employee_id
+        Allocation.employee_id == employee_id,
+        or_(
+            Allocation.active_start_date.is_(None),
+            Allocation.active_start_date <= today
+        ),
+        or_(
+            Allocation.active_end_date.is_(None),
+            Allocation.active_end_date >= today
+        )
     ).all()
     
     max_capacity = int(employee.working_hours_per_day or 8)
