@@ -31,7 +31,7 @@ from app.api.company_settings import router as company_settings_router
 from app.api.wifi_networks import router as wifi_networks_router
 from app.api.hiring_sync import router as hiring_sync_router
 from app.seed_skills import seed_skills
-from app.services.scheduler_service import start_scheduler, shutdown_scheduler
+# from app.services.scheduler_service import start_scheduler, shutdown_scheduler
 
 Base.metadata.create_all(bind=engine)
 
@@ -528,9 +528,9 @@ seed_skills()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    start_scheduler()
+    # start_scheduler()
     yield
-    shutdown_scheduler()
+    # shutdown_scheduler()
 
 
 app = FastAPI(title="Autonex Resource Planning Tool V2", lifespan=lifespan)
