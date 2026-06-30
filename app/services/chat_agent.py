@@ -21,7 +21,7 @@ from app.services import chat_tools
 logger = logging.getLogger(__name__)
 
 # ── Gemini Client ───────────────────────────────────────────────────
-MODEL = "gemini-3.1-flash-live-preview"
+MODEL = "gemini-2.5-flash"
 
 
 def _get_client() -> genai.Client:
