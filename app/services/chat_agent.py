@@ -68,6 +68,37 @@ def _build_system_prompt(employee_name: str, employee_type: str, role: str) -> s
 3. **Stay on topic.** Help with leaves, WFH, projects, policies, and holidays only. Politely redirect off-topic queries.
 4. **Always use tools** to fetch real data — never guess balances, dates, or policy details.
 5. **Cite the policy name** when returning policy search results (e.g., "According to the **Leave Policy**...").
+
+## Example Responses
+
+**User asks: "How many leaves do I have?"**
+Your response (after calling get_leave_balance):
+> Here's your leave balance for 2026, {employee_name}:
+>
+> | Type | Quota | Used | Remaining |
+> |------|-------|------|-----------|
+> | Paid Leave | 12 | 3 | **9** |
+> | Casual/Sick | 6 | 2 | **4** |
+> | Floater | 2 | 0 | **2** |
+>
+> You have plenty of leave remaining! 🎉 Would you like me to help you plan some time off?
+
+**User asks: "What are the do's and don'ts?"**
+Your response (after calling search_policy):
+> According to the **General Policies**, here are the key do's and don'ts:
+>
+> ### ✅ Do's
+> - Keep your manager informed of any roadblocks early
+> - Secure your workstation when stepping away (Win+L or Cmd+Control+Q)
+> - Use company-approved tools and software for all project work
+> - Dress professionally when meeting clients
+>
+> ### ❌ Don'ts
+> - Don't share confidential client data or passwords on public channels
+> - Don't use unauthorized third-party software without IT approval
+> - Don't engage in side-gigs that conflict with your duties
+>
+> Need more details on any specific policy?
 """
 
 
@@ -451,16 +482,30 @@ async def chat_stream(
                 config=config,
             )
 
-        # Yield the final text token by token for streaming feel
+        # Yield the final text in chunks for streaming feel
         if final_text:
-            # Split into reasonable chunks for streaming
-            words = final_text.split(" ")
-            chunk = ""
-            for i, word in enumerate(words):
-                chunk += (" " if chunk else "") + word
-                if len(chunk) >= 20 or i == len(words) - 1:
-                    yield json.dumps({"type": "token", "content": chunk})
-                    chunk = ""
+            # Stream by splitting on line boundaries first, then sub-chunk long lines.
+            # This preserves ALL whitespace and markdown formatting exactly.
+            lines = final_text.split("\n")
+            for line_idx, line in enumerate(lines):
+                # Add newline back (except last line)
+                line_with_nl = line + ("\n" if line_idx < len(lines) - 1 else "")
+                # Sub-chunk long lines at ~40 char boundaries (on word boundaries)
+                if len(line_with_nl) > 50:
+                    pos = 0
+                    while pos < len(line_with_nl):
+                        end = min(pos + 40, len(line_with_nl))
+                        # Extend to next space boundary to avoid splitting words
+                        if end < len(line_with_nl):
+                            space_pos = line_with_nl.find(" ", end)
+                            if space_pos != -1 and space_pos < end + 15:
+                                end = space_pos + 1  # Include the space
+                            else:
+                                end = min(pos + 55, len(line_with_nl))
+                        yield json.dumps({"type": "token", "content": line_with_nl[pos:end]})
+                        pos = end
+                else:
+                    yield json.dumps({"type": "token", "content": line_with_nl})
 
         # Save assistant response
         _save_message(conversation_id, user_id, "model", final_text, db=db)
