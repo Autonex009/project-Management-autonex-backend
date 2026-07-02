@@ -973,6 +973,91 @@ def reject_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_
     return {"message": "Leave rejected", "leave_id": leave_id, "status": "rejected"}
 
 
+@router.patch("/{leave_id}/undo-reject")
+def undo_reject_leave(leave_id: int, approved_by: int = Query(default=0), db: Session = Depends(get_db)):
+    """Reopen a rejected leave back to pending."""
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found")
+    if leave.status != "rejected":
+        raise HTTPException(status_code=400, detail=f"Leave is not rejected (status: {leave.status})")
+
+    # Re-run the same overlap / consecutive-day guards create_leave applies, since other
+    # non-rejected leaves may have been legitimately created in this window while this one
+    # was rejected (rejected leaves don't block). Reopening it must not silently double-book.
+    overlap = (
+        db.query(Leave)
+        .filter(
+            Leave.employee_id == leave.employee_id,
+            Leave.id != leave_id,
+            Leave.status != "rejected",
+            Leave.start_date <= leave.end_date,
+            Leave.end_date >= leave.start_date,
+        )
+        .first()
+    )
+    if overlap:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot reopen — it now overlaps another active leave ({overlap.start_date} – {overlap.end_date}).",
+        )
+    validate_consecutive_leaves(
+        leave.employee_id, leave.start_date, leave.end_date, db,
+        exclude_leave_id=leave_id, is_half_day=getattr(leave, "is_half_day", False),
+    )
+
+    leave.status = "pending"
+    leave.approved_by = approved_by
+    db.commit()
+
+    emp_user = db.query(User).filter(User.employee_id == leave.employee_id).first()
+    if emp_user:
+        _push_notification(
+            db, emp_user.id,
+            "Leave request reopened",
+            f"Your {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date} has been reopened and is pending approval.",
+            "leave_applied",
+        )
+        db.commit()
+
+    return {"message": "Leave reopened", "leave_id": leave_id, "status": "pending"}
+
+
+@router.patch("/{leave_id}/undo-approve")
+def undo_approve_leave(leave_id: int, approved_by: int = Query(default=0), db: Session = Depends(get_db)):
+    """Revoke an approval, reverting the leave back to pending. Reverses the Razorpay
+    sync first (if applied) so the two systems never drift out of sync."""
+    leave = db.query(Leave).filter(Leave.id == leave_id).first()
+    if not leave:
+        raise HTTPException(status_code=404, detail="Leave not found")
+    if leave.status != "approved":
+        raise HTTPException(status_code=400, detail=f"Leave is not approved (status: {leave.status})")
+
+    if leave.razorpay_applied:
+        employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+        if not employee:
+            raise HTTPException(status_code=404, detail="Employee not found")
+        unsync_leave_from_razorpay(employee, leave)
+        leave.razorpay_applied = False
+
+    leave.status = "pending"
+    leave.approved_by = approved_by
+    leave.approval_remark = None
+    db.commit()
+
+    emp_user = db.query(User).filter(User.employee_id == leave.employee_id).first()
+    if emp_user:
+        _push_notification(
+            db, emp_user.id,
+            "Leave approval revoked",
+            f"Your {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date} is back to pending — approval was revoked.",
+            "leave_applied",
+        )
+        db.commit()
+
+    return {"message": "Leave approval revoked, reverted to pending", "leave_id": leave_id, "status": "pending"}
+
+
 @router.delete("/{leave_id}")
 def delete_leave(leave_id: int, db: Session = Depends(get_db)):
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
