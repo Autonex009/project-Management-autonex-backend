@@ -175,14 +175,22 @@ def get_signup_request_counts(db: Session = Depends(get_db)):
 @router.get("", response_model=PaginatedSignupRequestResponse)
 def list_signup_requests(
     status: Optional[str] = Query(None, description="Filter by status: pending | approved | rejected"),
+    search: Optional[str] = Query(None, description="Case-insensitive search on name, email, or designation"),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
-    """List signup requests with server-side pagination."""
+    """List signup requests with server-side pagination and search."""
     q = db.query(SignupRequest)
     if status:
         q = q.filter(SignupRequest.status == status)
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        q = q.filter(
+            SignupRequest.name.ilike(term) |
+            SignupRequest.email.ilike(term) |
+            SignupRequest.designation.ilike(term)
+        )
     q = q.order_by(SignupRequest.created_at.desc())
 
     total = q.count()
@@ -211,44 +219,67 @@ def approve_signup_request(
     if req.status != "pending":
         raise HTTPException(status_code=400, detail=f"Request is already {req.status}")
 
-    # Guard: ensure no conflict exists before approving
+    # Check for existing inactive records from a previous undo-approve
+    existing_employee = db.query(Employee).filter(Employee.email == req.email).first()
+    existing_user = db.query(User).filter(User.email == req.email).first()
+
+    # Guard: ensure no conflict from OTHER records (exclude the ones we may reactivate)
     check_duplicate_identity(
         db,
         email=req.email,
         phone=req.phone,
-        exclude_signup_request_id=request_id
+        exclude_signup_request_id=request_id,
+        exclude_employee_id=existing_employee.id if existing_employee else None,
+        exclude_user_id=existing_user.id if existing_user else None,
     )
 
-    # Create Employee record
-    employee = Employee(
-        name=req.name,
-        email=req.email,
-        phone=req.phone,
-        designation=req.designation or "Annotator/ Reviewer",
-        employee_type=req.employee_type,
-        skills=req.skills or [],
-        status="active",
-        working_hours_per_day=8,
-        weekly_availability=40,
-        productivity_baseline=1.0,
-    )
-    db.add(employee)
+    # Reactivate existing employee or create a new one
+    if existing_employee:
+        existing_employee.status = "active"
+        existing_employee.name = req.name
+        existing_employee.phone = req.phone
+        existing_employee.designation = req.designation or existing_employee.designation or "Annotator/ Reviewer"
+        existing_employee.employee_type = req.employee_type
+        existing_employee.skills = req.skills or []
+        employee = existing_employee
+    else:
+        employee = Employee(
+            name=req.name,
+            email=req.email,
+            phone=req.phone,
+            designation=req.designation or "Annotator/ Reviewer",
+            employee_type=req.employee_type,
+            skills=req.skills or [],
+            status="active",
+            working_hours_per_day=8,
+            weekly_availability=40,
+            productivity_baseline=1.0,
+        )
+        db.add(employee)
     db.flush()
 
-    # Create User with temp password
+    # Generate new temp password
     temp_password = _gen_temp_password()
     pw_hash = bcrypt.hashpw(temp_password.encode(), bcrypt.gensalt()).decode()
 
-    user = User(
-        name=req.name,
-        email=req.email,
-        password_hash=pw_hash,
-        role="employee",
-        employee_id=employee.id,
-        is_active=True,
-        skills=req.skills or [],
-    )
-    db.add(user)
+    # Reactivate existing user or create a new one
+    if existing_user:
+        existing_user.is_active = True
+        existing_user.password_hash = pw_hash
+        existing_user.employee_id = employee.id
+        existing_user.skills = req.skills or []
+        user = existing_user
+    else:
+        user = User(
+            name=req.name,
+            email=req.email,
+            password_hash=pw_hash,
+            role="employee",
+            employee_id=employee.id,
+            is_active=True,
+            skills=req.skills or [],
+        )
+        db.add(user)
     db.flush()
 
     # Mark request approved
@@ -341,61 +372,48 @@ def reject_signup_request(
     return {"message": f"Signup request rejected. {req.email} has been notified.", "request_id": request_id}
 
 
-# ── Undo endpoints (to be enabled in a future release) ────────────────────────
-# These endpoints allow admins to reverse approve/reject decisions.
-#
-# undo-reject: resets rejected → pending so admin can re-review and approve.
-# undo-approve: sets approved → rejected AND deactivates user.is_active = False
-#               + employee.status = inactive so the employee loses portal access.
-#
-# Frontend: add an "Undo" button (RotateCcw icon, secondary style) to the left
-# of the Details button for approved and rejected rows in SignupRequestsPage.jsx.
-# API methods to add in signupRequestApi:
-#   undoReject:  PATCH /signup-requests/{id}/undo-reject  (no body)
-#   undoApprove: PATCH /signup-requests/{id}/undo-approve (body: { reason? })
-#
-# @router.patch("/{request_id}/undo-reject")
-# def undo_reject_signup_request(
-#     request_id: int,
-#     reviewed_by: int = Query(0),
-#     db: Session = Depends(get_db),
-# ):
-#     req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
-#     if not req:
-#         raise HTTPException(status_code=404, detail="Signup request not found")
-#     if req.status != "rejected":
-#         raise HTTPException(status_code=400, detail=f"Request is not rejected (status: {req.status})")
-#     req.status = "pending"
-#     req.reviewed_by = reviewed_by
-#     req.reviewed_at = datetime.utcnow()
-#     req.rejection_reason = None
-#     db.commit()
-#     logger.info("[signup-request] Undo-reject id=%s email=%s", req.id, req.email)
-#     return {"message": "Signup request reopened.", "request_id": request_id}
-#
-#
-# @router.patch("/{request_id}/undo-approve")
-# def undo_approve_signup_request(
-#     request_id: int,
-#     reviewed_by: int = Query(0),
-#     body: RejectBody = RejectBody(),
-#     db: Session = Depends(get_db),
-# ):
-#     req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
-#     if not req:
-#         raise HTTPException(status_code=404, detail="Signup request not found")
-#     if req.status != "approved":
-#         raise HTTPException(status_code=400, detail=f"Request is not approved (status: {req.status})")
-#     user = db.query(User).filter(User.email == req.email).first()
-#     if user:
-#         user.is_active = False
-#     employee = db.query(Employee).filter(Employee.email == req.email).first()
-#     if employee:
-#         employee.status = "inactive"
-#     req.status = "rejected"
-#     req.reviewed_by = reviewed_by
-#     req.reviewed_at = datetime.utcnow()
-#     req.rejection_reason = body.reason
-#     db.commit()
-#     logger.info("[signup-request] Undo-approve id=%s email=%s — account deactivated", req.id, req.email)
-#     return {"message": "Approval revoked. Employee account has been deactivated.", "request_id": request_id}
+@router.patch("/{request_id}/undo-reject")
+def undo_reject_signup_request(
+    request_id: int,
+    reviewed_by: int = Query(0),
+    db: Session = Depends(get_db),
+):
+    req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Signup request not found")
+    if req.status != "rejected":
+        raise HTTPException(status_code=400, detail=f"Request is not rejected (status: {req.status})")
+    req.status = "pending"
+    req.reviewed_by = reviewed_by
+    req.reviewed_at = datetime.utcnow()
+    req.rejection_reason = None
+    db.commit()
+    logger.info("[signup-request] Undo-reject id=%s email=%s", req.id, req.email)
+    return {"message": "Signup request reopened.", "request_id": request_id}
+
+
+@router.patch("/{request_id}/undo-approve")
+def undo_approve_signup_request(
+    request_id: int,
+    reviewed_by: int = Query(0),
+    body: RejectBody = RejectBody(),
+    db: Session = Depends(get_db),
+):
+    req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Signup request not found")
+    if req.status != "approved":
+        raise HTTPException(status_code=400, detail=f"Request is not approved (status: {req.status})")
+    user = db.query(User).filter(User.email == req.email).first()
+    if user:
+        user.is_active = False
+    employee = db.query(Employee).filter(Employee.email == req.email).first()
+    if employee:
+        employee.status = "inactive"
+    req.status = "rejected"
+    req.reviewed_by = reviewed_by
+    req.reviewed_at = datetime.utcnow()
+    req.rejection_reason = body.reason
+    db.commit()
+    logger.info("[signup-request] Undo-approve id=%s email=%s — account deactivated", req.id, req.email)
+    return {"message": "Approval revoked. Employee account has been deactivated.", "request_id": request_id}
