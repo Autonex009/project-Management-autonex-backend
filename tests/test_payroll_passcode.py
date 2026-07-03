@@ -27,7 +27,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import app.db.database as database
 from app.db.database import Base
 
-import app.models.admin            # noqa: F401
 import app.models.allocation       # noqa: F401
 import app.models.employee         # noqa: F401
 import app.models.guideline        # noqa: F401
@@ -35,7 +34,6 @@ import app.models.leave            # noqa: F401
 import app.models.notification     # noqa: F401
 import app.models.parent_project   # noqa: F401
 import app.models.payroll          # noqa: F401
-import app.models.product_manager  # noqa: F401
 import app.models.project          # noqa: F401
 import app.models.referral         # noqa: F401
 import app.models.side_project     # noqa: F401

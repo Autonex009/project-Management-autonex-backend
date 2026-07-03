@@ -140,7 +140,10 @@ def is_weekend(d: date) -> bool:
 
 
 def is_non_working_day(d: date) -> bool:
-    return is_weekend(d) or is_fixed_holiday(d)
+    # Payroll treats fixed public holidays as WORKING days (they are paid days, not
+    # days off the salary divisor), so only weekends are non-working here. Leave-day
+    # counting in app/api/leaves.py still excludes holidays separately.
+    return is_weekend(d)
 
 
 def normalize_leave_type(leave_type: str) -> str:

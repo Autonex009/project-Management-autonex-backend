@@ -229,6 +229,69 @@ def reject_wfh(
     return {"message": "WFH request rejected", "wfh_id": wfh_id, "status": "rejected"}
 
 
+@router.patch("/{wfh_id}/undo-reject")
+def undo_reject_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Depends(get_db)):
+    """Reopen a rejected WFH request back to pending."""
+    req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="WFH request not found")
+    if req.status != "rejected":
+        raise HTTPException(status_code=400, detail=f"WFH request is not rejected (status: {req.status})")
+
+    end_date = req.end_date or req.wfh_date
+    # Re-check overlap since another non-rejected WFH request may have been created in this
+    # window while this one was rejected (rejected requests don't block new ones).
+    overlap = db.query(WFHRequest).filter(
+        WFHRequest.employee_id == req.employee_id,
+        WFHRequest.id != wfh_id,
+        WFHRequest.status != "rejected",
+        WFHRequest.wfh_date <= end_date,
+        (WFHRequest.end_date >= req.wfh_date) | (WFHRequest.wfh_date >= req.wfh_date),
+    ).first()
+    if overlap:
+        overlap_end = overlap.end_date or overlap.wfh_date
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot reopen — it now overlaps another active WFH request ({overlap.wfh_date} – {overlap_end}).",
+        )
+
+    req.status = "pending"
+    req.approved_by = approved_by
+    db.commit()
+
+    emp_user = db.query(User).filter(User.employee_id == req.employee_id).first()
+    if emp_user:
+        _push_notification(db, emp_user.id, "WFH request reopened",
+            f"Your WFH request for {req.wfh_date} has been reopened and is pending approval.",
+            "wfh_applied")
+        db.commit()
+
+    return {"message": "WFH request reopened", "wfh_id": wfh_id, "status": "pending"}
+
+
+@router.patch("/{wfh_id}/undo-approve")
+def undo_approve_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Depends(get_db)):
+    """Revoke an approval, reverting the WFH request back to pending."""
+    req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="WFH request not found")
+    if req.status != "approved":
+        raise HTTPException(status_code=400, detail=f"WFH request is not approved (status: {req.status})")
+
+    req.status = "pending"
+    req.approved_by = approved_by
+    db.commit()
+
+    emp_user = db.query(User).filter(User.employee_id == req.employee_id).first()
+    if emp_user:
+        _push_notification(db, emp_user.id, "WFH approval revoked",
+            f"Your WFH request for {req.wfh_date} is back to pending — approval was revoked.",
+            "wfh_applied")
+        db.commit()
+
+    return {"message": "WFH approval revoked, reverted to pending", "wfh_id": wfh_id, "status": "pending"}
+
+
 @router.put("/{wfh_id}", response_model=WFHResponse)
 def update_wfh_request(wfh_id: int, payload: WFHCreate, db: Session = Depends(get_db)):
     """Edit a WFH request. Only allowed before the WFH date."""

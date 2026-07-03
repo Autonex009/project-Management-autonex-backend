@@ -1,3 +1,4 @@
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -5,7 +6,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, onboarding, company_settings, wifi_network
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, onboarding, company_settings, wifi_network, chat
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -30,10 +31,13 @@ from app.api.onboarding import router as onboarding_router
 from app.api.company_settings import router as company_settings_router
 from app.api.wifi_networks import router as wifi_networks_router
 from app.api.hiring_sync import router as hiring_sync_router
+from app.api.chat import router as chat_router
 from app.seed_skills import seed_skills
-from app.services.scheduler_service import start_scheduler, shutdown_scheduler
+# from app.services.scheduler_service import start_scheduler, shutdown_scheduler
 
 Base.metadata.create_all(bind=engine)
+
+logger = logging.getLogger(__name__)
 
 
 def sync_main_project_schema() -> None:
@@ -457,24 +461,28 @@ sync_performance_reviews_schema()
 
 
 def sync_payroll_schema() -> None:
-    """Backfill the unpaid_days snapshot column on existing payroll_leave_adjustments tables."""
+    """Backfill snapshot columns on existing payroll_leave_adjustments tables."""
     inspector = inspect(engine)
     try:
         tables = set(inspector.get_table_names())
     except Exception:
         return
     if "payroll_leave_adjustments" not in tables:
-        return  # create_all() will build it with the column already present
+        return  # create_all() will build it with the columns already present
     try:
         columns = {column["name"] for column in inspector.get_columns("payroll_leave_adjustments")}
     except Exception:
         return
-    if "unpaid_days" in columns:
-        return
     with engine.begin() as connection:
-        connection.execute(
-            text("ALTER TABLE payroll_leave_adjustments ADD COLUMN unpaid_days INTEGER")
-        )
+        if "unpaid_days" not in columns:
+            connection.execute(
+                text("ALTER TABLE payroll_leave_adjustments ADD COLUMN unpaid_days INTEGER")
+            )
+        # Specific unpaid dates chosen by the admin (JSON array of ISO date strings).
+        if "unpaid_dates" not in columns:
+            connection.execute(
+                text("ALTER TABLE payroll_leave_adjustments ADD COLUMN unpaid_dates TEXT")
+            )
 
 
 sync_payroll_schema()
@@ -518,15 +526,34 @@ def sync_wifi_networks_schema() -> None:
     if "wifi_networks" not in tables:
         wifi_network.Base.metadata.tables["wifi_networks"].create(bind=engine)
 
+def sync_chat_schema() -> None:
+    """Create the chat tables on existing databases if missing."""
+    inspector = inspect(engine)
+    try:
+        tables = set(inspector.get_table_names())
+    except Exception:
+        return
+    if "chat_conversations" not in tables:
+        chat.Base.metadata.tables["chat_conversations"].create(bind=engine)
+    if "chat_messages" not in tables:
+        chat.Base.metadata.tables["chat_messages"].create(bind=engine)
+
 sync_company_settings_schema()
 sync_wifi_networks_schema()
+sync_chat_schema()
 seed_skills()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    start_scheduler()
+    # Initialize knowledge base for the chat RAG pipeline
+    try:
+        from app.services.knowledge_service import initialize_knowledge_base
+        initialize_knowledge_base()
+    except Exception as e:
+        logger.warning("Knowledge base init skipped: %s", e)
+    # start_scheduler()
     yield
-    shutdown_scheduler()
+    # shutdown_scheduler()
 
 
 app = FastAPI(title="Autonex Resource Planning Tool V2", lifespan=lifespan)
@@ -569,4 +596,5 @@ app.include_router(onboarding_router)
 app.include_router(company_settings_router)
 app.include_router(wifi_networks_router)
 app.include_router(hiring_sync_router)
+app.include_router(chat_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
