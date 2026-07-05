@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, onboarding, company_settings, wifi_network, chat
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_review, onboarding, company_settings, wifi_network,chat
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -27,6 +27,7 @@ from app.api.signup_requests import router as signup_requests_router
 from app.api.referrals import router as referrals_router, external_router as referrals_external_router
 from app.api.payroll import router as payroll_router
 from app.api.performance_reviews import router as performance_reviews_router
+from app.api.perf_reviews import router as perf_reviews_router
 from app.api.onboarding import router as onboarding_router
 from app.api.company_settings import router as company_settings_router
 from app.api.wifi_networks import router as wifi_networks_router
@@ -460,6 +461,20 @@ def sync_performance_reviews_schema() -> None:
 sync_performance_reviews_schema()
 
 
+def sync_perf_reviews_schema() -> None:
+    """Create the perf_reviews (monthly structured reviews) table if missing."""
+    inspector = inspect(engine)
+    try:
+        tables = set(inspector.get_table_names())
+    except Exception:
+        return
+    if "perf_reviews" not in tables:
+        perf_review.Base.metadata.tables["perf_reviews"].create(bind=engine)
+
+
+sync_perf_reviews_schema()
+
+
 def sync_payroll_schema() -> None:
     """Backfill snapshot columns on existing payroll_leave_adjustments tables."""
     inspector = inspect(engine)
@@ -592,6 +607,7 @@ app.include_router(referrals_router)
 app.include_router(referrals_external_router)
 app.include_router(payroll_router)
 app.include_router(performance_reviews_router)
+app.include_router(perf_reviews_router)
 app.include_router(onboarding_router)
 app.include_router(company_settings_router)
 app.include_router(wifi_networks_router)
