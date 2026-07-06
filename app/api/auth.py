@@ -6,6 +6,7 @@ import os
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Literal
 from jose import ExpiredSignatureError, JWTError
@@ -190,7 +191,23 @@ def signup(body: SignupRequest, db: Session = Depends(get_db)):
         "employee_id": user.employee_id,
     })
 
-    return LoginResponse(token=token, user=response_user)
+    # Return JSONResponse to include both cookie and JSON body
+    response = JSONResponse(content={
+        "token": token,
+        "user": response_user.model_dump(),
+    }, status_code=status.HTTP_201_CREATED)
+
+    is_prod = os.getenv("ENVIRONMENT", "development") != "development"
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        secure=is_prod,
+        samesite="lax",
+        max_age=60 * 60 * 24,  # 24 hours
+        path="/",
+    )
+    return response
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -255,8 +272,23 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         "employee_id": user.employee_id,
     })
 
-    logger.info("[login] Success: email=%s role=%s", body.email, response_user.role)
-    return LoginResponse(token=token, user=response_user)
+    # Return JSONResponse to include both cookie and JSON body
+    response = JSONResponse(content={
+        "token": token,
+        "user": response_user.model_dump(),
+    })
+
+    is_prod = os.getenv("ENVIRONMENT", "development") != "development"
+    response.set_cookie(
+        key="access_token",
+        value=token,
+        httponly=True,
+        secure=is_prod,
+        samesite="lax",
+        max_age=60 * 60 * 24,  # 24 hours
+        path="/",
+    )
+    return response
 
 
 @router.post("/forgot-password", response_model=MessageResponse)
@@ -403,12 +435,19 @@ def reset_password(
 @router.post("/logout")
 def logout(request: Request):
     """Invalidate current token."""
-    auth_header = request.headers.get("Authorization", "")
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
+    token = request.cookies.get("access_token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:]
+            
+    if token:
         blacklist_token(token)
         logger.info("[logout] Token blacklisted")
-    return {"message": "Logged out successfully"}
+        
+    response = JSONResponse(content={"message": "Logged out successfully"})
+    response.delete_cookie("access_token", path="/")
+    return response
 
 
 @router.get("/me", response_model=UserResponse)

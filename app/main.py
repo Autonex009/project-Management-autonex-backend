@@ -580,13 +580,15 @@ else:
     uploads_dir = Path(__file__).resolve().parents[1] / "uploads"
 uploads_dir.mkdir(parents=True, exist_ok=True)
 
-# Configure CORS
+# Configure CORS dynamically without hardcoding any domains or localhost
+# This allows credentials (cookies) to be sent from any frontend origin (local, staging, prod, preview)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Allow all origins
-    allow_credentials=False,
-    allow_methods=["*"],   # Allow all HTTP methods
-    allow_headers=["*"],   # Allow all headers
+    allow_origins=[],
+    allow_origin_regex=r"https?://.*",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(project_router)
