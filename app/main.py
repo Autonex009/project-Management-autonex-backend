@@ -1,3 +1,4 @@
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -5,7 +6,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, onboarding, company_settings, wifi_network
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_review, onboarding, company_settings, wifi_network,chat
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -26,14 +27,18 @@ from app.api.signup_requests import router as signup_requests_router
 from app.api.referrals import router as referrals_router, external_router as referrals_external_router
 from app.api.payroll import router as payroll_router
 from app.api.performance_reviews import router as performance_reviews_router
+from app.api.perf_reviews import router as perf_reviews_router
 from app.api.onboarding import router as onboarding_router
 from app.api.company_settings import router as company_settings_router
 from app.api.wifi_networks import router as wifi_networks_router
 from app.api.hiring_sync import router as hiring_sync_router
+from app.api.chat import router as chat_router
 from app.seed_skills import seed_skills
 # from app.services.scheduler_service import start_scheduler, shutdown_scheduler
 
 Base.metadata.create_all(bind=engine)
+
+logger = logging.getLogger(__name__)
 
 
 def sync_main_project_schema() -> None:
@@ -456,6 +461,20 @@ def sync_performance_reviews_schema() -> None:
 sync_performance_reviews_schema()
 
 
+def sync_perf_reviews_schema() -> None:
+    """Create the perf_reviews (monthly structured reviews) table if missing."""
+    inspector = inspect(engine)
+    try:
+        tables = set(inspector.get_table_names())
+    except Exception:
+        return
+    if "perf_reviews" not in tables:
+        perf_review.Base.metadata.tables["perf_reviews"].create(bind=engine)
+
+
+sync_perf_reviews_schema()
+
+
 def sync_payroll_schema() -> None:
     """Backfill snapshot columns on existing payroll_leave_adjustments tables."""
     inspector = inspect(engine)
@@ -522,12 +541,31 @@ def sync_wifi_networks_schema() -> None:
     if "wifi_networks" not in tables:
         wifi_network.Base.metadata.tables["wifi_networks"].create(bind=engine)
 
+def sync_chat_schema() -> None:
+    """Create the chat tables on existing databases if missing."""
+    inspector = inspect(engine)
+    try:
+        tables = set(inspector.get_table_names())
+    except Exception:
+        return
+    if "chat_conversations" not in tables:
+        chat.Base.metadata.tables["chat_conversations"].create(bind=engine)
+    if "chat_messages" not in tables:
+        chat.Base.metadata.tables["chat_messages"].create(bind=engine)
+
 sync_company_settings_schema()
 sync_wifi_networks_schema()
+sync_chat_schema()
 seed_skills()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize knowledge base for the chat RAG pipeline
+    try:
+        from app.services.knowledge_service import initialize_knowledge_base
+        initialize_knowledge_base()
+    except Exception as e:
+        logger.warning("Knowledge base init skipped: %s", e)
     # start_scheduler()
     yield
     # shutdown_scheduler()
@@ -542,13 +580,15 @@ else:
     uploads_dir = Path(__file__).resolve().parents[1] / "uploads"
 uploads_dir.mkdir(parents=True, exist_ok=True)
 
-# Configure CORS
+# Configure CORS dynamically without hardcoding any domains or localhost
+# This allows credentials (cookies) to be sent from any frontend origin (local, staging, prod, preview)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Allow all origins
-    allow_credentials=False,
-    allow_methods=["*"],   # Allow all HTTP methods
-    allow_headers=["*"],   # Allow all headers
+    allow_origins=[],
+    allow_origin_regex=r"https?://.*",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(project_router)
@@ -569,8 +609,10 @@ app.include_router(referrals_router)
 app.include_router(referrals_external_router)
 app.include_router(payroll_router)
 app.include_router(performance_reviews_router)
+app.include_router(perf_reviews_router)
 app.include_router(onboarding_router)
 app.include_router(company_settings_router)
 app.include_router(wifi_networks_router)
 app.include_router(hiring_sync_router)
+app.include_router(chat_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
