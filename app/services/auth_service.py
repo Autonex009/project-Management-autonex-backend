@@ -9,7 +9,7 @@ from typing import Optional
 
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
@@ -75,6 +75,7 @@ def is_token_blacklisted(token: str) -> bool:
 
 # ── Dependencies ────────────────────────────────────────────────────
 def get_current_user(
+    request: Request,
     token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_db),
 ) -> User:
@@ -87,6 +88,9 @@ def get_current_user(
         detail="Invalid or expired token",
         headers={"WWW-Authenticate": "Bearer"},
     )
+
+    if token is None:
+        token = request.cookies.get("access_token")
 
     if token is None:
         raise credentials_exception
