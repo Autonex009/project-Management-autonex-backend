@@ -1046,15 +1046,41 @@ def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] 
 
 @router.get("/reports")
 def get_onboarding_reports(
+    page: int = 1,
+    limit: int = 10,
+    search: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm"))
 ):
     """Retrieve full detailed reports on candidate onboarding progress."""
-    return fetch_onboarding_reports_data(db)
+    candidates = get_onboarding_candidates(db)
+    
+    if search:
+        search_lower = search.lower()
+        candidates = [c for c in candidates if search_lower in (c.name or "").lower() or search_lower in (c.email or "").lower()]
+        
+    total = len(candidates)
+    candidates.sort(key=lambda c: (c.name or "").lower())
+    
+    if limit > 0:
+        start = (page - 1) * limit
+        candidates = candidates[start : start + limit]
+        
+    reports = fetch_onboarding_reports_data(db, candidates=candidates)
+    
+    return {
+        "data": reports,
+        "total": total,
+        "page": page,
+        "limit": limit
+    }
 
 
 @router.get("/newly-onboarded")
 def get_newly_onboarded(
+    page: int = 1,
+    limit: int = 10,
+    search: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm"))
 ):
@@ -1065,6 +1091,18 @@ def get_newly_onboarded(
     candidates = get_onboarding_candidates(db)
     allocated_ids = _actively_allocated_employee_ids(db)
     pool = [c for c in candidates if c.employee_id not in allocated_ids]
+
+    if search:
+        search_lower = search.lower()
+        pool = [c for c in pool if search_lower in (c.name or "").lower() or search_lower in (c.email or "").lower()]
+        
+    total = len(pool)
+    pool.sort(key=lambda c: (c.name or "").lower())
+    
+    if limit > 0:
+        start = (page - 1) * limit
+        pool = pool[start : start + limit]
+
     reports = fetch_onboarding_reports_data(db, candidates=pool)
 
     # Enrich with each candidate's project allocations (history/context). Pool members
@@ -1105,8 +1143,12 @@ def get_newly_onboarded(
     for r in reports:
         r["allocations"] = allocs_by_emp.get(r["employeeId"], [])
 
-    reports.sort(key=lambda r: r.get("overallScore", 0), reverse=True)
-    return reports
+    return {
+        "data": reports,
+        "total": total,
+        "page": page,
+        "limit": limit
+    }
 
 
 @router.get("/reports/export")
@@ -1152,6 +1194,9 @@ def export_onboarding_reports(
 @router.get("/mentors/{mentor_id}/mentees")
 def get_mentees(
     mentor_id: int,
+    page: int = 1,
+    limit: int = 10,
+    search: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm"))
 ):
@@ -1212,6 +1257,17 @@ def get_mentees(
         user_map[u.id] = u
     final_users = list(user_map.values())
 
+    if search:
+        search_lower = search.lower()
+        final_users = [c for c in final_users if search_lower in (c.name or "").lower() or search_lower in (c.email or "").lower()]
+        
+    total = len(final_users)
+    final_users.sort(key=lambda c: (c.name or "").lower())
+    
+    if limit > 0:
+        start = (page - 1) * limit
+        final_users = final_users[start : start + limit]
+
     results = []
     for m in final_users:
         progress_records = db.query(OnboardingProgress).filter(OnboardingProgress.user_id == m.id).all()
@@ -1233,5 +1289,10 @@ def get_mentees(
             "quizScorePercent": score
         })
 
-    return results
+    return {
+        "data": results,
+        "total": total,
+        "page": page,
+        "limit": limit
+    }
 
