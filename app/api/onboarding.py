@@ -67,20 +67,57 @@ def _is_pm_or_admin(user: User, employee: Employee) -> bool:
     return "program manager" in designation or "project manager" in designation or "admin" in designation
 
 
-def get_onboarding_candidates(db: Session) -> List[User]:
-    """Retrieve all annotation staff: designation contains Annotator/Reviewer, OR the linked
-    employee has an annotation skill — but skill-only matches exclude PMs/Admins."""
-    rows = db.query(User, Employee).join(
-        Employee, User.employee_id == Employee.id
-    ).all()
-    candidates = []
-    for user, employee in rows:
-        designation = (employee.designation or "").lower()
-        is_annotator_designation = "annotator" in designation or "reviewer" in designation
-        skill_based = _has_annotation_skill(employee.skills) and not _is_pm_or_admin(user, employee)
-        if is_annotator_designation or skill_based:
-            candidates.append(user)
-    return candidates
+from sqlalchemy import cast, String, or_, func
+
+def get_onboarding_candidates(db: Session, search: Optional[str] = None, skip: int = 0, limit: int = -1, exclude_emp_ids: Optional[list] = None) -> tuple[List[User], int]:
+    """Retrieve all annotation staff via DB-level filtering and pagination.
+    Returns (paginated_users, total_count)."""
+    
+    query = db.query(User).join(Employee, User.employee_id == Employee.id)
+    
+    # Filter 1: Annotator/Reviewer designation OR annotation skills (and not PM/Admin)
+    is_annotator_desig = or_(
+        func.lower(Employee.designation).contains("annotator"),
+        func.lower(Employee.designation).contains("reviewer")
+    )
+    
+    has_annotation_skill = cast(Employee.skills, String).ilike('%annotation%')
+    is_pm_admin = or_(
+        func.lower(Employee.designation).contains("program manager"),
+        func.lower(Employee.designation).contains("project manager"),
+        func.lower(Employee.designation).contains("admin"),
+        User.role == "pm",
+        User.role == "admin"
+    )
+    
+    skill_based = has_annotation_skill & ~is_pm_admin
+    
+    query = query.filter(is_annotator_desig | skill_based)
+    
+    # Filter 2: Search term
+    if search:
+        search_lower = search.lower()
+        query = query.filter(
+            or_(
+                func.lower(User.name).contains(search_lower),
+                func.lower(User.email).contains(search_lower)
+            )
+        )
+        
+    # Filter 3: Exclude employees
+    if exclude_emp_ids:
+        query = query.filter(~Employee.id.in_(exclude_emp_ids))
+        
+    total = query.count()
+    
+    query = query.order_by(func.lower(User.name).asc())
+    
+    if skip > 0:
+        query = query.offset(skip)
+    if limit > 0:
+        query = query.limit(limit)
+        
+    return query.all(), total
 
 
 def _actively_allocated_employee_ids(db: Session) -> set:
@@ -1053,19 +1090,9 @@ def get_onboarding_reports(
     current_user: User = Depends(require_role("admin", "pm"))
 ):
     """Retrieve full detailed reports on candidate onboarding progress."""
-    candidates = get_onboarding_candidates(db)
+    start = (page - 1) * limit if limit > 0 else 0
+    candidates, total = get_onboarding_candidates(db, search=search, skip=start, limit=limit)
     
-    if search:
-        search_lower = search.lower()
-        candidates = [c for c in candidates if search_lower in (c.name or "").lower() or search_lower in (c.email or "").lower()]
-        
-    total = len(candidates)
-    candidates.sort(key=lambda c: (c.name or "").lower())
-    
-    if limit > 0:
-        start = (page - 1) * limit
-        candidates = candidates[start : start + limit]
-        
     reports = fetch_onboarding_reports_data(db, candidates=candidates)
     
     return {
@@ -1088,24 +1115,12 @@ def get_newly_onboarded(
     progress and MCQ stats. Lets all PMs/Admins triage new annotators by assessment
     performance before deciding which project to assign them to.
     """
-    candidates = get_onboarding_candidates(db)
     allocated_ids = _actively_allocated_employee_ids(db)
-    pool = [c for c in candidates if c.employee_id not in allocated_ids]
-
-    if search:
-        search_lower = search.lower()
-        pool = [c for c in pool if search_lower in (c.name or "").lower() or search_lower in (c.email or "").lower()]
-        
-    total = len(pool)
-    pool.sort(key=lambda c: (c.name or "").lower())
     
-    if limit > 0:
-        start = (page - 1) * limit
-        pool = pool[start : start + limit]
+    start = (page - 1) * limit if limit > 0 else 0
+    pool, total = get_onboarding_candidates(db, search=search, skip=start, limit=limit, exclude_emp_ids=list(allocated_ids))
 
     reports = fetch_onboarding_reports_data(db, candidates=pool)
-
-    # Enrich with each candidate's project allocations (history/context). Pool members
     # have no ACTIVE allocation, but many have past/expired ones (end dates go stale) —
     # surfacing these lets PMs see a candidate may still be engaged elsewhere.
     emp_ids = [c.employee_id for c in pool if c.employee_id]
