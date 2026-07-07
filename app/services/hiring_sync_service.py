@@ -97,14 +97,18 @@ def run_sync(db: Session) -> dict:
             skipped.append({"email": email, "reason": "Already has a user account"})
             continue
 
-        # Skip if a signup request already exists in any status
+        # Skip if a signup request already exists in any status (except rejected, which we delete to allow re-import)
         existing_req = db.query(SignupRequest).filter(SignupRequest.email == email).first()
         if existing_req:
-            skipped.append({
-                "email": email,
-                "reason": f"Signup request already exists (status: {existing_req.status})",
-            })
-            continue
+            if existing_req.status == "rejected":
+                db.delete(existing_req)
+                db.flush()
+            else:
+                skipped.append({
+                    "email": email,
+                    "reason": f"Signup request already exists (status: {existing_req.status})",
+                })
+                continue
 
         employee_type = _map_employee_type(c.get("job_type"))
         designation   = _map_designation(c.get("job_title"))

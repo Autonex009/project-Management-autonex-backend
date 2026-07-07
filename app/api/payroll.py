@@ -285,6 +285,8 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
     for leave in approved_leaves:
         leave_id = leave["leave_id"]
         days = leave["days_in_month"]
+        is_half_day = leave.get("is_half_day", False)
+        weight = 0.5 if is_half_day else 1.0
         date_entries = leave.get("dates", [])            # [{"date", "auto_unpaid"}] for the month
         ordered_dates = [d["date"] for d in date_entries]
         auto_unpaid_set = {d["date"] for d in date_entries if d["auto_unpaid"]}
@@ -297,7 +299,9 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
             source = "manual"
         elif snap is not None and snap.get("unpaid_days") is not None:
             # Legacy count-only override → mark the first N working days unpaid.
-            n = max(0, min(int(snap["unpaid_days"]), days))
+            val = float(snap["unpaid_days"])
+            count = int(round(val / weight))
+            n = max(0, min(count, len(ordered_dates)))
             unpaid_set = set(ordered_dates[:n])
             source = "manual"
         elif snap is not None:
@@ -308,7 +312,7 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
             unpaid_set = set(auto_unpaid_set)
             source = "auto"
 
-        unpaid_days = len(unpaid_set)
+        unpaid_days = len(unpaid_set) * weight
         paid_days = days - unpaid_days
         deduct = unpaid_days > 0
         deduction_amount = round(unpaid_days * per_day, 2)
@@ -478,10 +482,10 @@ def preview_payroll(
                 continue
             if leave.start_date > month_end or leave.end_date < month_start:
                 continue
-            cls = classification.get(leave.id, {"paid_dates": set(), "unpaid_dates": set()})
+            cls = classification.get(leave.id, {"paid_dates": {}, "unpaid_dates": {}})
             month_paid = [d for d in cls["paid_dates"] if month_start <= d <= month_end]
             month_unpaid = [d for d in cls["unpaid_dates"] if month_start <= d <= month_end]
-            days_in_month = len(month_paid) + len(month_unpaid)
+            days_in_month = sum(cls["paid_dates"][d] for d in month_paid) + sum(cls["unpaid_dates"][d] for d in month_unpaid)
             if days_in_month <= 0:
                 continue
             unpaid_set = set(month_unpaid)
@@ -497,7 +501,8 @@ def preview_payroll(
                 "start_date": leave.start_date.isoformat(),
                 "end_date": leave.end_date.isoformat(),
                 "days_in_month": days_in_month,
-                "auto_unpaid_days": len(month_unpaid),
+                "auto_unpaid_days": sum(cls["unpaid_dates"][d] for d in month_unpaid),
+                "is_half_day": getattr(leave, "is_half_day", False),
                 "dates": date_entries,
                 "reason": leave.reason or "",
             })
@@ -526,7 +531,7 @@ class LeaveAdjustmentIn(BaseModel):
     employee_id: int
     leave_id: int
     deduct: bool
-    unpaid_days: Optional[int] = None   # snapshot of unpaid working-days; preserves partial classifications
+    unpaid_days: Optional[float] = None   # snapshot of unpaid working-days; preserves partial classifications
     unpaid_dates: Optional[List[str]] = None   # exact unpaid working-dates (ISO) the admin chose
 
 
