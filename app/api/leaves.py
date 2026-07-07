@@ -339,12 +339,18 @@ def _get_admin_notification_targets(db: Session) -> list[dict]:
 @router.get("", response_model=List[LeaveSchema])
 def get_all_leaves(
     employee_id: Optional[int] = None,
+    start_date: Optional[date_type] = None,
+    end_date: Optional[date_type] = None,
     db: Session = Depends(get_db)
 ):
-    """Get all leaves, optionally filtered by employee_id"""
+    """Get all leaves, optionally filtered by employee_id, start_date, or end_date"""
     query = db.query(Leave)
     if employee_id:
         query = query.filter(Leave.employee_id == employee_id)
+    if start_date:
+        query = query.filter(Leave.end_date >= start_date)
+    if end_date:
+        query = query.filter(Leave.start_date <= end_date)
 
     leaves = query.order_by(Leave.id.desc()).all()
     return [

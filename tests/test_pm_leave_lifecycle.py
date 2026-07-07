@@ -89,10 +89,10 @@ def client_and_db():
 def _seed(db):
     """Create an admin user, a PM (user + employee), and return their ids."""
     admin_emp = Employee(name="Admin Person", email="admin@x.com", status="active",
-                         employee_type="employee")
+                         employee_type="employee", slack_user_id="U123ADMIN")
     pm_emp = Employee(name="Pat Manager", email="pm@x.com", status="active",
                       employee_type="employee", designation="Project Manager",
-                      razorpay_email="pm@x.com")
+                      razorpay_email="pm@x.com", slack_user_id="U123PM")
     db.add_all([admin_emp, pm_emp])
     db.commit()
     db.refresh(admin_emp)
@@ -180,6 +180,7 @@ def test_pm_paid_leave_over_monthly_limit_is_flagged(client_and_db):
             "leave_type": "paid",
             "start_date": day.isoformat(),
             "end_date": day.isoformat(),
+            "reason": "Test reason",
         })
         assert resp.status_code == 201, resp.text
         flags.append(resp.json()["flagged"])
@@ -212,3 +213,226 @@ def test_pm_wfh_routes_to_admin_and_can_be_rejected(client_and_db):
     resp = client.patch(f"/api/wfh/{wfh['id']}/reject", params={"approved_by": admin_user_id})
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "rejected"
+
+
+def test_employee_wfh_routes_to_pm(client_and_db):
+    from app.models.parent_project import MainProject
+    from app.models.sub_project import SubProject
+    from app.models.project import DailySheet
+    from app.models.allocation import Allocation
+
+    client, db = client_and_db
+    ids = _seed(db)
+    pm_emp_id = ids["pm_emp"].id
+    admin_user_id = ids["admin_user"].id
+
+    # Create a normal employee
+    emp = Employee(name="Jane Employee", email="jane@x.com", status="active",
+                   employee_type="employee")
+    db.add(emp)
+    db.commit()
+    db.refresh(emp)
+
+    emp_user = User(email="jane@x.com", password_hash="x", name="Jane Employee",
+                    role="employee", employee_id=emp.id, is_active=True)
+    db.add(emp_user)
+    db.commit()
+    db.refresh(emp_user)
+
+    wfh_date = _next_weekday(date.today() + timedelta(days=15))
+
+    # Create MainProject, SubProject, DailySheet, and Allocation
+    main_proj = MainProject(
+        name="Main Proj",
+        program_manager_id=pm_emp_id,
+        client="Client X",
+        global_start_date=date.today() - timedelta(days=30),
+        status="active"
+    )
+    db.add(main_proj)
+    db.commit()
+    db.refresh(main_proj)
+
+    sub_proj = SubProject(
+        main_project_id=main_proj.id,
+        name="Sub Proj",
+        client="Client X",
+        pm_id=pm_emp_id,
+        start_date=date.today() - timedelta(days=30),
+        duration_days=90,
+        status="active"
+    )
+    db.add(sub_proj)
+    db.commit()
+    db.refresh(sub_proj)
+
+    sheet = DailySheet(
+        name="Daily Sheet X",
+        client="Client X",
+        project_type="Annotation",
+        total_tasks=1000,
+        estimated_time_per_task=0.5,
+        sub_project_id=sub_proj.id,
+        main_project_id=main_proj.id,
+        start_date=date.today() - timedelta(days=30),
+        end_date=date.today() + timedelta(days=60),
+        priority="medium",
+        project_status="active"
+    )
+    db.add(sheet)
+    db.commit()
+    db.refresh(sheet)
+
+    alloc = Allocation(
+        employee_id=emp.id,
+        sub_project_id=sheet.id,
+        total_daily_hours=8,
+        active_start_date=date.today() - timedelta(days=30),
+        active_end_date=date.today() + timedelta(days=60),
+    )
+    db.add(alloc)
+    db.commit()
+
+    # Now Jane applies for WFH
+    resp = client.post("/api/wfh", json={
+        "employee_id": emp.id,
+        "wfh_date": wfh_date.isoformat(),
+        "reason": "WFH study time",
+    })
+    assert resp.status_code == 201, resp.text
+    wfh = resp.json()
+    assert wfh["status"] == "pending"
+
+    # Verify PM received the in-app notification (wfh_applied)
+    pm_notifs = db.query(Notification).filter(
+        Notification.user_id == ids["pm_user"].id,
+        Notification.type == "wfh_applied",
+    ).all()
+    assert len(pm_notifs) == 1, "PM should receive a notification for their allocated employee's WFH"
+
+    # Verify admin did NOT receive it (because it was routed to PM)
+    admin_notifs = db.query(Notification).filter(
+        Notification.user_id == admin_user_id,
+        Notification.type == "wfh_applied",
+    ).all()
+    assert len(admin_notifs) == 0, "Admin should not receive notification since request went to PM"
+
+
+def test_wfh_limits_fulltime(client_and_db):
+    client, db = client_and_db
+    ids = _seed(db)
+    emp = Employee(name="FT Employee", email="ft@x.com", status="active",
+                   employee_type="Full-time")
+    db.add(emp)
+    db.commit()
+    db.refresh(emp)
+
+    # Tuesday and Wednesday of next week
+    next_mon = date.today() + timedelta(days=7 - date.today().weekday())
+    wfh_date1 = next_mon + timedelta(days=1)  # Tuesday
+    wfh_date2 = next_mon + timedelta(days=2)  # Wednesday
+
+    # First request: should pass
+    resp = client.post("/api/wfh", json={
+        "employee_id": emp.id,
+        "wfh_date": wfh_date1.isoformat(),
+        "reason": "Reason 1",
+    })
+    assert resp.status_code == 201, resp.text
+
+    # Second request in the same week: should fail (limit 1/week)
+    resp = client.post("/api/wfh", json={
+        "employee_id": emp.id,
+        "wfh_date": wfh_date2.isoformat(),
+        "reason": "Reason 2",
+    })
+    assert resp.status_code == 400, resp.text
+    assert "limited to 1 WFH day per week" in resp.json()["detail"]
+
+
+def test_wfh_limits_intern_and_contractor(client_and_db):
+    client, db = client_and_db
+    ids = _seed(db)
+    
+    # Test Intern
+    intern = Employee(name="Intern Employee", email="intern@x.com", status="active",
+                      employee_type="Intern")
+    db.add(intern)
+    db.commit()
+    db.refresh(intern)
+
+    wfh_dates = [
+        _next_weekday(date.today() + timedelta(days=20)),
+        _next_weekday(date.today() + timedelta(days=21)),
+        _next_weekday(date.today() + timedelta(days=22))
+    ]
+    # Ensure all are in the same calendar month
+    month = wfh_dates[0].month
+    wfh_dates = [d for d in wfh_dates if d.month == month]
+    # If we don't have enough weekdays in this month, use next month
+    if len(wfh_dates) < 3:
+        base = (date.today() + timedelta(days=40)).replace(day=1)
+        wfh_dates = []
+        d = base
+        while len(wfh_dates) < 3:
+            d = _next_weekday(d)
+            wfh_dates.append(d)
+            d += timedelta(days=1)
+
+    # First WFH
+    resp = client.post("/api/wfh", json={
+        "employee_id": intern.id,
+        "wfh_date": wfh_dates[0].isoformat(),
+        "reason": "Reason 1",
+    })
+    assert resp.status_code == 201, resp.text
+
+    # Second WFH
+    resp = client.post("/api/wfh", json={
+        "employee_id": intern.id,
+        "wfh_date": wfh_dates[1].isoformat(),
+        "reason": "Reason 2",
+    })
+    assert resp.status_code == 201, resp.text
+
+    # Third WFH (should fail - limit 2/month)
+    resp = client.post("/api/wfh", json={
+        "employee_id": intern.id,
+        "wfh_date": wfh_dates[2].isoformat(),
+        "reason": "Reason 3",
+    })
+    assert resp.status_code == 400, resp.text
+    assert "limited to 2 WFH days per calendar month" in resp.json()["detail"]
+
+    # Test Contractor
+    contractor = Employee(name="Contractor Employee", email="contractor@x.com", status="active",
+                          employee_type="Contractor")
+    db.add(contractor)
+    db.commit()
+    db.refresh(contractor)
+
+    # First WFH
+    resp = client.post("/api/wfh", json={
+        "employee_id": contractor.id,
+        "wfh_date": wfh_dates[0].isoformat(),
+        "reason": "Reason 1",
+    })
+    assert resp.status_code == 201, resp.text
+
+    # Second WFH
+    resp = client.post("/api/wfh", json={
+        "employee_id": contractor.id,
+        "wfh_date": wfh_dates[1].isoformat(),
+        "reason": "Reason 2",
+    })
+    assert resp.status_code == 201, resp.text
+
+    # Third WFH (should fail)
+    resp = client.post("/api/wfh", json={
+        "employee_id": contractor.id,
+        "wfh_date": wfh_dates[2].isoformat(),
+        "reason": "Reason 3",
+    })
+    assert resp.status_code == 400, resp.text
+    assert "limited to 2 WFH days per calendar month" in resp.json()["detail"]
+

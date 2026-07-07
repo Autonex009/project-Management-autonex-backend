@@ -44,6 +44,7 @@ from app.models.user import User
 from app.api.leaves import router as leave_router
 from app.api.payroll import router as payroll_router
 from app.services.salary_crypto import encrypt_salary
+from app.api.wfh import router as wfh_router
 
 @pytest.fixture()
 def client_and_db():
@@ -65,6 +66,7 @@ def client_and_db():
     app = FastAPI()
     app.include_router(leave_router)
     app.include_router(payroll_router)
+    app.include_router(wfh_router)
     app.dependency_overrides[database.get_db] = override_get_db
 
     db = TestingSessionLocal()
@@ -458,4 +460,115 @@ def test_consecutive_leaves_fixed_holiday_ignored(client_and_db):
     resp = client.post("/api/leaves", json=payload_5)
     assert resp.status_code == 400
     assert "Safe guard triggered" in resp.json()["detail"]
+
+
+def test_leave_reason_validation(client_and_db):
+    client, db = client_and_db
+    emp, admin = _seed_employee(db)
+
+    # Test 1: missing reason
+    payload = {
+        "employee_id": emp.id,
+        "leave_type": "paid",
+        "start_date": "2026-06-22",
+        "end_date": "2026-06-22",
+    }
+    resp = client.post("/api/leaves", json=payload)
+    assert resp.status_code == 422
+    assert "reason" in resp.text
+
+    # Test 2: empty reason
+    payload["reason"] = ""
+    resp = client.post("/api/leaves", json=payload)
+    assert resp.status_code == 422
+    assert "reason" in resp.text
+
+    # Test 3: whitespace only reason
+    payload["reason"] = "   "
+    resp = client.post("/api/leaves", json=payload)
+    assert resp.status_code == 422
+    assert "reason" in resp.text
+
+    # Test 4: valid reason
+    payload["reason"] = "My reason"
+    resp = client.post("/api/leaves", json=payload)
+    assert resp.status_code == 201
+
+
+def test_wfh_reason_validation(client_and_db):
+    client, db = client_and_db
+    emp, admin = _seed_employee(db)
+
+    # Test 1: missing reason
+    payload = {
+        "employee_id": emp.id,
+        "wfh_date": "2026-06-23",
+    }
+    resp = client.post("/api/wfh", json=payload)
+    assert resp.status_code == 422
+    assert "reason" in resp.text
+
+    # Test 2: empty reason
+    payload["reason"] = ""
+    resp = client.post("/api/wfh", json=payload)
+    assert resp.status_code == 422
+    assert "reason" in resp.text
+
+    # Test 3: whitespace only reason
+    payload["reason"] = "   "
+    resp = client.post("/api/wfh", json=payload)
+    assert resp.status_code == 422
+    assert "reason" in resp.text
+
+    # Test 4: valid reason
+    payload["reason"] = "WFH reason"
+    resp = client.post("/api/wfh", json=payload)
+    assert resp.status_code == 201
+
+
+def test_leaves_date_filtering(client_and_db):
+    client, db = client_and_db
+    emp, admin = _seed_employee(db)
+
+    # Add three leaves in different months
+    db.add(Leave(employee_id=emp.id, leave_type="paid",
+                 start_date=date(2026, 5, 10), end_date=date(2026, 5, 12),
+                 status="approved", reason="May leave"))
+    db.add(Leave(employee_id=emp.id, leave_type="paid",
+                 start_date=date(2026, 6, 15), end_date=date(2026, 6, 18),
+                 status="approved", reason="June leave"))
+    db.add(Leave(employee_id=emp.id, leave_type="paid",
+                 start_date=date(2026, 7, 20), end_date=date(2026, 7, 22),
+                 status="approved", reason="July leave"))
+    db.commit()
+
+    # Get all leaves (unfiltered)
+    resp = client.get("/api/leaves")
+    assert resp.status_code == 200
+    assert len(resp.json()) == 3
+
+    # Filter for June leaves (start_date=2026-06-01, end_date=2026-06-30)
+    resp = client.get("/api/leaves", params={"start_date": "2026-06-01", "end_date": "2026-06-30"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 1
+    assert data[0]["reason"] == "June leave"
+
+    # Filter for leaves after June 1st (start_date=2026-06-01)
+    resp = client.get("/api/leaves", params={"start_date": "2026-06-01"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 2
+    reasons = {x["reason"] for x in data}
+    assert reasons == {"June leave", "July leave"}
+
+    # Filter for leaves before June 30th (end_date=2026-06-30)
+    resp = client.get("/api/leaves", params={"end_date": "2026-06-30"})
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 2
+    reasons = {x["reason"] for x in data}
+    assert reasons == {"May leave", "June leave"}
+
+
 

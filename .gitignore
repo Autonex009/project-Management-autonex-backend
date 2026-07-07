@@ -70,3 +70,4 @@ test_slack_trial.py
 .env.production
 leaves_backup.csv
 sync_leaves_from_sheet.py   
+autonex.db.bak

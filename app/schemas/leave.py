@@ -54,10 +54,24 @@ class LeaveBase(BaseModel):
 
 
 class LeaveCreate(LeaveBase):
-    pass
+    reason: str = Field(..., min_length=1)
+
+    @validator("reason")
+    def validate_reason(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Reason cannot be empty or just whitespace.")
+        return v.strip()
+
 
 class LeaveUpdate(LeaveBase):
-    pass
+    reason: str = Field(..., min_length=1)
+
+    @validator("reason")
+    def validate_reason(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Reason cannot be empty or just whitespace.")
+        return v.strip()
+
 
 class Leave(LeaveBase):
     leave_id: int

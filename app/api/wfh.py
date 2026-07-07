@@ -1,16 +1,19 @@
 """WFH (Work From Home) request management API."""
 import logging
-from datetime import date
+from datetime import date, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, validator
 
 from app.db.database import get_db
 from app.models.wfh import WFHRequest
 from app.models.employee import Employee
 from app.models.user import User
 from app.models.notification import Notification
+from types import SimpleNamespace
+from app.api.leaves import _get_pm_notification_targets, _get_admin_notification_targets
+from app.constants.leave_types import is_intern_or_contractor
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/wfh", tags=["wfh"])
@@ -22,7 +25,13 @@ class WFHCreate(BaseModel):
     employee_id: int
     wfh_date: date          # start date
     end_date: Optional[date] = None   # defaults to wfh_date for single-day
-    reason: Optional[str] = None
+    reason: str = Field(..., min_length=1)
+
+    @validator("reason")
+    def validate_reason(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Reason cannot be empty or just whitespace.")
+        return v.strip()
 
 
 class WFHResponse(BaseModel):
@@ -47,6 +56,71 @@ class WFHApproveBody(BaseModel):
 
 def _push_notification(db: Session, user_id: int, title: str, message: str, notif_type: str):
     db.add(Notification(user_id=user_id, title=title, message=message, type=notif_type))
+
+
+def _validate_wfh_limit(db: Session, employee: Employee, start_date: date, end_date: date, exclude_wfh_id: Optional[int] = None):
+    # Collect proposed WFH working days (skip weekends)
+    proposed_dates = []
+    curr = start_date
+    while curr <= end_date:
+        if curr.weekday() < 5:  # Monday=0, Friday=4, Saturday=5, Sunday=6
+            proposed_dates.append(curr)
+        curr += timedelta(days=1)
+
+    if not proposed_dates:
+        return
+
+    # Query existing active WFH requests for this employee (excluding the one being updated, if any)
+    query = db.query(WFHRequest).filter(
+        WFHRequest.employee_id == employee.id,
+        WFHRequest.status != "rejected"
+    )
+    if exclude_wfh_id is not None:
+        query = query.filter(WFHRequest.id != exclude_wfh_id)
+    existing_requests = query.all()
+
+    existing_dates = set()
+    for r in existing_requests:
+        r_end = r.end_date or r.wfh_date
+        curr_d = r.wfh_date
+        while curr_d <= r_end:
+            if curr_d.weekday() < 5:
+                existing_dates.add(curr_d)
+            curr_d += timedelta(days=1)
+
+    # Check limits based on employee type
+    if is_intern_or_contractor(employee.employee_type):
+        # Limit: 2 WFH per calendar month
+        month_counts = {}
+        for d in existing_dates:
+            key = (d.year, d.month)
+            month_counts[key] = month_counts.get(key, 0) + 1
+        
+        for d in proposed_dates:
+            key = (d.year, d.month)
+            new_count = month_counts.get(key, 0) + 1
+            if new_count > 2:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Interns and contractors are limited to 2 WFH days per calendar month. This request would exceed that limit in {d.strftime('%B %Y')}."
+                )
+            month_counts[key] = new_count
+    else:
+        # Limit: 1 WFH per week (Mon-Sun)
+        week_counts = {}
+        for d in existing_dates:
+            monday = d - timedelta(days=d.weekday())
+            week_counts[monday] = week_counts.get(monday, 0) + 1
+            
+        for d in proposed_dates:
+            monday = d - timedelta(days=d.weekday())
+            new_count = week_counts.get(monday, 0) + 1
+            if new_count > 1:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Full-time employees are limited to 1 WFH day per week. This request would exceed that limit in the week of {monday.strftime('%Y-%m-%d')}."
+                )
+            week_counts[monday] = new_count
 
 
 def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
@@ -134,6 +208,9 @@ def create_wfh_request(payload: WFHCreate, db: Session = Depends(get_db)):
             detail=f"A WFH request already exists overlapping this period ({overlap.wfh_date} – {overlap_end}).",
         )
 
+    # Validate WFH limit
+    _validate_wfh_limit(db, employee, payload.wfh_date, end_date)
+
     req = WFHRequest(
         employee_id=payload.employee_id,
         wfh_date=payload.wfh_date,
@@ -145,18 +222,45 @@ def create_wfh_request(payload: WFHCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(req)
 
-    # Notify employee
+    # Notify employee (in-app)
     emp_user = db.query(User).filter(User.employee_id == employee.id).first()
     if emp_user:
         _push_notification(db, emp_user.id, "WFH request submitted",
             f"Your WFH request for {req.wfh_date} has been submitted and is pending approval.",
             "wfh_applied")
+        db.commit()
 
-    # Notify admins
-    for admin in db.query(User).filter(User.role == "admin", User.is_active == True).all():
-        _push_notification(db, admin.id, f"WFH request from {employee.name}",
-            f"{employee.name} has requested WFH on {req.wfh_date}.",
-            "wfh_applied")
+    # WFH PM & Admin Notification Routing:
+    dummy_leave = SimpleNamespace(start_date=req.wfh_date, end_date=end_date)
+    is_pm_applicant = emp_user is not None and emp_user.role == "pm"
+    pm_targets = [] if is_pm_applicant else _get_pm_notification_targets(db, employee, dummy_leave)
+    
+    notified_user_ids: set[int] = set()
+    for target in pm_targets:
+        # In-app notification for PM
+        pm_emp_id = getattr(target["pm_employee"], "id", None)
+        if pm_emp_id:
+            pm_user = db.query(User).filter(User.employee_id == pm_emp_id).first()
+            if pm_user and pm_user.id not in notified_user_ids:
+                notified_user_ids.add(pm_user.id)
+                _push_notification(
+                    db, pm_user.id,
+                    f"New WFH request from {employee.name}",
+                    f"{employee.name} has requested WFH on {req.wfh_date}.",
+                    "wfh_applied",
+                )
+
+    # Admin fallback: notify each admin exactly once if no PM is assigned
+    if not pm_targets:
+        for admin_user in db.query(User).filter(User.role == "admin", User.is_active == True).all():
+            if admin_user.id not in notified_user_ids:
+                notified_user_ids.add(admin_user.id)
+                _push_notification(
+                    db, admin_user.id,
+                    f"WFH request from {employee.name}",
+                    f"{employee.name} has requested WFH on {req.wfh_date}.",
+                    "wfh_applied",
+                )
     db.commit()
 
     return _build_response(req, db)
@@ -313,6 +417,13 @@ def update_wfh_request(wfh_id: int, payload: WFHCreate, db: Session = Depends(ge
             status_code=409,
             detail=f"A WFH request already exists overlapping this period ({overlap.wfh_date} – {overlap_end}).",
         )
+
+    employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    # Validate WFH limit
+    _validate_wfh_limit(db, employee, payload.wfh_date, end_date, exclude_wfh_id=wfh_id)
 
     req.wfh_date = payload.wfh_date
     req.end_date = end_date
