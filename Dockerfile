@@ -20,6 +20,4 @@ RUN mkdir -p /app/uploads
 
 # We remove the EXPOSE instruction as Railway handles it dynamically
 
-# Use shell form (no brackets) to natively evaluate the $PORT variable 
-# and remove the dangerous --reload flag
-CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port $PORT"]
