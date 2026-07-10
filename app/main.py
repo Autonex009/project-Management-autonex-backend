@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_review, onboarding, company_settings, wifi_network,chat
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network,chat
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -27,7 +27,7 @@ from app.api.signup_requests import router as signup_requests_router
 from app.api.referrals import router as referrals_router, external_router as referrals_external_router
 from app.api.payroll import router as payroll_router
 from app.api.performance_reviews import router as performance_reviews_router
-from app.api.perf_reviews import router as perf_reviews_router
+from app.api.perf_evals import router as perf_evals_router
 from app.api.onboarding import router as onboarding_router
 from app.api.company_settings import router as company_settings_router
 from app.api.wifi_networks import router as wifi_networks_router
@@ -461,18 +461,25 @@ def sync_performance_reviews_schema() -> None:
 sync_performance_reviews_schema()
 
 
-def sync_perf_reviews_schema() -> None:
-    """Create the perf_reviews (monthly structured reviews) table if missing."""
+def sync_perf_evals_schema() -> None:
+    """Create the project-based self-evaluation tables; drop the old perf_reviews table."""
     inspector = inspect(engine)
     try:
         tables = set(inspector.get_table_names())
     except Exception:
         return
-    if "perf_reviews" not in tables:
-        perf_review.Base.metadata.tables["perf_reviews"].create(bind=engine)
+
+    # Drop the superseded 5-fixed-criteria table (data intentionally discarded).
+    if "perf_reviews" in tables:
+        with engine.begin() as connection:
+            connection.execute(text("DROP TABLE IF EXISTS perf_reviews"))
+
+    for table_name in ("perf_project_params", "perf_evaluations"):
+        if table_name not in tables:
+            perf_eval.Base.metadata.tables[table_name].create(bind=engine)
 
 
-sync_perf_reviews_schema()
+sync_perf_evals_schema()
 
 
 def sync_payroll_schema() -> None:
@@ -607,7 +614,7 @@ app.include_router(referrals_router)
 app.include_router(referrals_external_router)
 app.include_router(payroll_router)
 app.include_router(performance_reviews_router)
-app.include_router(perf_reviews_router)
+app.include_router(perf_evals_router)
 app.include_router(onboarding_router)
 app.include_router(company_settings_router)
 app.include_router(wifi_networks_router)
