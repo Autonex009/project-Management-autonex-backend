@@ -6,6 +6,7 @@ from app.models.project import SubProject, Project  # SubProject with alias
 from app.models.allocation import Allocation
 from app.models.employee import Employee
 from app.models.parent_project import ParentProject
+from app.models.perf_eval import PerfEvaluation, PerfProjectParams
 from app.schemas.project import (
     ProjectCreate,
     ProjectUpdate,
@@ -199,8 +200,10 @@ def delete_project(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Delete related allocations first to avoid FK constraint violation
+    # Delete related allocations + performance evaluations first (FK / orphan cleanup)
     db.query(Allocation).filter(Allocation.sub_project_id == project_id).delete()
+    db.query(PerfEvaluation).filter(PerfEvaluation.project_id == project_id).delete()
+    db.query(PerfProjectParams).filter(PerfProjectParams.project_id == project_id).delete()
 
     db.delete(project)
     db.commit()

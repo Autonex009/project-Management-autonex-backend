@@ -1,12 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from typing import List
 
 from app.db.database import get_db
 from app.models.allocation import Allocation
 from app.models.parent_project import MainProject, ParentProject
 from app.models.project import SubProject, Project
+from app.models.sub_project import SubProject as SubProjectGroup
+from app.models.perf_eval import PerfEvaluation, PerfProjectParams
 from app.models.employee import Employee
 from app.schemas.parent_project import (
     ParentProjectCreate,
@@ -283,25 +285,44 @@ def update_parent_project(
 @router.delete("/{parent_project_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_parent_project(parent_project_id: int, db: Session = Depends(get_db)):
     """
-    Delete a parent project.
-    Unlinks sub-projects (sets parent_project_id to NULL) rather than cascade deleting.
+    Delete a project and everything under it:
+    its sub-project groups and daily-sheets, plus the daily-sheets' allocations
+    and performance evaluations. Fully removes the project everywhere.
     """
     pp = db.query(ParentProject).filter(ParentProject.id == parent_project_id).first()
-    
+
     if not pp:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Parent project with ID {parent_project_id} not found"
         )
-    
-    # Unlink sub-projects instead of deleting
-    db.query(Project).filter(Project.main_project_id == parent_project_id).update(
-        {"main_project_id": None, "is_sub_project": False}
-    )
-    
+
+    # Project groups (intermediate level) under this project.
+    group_ids = [
+        g.id for g in db.query(SubProjectGroup)
+        .filter(SubProjectGroup.main_project_id == parent_project_id).all()
+    ]
+
+    # Daily-sheets linked directly to the project or via one of its groups.
+    sheet_filter = [Project.main_project_id == parent_project_id]
+    if group_ids:
+        sheet_filter.append(Project.sub_project_id.in_(group_ids))
+    sheet_ids = [
+        d.id for d in db.query(Project).filter(or_(*sheet_filter)).all()
+    ]
+
+    if sheet_ids:
+        db.query(Allocation).filter(Allocation.sub_project_id.in_(sheet_ids)).delete(synchronize_session=False)
+        db.query(PerfEvaluation).filter(PerfEvaluation.project_id.in_(sheet_ids)).delete(synchronize_session=False)
+        db.query(PerfProjectParams).filter(PerfProjectParams.project_id.in_(sheet_ids)).delete(synchronize_session=False)
+        db.query(Project).filter(Project.id.in_(sheet_ids)).delete(synchronize_session=False)
+
+    if group_ids:
+        db.query(SubProjectGroup).filter(SubProjectGroup.id.in_(group_ids)).delete(synchronize_session=False)
+
     db.delete(pp)
     db.commit()
-    
+
     return None
 
 

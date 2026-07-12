@@ -462,7 +462,7 @@ sync_performance_reviews_schema()
 
 
 def sync_perf_evals_schema() -> None:
-    """Create the project-based self-evaluation tables; drop the old perf_reviews table."""
+    """Create the performance-evaluation tables; backfill new columns on perf_evaluations."""
     inspector = inspect(engine)
     try:
         tables = set(inspector.get_table_names())
@@ -477,6 +477,23 @@ def sync_perf_evals_schema() -> None:
     for table_name in ("perf_project_params", "perf_evaluations"):
         if table_name not in tables:
             perf_eval.Base.metadata.tables[table_name].create(bind=engine)
+
+    # Backfill columns added in the star-rating redesign on existing databases.
+    if "perf_evaluations" in tables:
+        try:
+            columns = {column["name"] for column in inspector.get_columns("perf_evaluations")}
+        except Exception:
+            return
+        adds = {
+            "overall_comment": "ALTER TABLE perf_evaluations ADD COLUMN overall_comment TEXT",
+            "employee_overall_rating": "ALTER TABLE perf_evaluations ADD COLUMN employee_overall_rating REAL",
+            "bonus_suggested": "ALTER TABLE perf_evaluations ADD COLUMN bonus_suggested BOOLEAN DEFAULT FALSE",
+            "bonus_note": "ALTER TABLE perf_evaluations ADD COLUMN bonus_note TEXT",
+        }
+        with engine.begin() as connection:
+            for col, ddl in adds.items():
+                if col not in columns:
+                    connection.execute(text(ddl))
 
 
 sync_perf_evals_schema()
