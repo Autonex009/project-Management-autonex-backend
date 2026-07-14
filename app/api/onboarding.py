@@ -560,7 +560,7 @@ def record_progress(
     if not section:
         raise HTTPException(status_code=404, detail="Section not found")
 
-    if current_user.role == "employee":
+    if current_user.id == user_id:
         if is_module_locked(user_id, section.module_id, db):
             raise HTTPException(status_code=403, detail="Cannot record progress for a locked module.")
 
@@ -641,7 +641,7 @@ def submit_quiz(
     if not section:
         raise HTTPException(status_code=404, detail="Section not found")
 
-    if current_user.role == "employee":
+    if current_user.id == user_id:
         if is_module_locked(user_id, section.module_id, db):
             raise HTTPException(status_code=403, detail="Cannot submit quiz for a locked module.")
     
