@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.services.auth_service import get_current_user
+from app.services.auth_service import require_role
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -7,7 +7,7 @@ from app.models.employee import Employee
 from app.models.user import User
 from app.services.hiring_sync_service import fetch_hired_candidates, run_sync
 
-router = APIRouter(prefix="/api/hiring", tags=["Hiring Sync"], dependencies=[Depends(get_current_user)])
+router = APIRouter(prefix="/api/hiring", tags=["Hiring Sync"], dependencies=[Depends(require_role("admin"))])
 
 
 @router.get("/preview")

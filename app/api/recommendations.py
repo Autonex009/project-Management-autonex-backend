@@ -3,14 +3,14 @@ Recommendations API Router
 Provides endpoints for project capacity analysis and recommendations.
 """
 from fastapi import APIRouter, Depends, HTTPException, status
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, require_role
 from sqlalchemy.orm import Session
 from typing import List
 
 from app.db.database import get_db
 from app.services.recommendation_service import RecommendationEngine
 
-router = APIRouter(prefix="/api/recommendations", tags=["recommendations"], dependencies=[Depends(get_current_user)])
+router = APIRouter(prefix="/api/recommendations", tags=["recommendations"], dependencies=[Depends(require_role("admin", "pm"))])
 
 
 @router.get("/project/{project_id}")

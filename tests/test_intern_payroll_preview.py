@@ -84,6 +84,16 @@ def test_intern_second_monthly_paid_leave_is_deducted(client_and_db):
     db.commit()
     db.refresh(intern)
 
+    from app.models.payroll import Salary
+    db.add(Salary(
+        id=1,
+        full_name="Ira Intern",
+        status="active",
+        base_pay_monthly=encrypt_salary(22000.0),
+        opt_bonus_monthly=encrypt_salary(0.0)
+    ))
+    db.commit()
+
     # Two single-day PAID leaves in Jan 2026 (both weekdays, not holidays)
     db.add_all([
         Leave(employee_id=intern.id, leave_type="paid",

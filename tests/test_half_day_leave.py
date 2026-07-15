@@ -88,6 +88,16 @@ def _seed_employee(db):
     db.commit()
     db.refresh(emp)
     
+    from app.models.payroll import Salary
+    db.add(Salary(
+        id=1,
+        full_name="Karan Dev",
+        status="active",
+        base_pay_monthly=encrypt_salary(30000.0),
+        opt_bonus_monthly=encrypt_salary(0.0)
+    ))
+    db.commit()
+    
     # Create admin user to approve leaves and access payroll
     admin = User(email="admin@x.com", password_hash="x", name="Admin Boss", role="admin", is_active=True)
     db.add(admin)

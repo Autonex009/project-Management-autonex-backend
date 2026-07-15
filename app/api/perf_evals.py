@@ -14,9 +14,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, require_role
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
+from app.models.user import User
+from app.models.employee import Employee
 
 from app.constants.perf_params import PERF_PARAM_NAME_SET, RATING_MIN, RATING_MAX
 from app.db.database import get_db
@@ -132,7 +134,23 @@ def list_evals(
     period: Optional[str] = None,
     status: Optional[str] = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
+    if current_user.role not in ["admin", "pm"]:
+        if employee_id is None:
+            employee_id = current_user.employee_id
+            if employee_id is None:
+                emp = db.query(Employee).filter(Employee.email == current_user.email).first()
+                if emp:
+                    employee_id = emp.id
+                else:
+                    raise HTTPException(status_code=403, detail="Access denied")
+        else:
+            is_self = current_user.employee_id == employee_id
+            if not is_self:
+                emp = db.query(Employee).filter(Employee.id == employee_id).first()
+                if not emp or emp.email != current_user.email:
+                    raise HTTPException(status_code=403, detail="Access denied")
     q = db.query(PerfEvaluation)
     if project_id:
         q = q.filter(PerfEvaluation.project_id == project_id)
@@ -146,7 +164,17 @@ def list_evals(
 
 
 @router.post("", response_model=PerfEvalResponse, status_code=201)
-def create_eval(payload: PerfEvalCreate, db: Session = Depends(get_db)):
+def create_eval(
+    payload: PerfEvalCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role not in ["admin", "pm"]:
+        is_self = current_user.employee_id == payload.employee_id
+        if not is_self:
+            emp = db.query(Employee).filter(Employee.id == payload.employee_id).first()
+            if not emp or emp.email != current_user.email:
+                raise HTTPException(status_code=403, detail="Access denied")
     existing = (
         db.query(PerfEvaluation)
         .filter(
@@ -183,7 +211,7 @@ def create_eval(payload: PerfEvalCreate, db: Session = Depends(get_db)):
     return ev
 
 
-@router.patch("/{eval_id}/review", response_model=PerfEvalResponse)
+@router.patch("/{eval_id}/review", response_model=PerfEvalResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def review_eval(eval_id: int, payload: PerfEvalReview, db: Session = Depends(get_db)):
     ev = db.query(PerfEvaluation).filter(PerfEvaluation.id == eval_id).first()
     if not ev:
@@ -218,7 +246,7 @@ def review_eval(eval_id: int, payload: PerfEvalReview, db: Session = Depends(get
     return ev
 
 
-@router.delete("/{eval_id}")
+@router.delete("/{eval_id}", dependencies=[Depends(require_role("admin", "pm"))])
 def delete_eval(eval_id: int, db: Session = Depends(get_db)):
     ev = db.query(PerfEvaluation).filter(PerfEvaluation.id == eval_id).first()
     if not ev:

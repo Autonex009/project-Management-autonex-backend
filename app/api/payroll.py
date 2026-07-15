@@ -68,14 +68,14 @@ def require_payroll_passcode(
         raise HTTPException(status_code=401, detail="Invalid or missing payroll passcode")
 
 
-from app.services.auth_service import get_current_user
+from app.services.auth_service import require_role
 
-# Passcode dependency applies to ALL routes on this router.
-# JWT auth (get_current_user) ensures identity; passcode ensures elevated authorization.
+# Role gate + passcode applies to ALL routes on this router.
+# require_role("admin") ensures identity + admin role; passcode ensures elevated authorization.
 router = APIRouter(
     prefix="/api/payroll",
     tags=["payroll"],
-    dependencies=[Depends(get_current_user), Depends(require_payroll_passcode)],
+    dependencies=[Depends(require_role("admin")), Depends(require_payroll_passcode)],
 )
 
 

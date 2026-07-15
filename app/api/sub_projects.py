@@ -3,7 +3,7 @@ Sub-Projects API — The NEW intermediate hierarchy level.
 Hierarchy: MainProject → SubProject → DailySheet → Allocations
 """
 from fastapi import APIRouter, Depends, HTTPException
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, require_role
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
@@ -57,7 +57,7 @@ class SubProjectResponse(BaseModel):
 
 # ── Endpoints ───────────────────────────────────────────────────────
 
-@router.post("", response_model=SubProjectResponse)
+@router.post("", response_model=SubProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def create_sub_project(payload: SubProjectCreate, db: Session = Depends(get_db)):
     """Create a new sub-project under a main project."""
     # Verify main project exists
@@ -97,7 +97,7 @@ def get_sub_project(sub_project_id: int, db: Session = Depends(get_db)):
     return sp
 
 
-@router.put("/{sub_project_id}", response_model=SubProjectResponse)
+@router.put("/{sub_project_id}", response_model=SubProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def update_sub_project(
     sub_project_id: int,
     payload: SubProjectUpdate,
@@ -115,7 +115,7 @@ def update_sub_project(
     return sp
 
 
-@router.delete("/{sub_project_id}")
+@router.delete("/{sub_project_id}", dependencies=[Depends(require_role("admin", "pm"))])
 def delete_sub_project(sub_project_id: int, db: Session = Depends(get_db)):
     sp = db.query(SubProject).filter(SubProject.id == sub_project_id).first()
     if not sp:
