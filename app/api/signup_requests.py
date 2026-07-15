@@ -26,7 +26,7 @@ from app.services.email_service import try_send_signup_approved_email, try_send_
 from app.services.identity_validator import check_duplicate_identity
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/signup-requests", tags=["signup-requests"], dependencies=[Depends(get_current_user)])
+router = APIRouter(prefix="/api/signup-requests", tags=["signup-requests"])
 
 PORTAL_URL = "https://autonex-frontend.vercel.app/login/employee"
 
@@ -156,7 +156,7 @@ def submit_signup_request(payload: SignupRequestCreate, db: Session = Depends(ge
     return _to_response(req)
 
 
-@router.get("/counts", response_model=SignupRequestCountsResponse)
+@router.get("/counts", response_model=SignupRequestCountsResponse, dependencies=[Depends(get_current_user)])
 def get_signup_request_counts(db: Session = Depends(get_db)):
     """Return pending/approved/rejected/total counts for tab badges."""
     from sqlalchemy import func
@@ -173,7 +173,7 @@ def get_signup_request_counts(db: Session = Depends(get_db)):
     return counts
 
 
-@router.get("", response_model=PaginatedSignupRequestResponse)
+@router.get("", response_model=PaginatedSignupRequestResponse, dependencies=[Depends(get_current_user)])
 def list_signup_requests(
     status: Optional[str] = Query(None, description="Filter by status: pending | approved | rejected"),
     search: Optional[str] = Query(None, description="Case-insensitive search on name, email, or designation"),
@@ -207,7 +207,7 @@ def list_signup_requests(
     )
 
 
-@router.patch("/{request_id}/approve")
+@router.patch("/{request_id}/approve", dependencies=[Depends(get_current_user)])
 def approve_signup_request(
     request_id: int,
     reviewed_by: int = Query(0),
@@ -321,7 +321,7 @@ class UpdateSignupRequest(BaseModel):
     designation: Optional[str] = None
 
 
-@router.patch("/{request_id}", response_model=SignupRequestResponse)
+@router.patch("/{request_id}", response_model=SignupRequestResponse, dependencies=[Depends(get_current_user)])
 def update_signup_request(
     request_id: int,
     payload: UpdateSignupRequest,
@@ -345,7 +345,7 @@ def update_signup_request(
     return _to_response(req)
 
 
-@router.patch("/{request_id}/reject")
+@router.patch("/{request_id}/reject", dependencies=[Depends(get_current_user)])
 def reject_signup_request(
     request_id: int,
     reviewed_by: int = Query(0),
@@ -373,7 +373,7 @@ def reject_signup_request(
     return {"message": f"Signup request rejected. {req.email} has been notified.", "request_id": request_id}
 
 
-@router.patch("/{request_id}/undo-reject")
+@router.patch("/{request_id}/undo-reject", dependencies=[Depends(get_current_user)])
 def undo_reject_signup_request(
     request_id: int,
     reviewed_by: int = Query(0),
@@ -393,7 +393,7 @@ def undo_reject_signup_request(
     return {"message": "Signup request reopened.", "request_id": request_id}
 
 
-@router.patch("/{request_id}/undo-approve")
+@router.patch("/{request_id}/undo-approve", dependencies=[Depends(get_current_user)])
 def undo_approve_signup_request(
     request_id: int,
     reviewed_by: int = Query(0),
