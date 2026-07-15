@@ -27,7 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from app.services.auth_service import require_role
+
 from app.db.database import get_db
 from app.models.employee import Employee
 from app.models.leave import Leave
@@ -75,7 +75,7 @@ from app.services.auth_service import get_current_user
 router = APIRouter(
     prefix="/api/payroll",
     tags=["payroll"],
-    dependencies=[Depends(require_role("admin")), Depends(require_payroll_passcode)],
+    dependencies=[Depends(get_current_user), Depends(require_payroll_passcode)],
 )
 
 
