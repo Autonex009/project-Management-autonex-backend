@@ -8,14 +8,14 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from app.services.auth_service import get_current_user
+from app.services.auth_service import require_role
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.models.company_settings import CompanySetting
 
-router = APIRouter(prefix="/api/company-settings", tags=["Company Settings"], dependencies=[Depends(get_current_user)])
+router = APIRouter(prefix="/api/company-settings", tags=["Company Settings"], dependencies=[Depends(require_role("admin"))])
 
 
 # ── Schemas ──────────────────────────────────────────────────────────

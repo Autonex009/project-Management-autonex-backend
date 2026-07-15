@@ -3,7 +3,7 @@ import logging
 from datetime import date, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, require_role
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field, validator
 
@@ -18,6 +18,15 @@ from app.constants.leave_types import is_intern_or_contractor
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/wfh", tags=["wfh"], dependencies=[Depends(get_current_user)])
+
+
+def check_wfh_access(wfh_employee_id: int, current_user: User, db: Session):
+    if current_user.role not in ["admin", "pm"]:
+        is_self = current_user.employee_id == wfh_employee_id
+        if not is_self:
+            emp = db.query(Employee).filter(Employee.id == wfh_employee_id).first()
+            if not emp or emp.email != current_user.email:
+                raise HTTPException(status_code=403, detail="Access denied")
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────
@@ -147,8 +156,24 @@ def get_wfh_requests(
     employee_id: Optional[int] = Query(None),
     month: Optional[str] = Query(None, description="YYYY-MM"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """Get WFH requests. Filter by employee_id and/or month (YYYY-MM)."""
+    if current_user.role not in ["admin", "pm"]:
+        if employee_id is None:
+            employee_id = current_user.employee_id
+            if employee_id is None:
+                emp = db.query(Employee).filter(Employee.email == current_user.email).first()
+                if emp:
+                    employee_id = emp.id
+                else:
+                    raise HTTPException(status_code=403, detail="Access denied")
+        else:
+            is_self = current_user.employee_id == employee_id
+            if not is_self:
+                emp = db.query(Employee).filter(Employee.id == employee_id).first()
+                if not emp or emp.email != current_user.email:
+                    raise HTTPException(status_code=403, detail="Access denied")
     q = db.query(WFHRequest)
     if employee_id:
         q = q.filter(WFHRequest.employee_id == employee_id)
@@ -185,8 +210,13 @@ def get_wfh_requests(
 
 
 @router.post("", response_model=WFHResponse, status_code=201)
-def create_wfh_request(payload: WFHCreate, db: Session = Depends(get_db)):
+def create_wfh_request(
+    payload: WFHCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Submit a WFH request."""
+    check_wfh_access(payload.employee_id, current_user, db)
     employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
@@ -267,7 +297,7 @@ def create_wfh_request(payload: WFHCreate, db: Session = Depends(get_db)):
     return _build_response(req, db)
 
 
-@router.patch("/{wfh_id}/approve")
+@router.patch("/{wfh_id}/approve", dependencies=[Depends(require_role("admin", "pm"))])
 def approve_wfh(
     wfh_id: int,
     approved_by: int = Query(0),
@@ -298,7 +328,7 @@ def approve_wfh(
     return {"message": "WFH request approved", "wfh_id": wfh_id, "status": "approved"}
 
 
-@router.patch("/{wfh_id}/reject")
+@router.patch("/{wfh_id}/reject", dependencies=[Depends(require_role("admin", "pm"))])
 def reject_wfh(
     wfh_id: int,
     approved_by: int = Query(0),
@@ -328,7 +358,7 @@ def reject_wfh(
     return {"message": "WFH request rejected", "wfh_id": wfh_id, "status": "rejected"}
 
 
-@router.patch("/{wfh_id}/undo-reject")
+@router.patch("/{wfh_id}/undo-reject", dependencies=[Depends(require_role("admin", "pm"))])
 def undo_reject_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Depends(get_db)):
     """Reopen a rejected WFH request back to pending."""
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
@@ -368,7 +398,7 @@ def undo_reject_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Depe
     return {"message": "WFH request reopened", "wfh_id": wfh_id, "status": "pending"}
 
 
-@router.patch("/{wfh_id}/undo-approve")
+@router.patch("/{wfh_id}/undo-approve", dependencies=[Depends(require_role("admin", "pm"))])
 def undo_approve_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Depends(get_db)):
     """Revoke an approval, reverting the WFH request back to pending."""
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
@@ -392,11 +422,18 @@ def undo_approve_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Dep
 
 
 @router.put("/{wfh_id}", response_model=WFHResponse)
-def update_wfh_request(wfh_id: int, payload: WFHCreate, db: Session = Depends(get_db)):
+def update_wfh_request(
+    wfh_id: int,
+    payload: WFHCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Edit a WFH request. Only allowed before the WFH date."""
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
+    check_wfh_access(req.employee_id, current_user, db)
+    check_wfh_access(payload.employee_id, current_user, db)
     if req.wfh_date <= date.today():
         raise HTTPException(status_code=400, detail="Cannot edit a WFH request on or after its date")
 
@@ -436,10 +473,15 @@ def update_wfh_request(wfh_id: int, payload: WFHCreate, db: Session = Depends(ge
 
 
 @router.delete("/{wfh_id}")
-def delete_wfh(wfh_id: int, db: Session = Depends(get_db)):
+def delete_wfh(
+    wfh_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
+    check_wfh_access(req.employee_id, current_user, db)
     if req.wfh_date <= date.today():
         raise HTTPException(status_code=400, detail="Cannot delete a WFH request on or after its date")
     db.delete(req)

@@ -13,7 +13,7 @@ from typing import List, Optional
 
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Query
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, require_role
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -156,7 +156,7 @@ def submit_signup_request(payload: SignupRequestCreate, db: Session = Depends(ge
     return _to_response(req)
 
 
-@router.get("/counts", response_model=SignupRequestCountsResponse, dependencies=[Depends(get_current_user)])
+@router.get("/counts", response_model=SignupRequestCountsResponse, dependencies=[Depends(require_role("admin"))])
 def get_signup_request_counts(db: Session = Depends(get_db)):
     """Return pending/approved/rejected/total counts for tab badges."""
     from sqlalchemy import func
@@ -173,7 +173,7 @@ def get_signup_request_counts(db: Session = Depends(get_db)):
     return counts
 
 
-@router.get("", response_model=PaginatedSignupRequestResponse, dependencies=[Depends(get_current_user)])
+@router.get("", response_model=PaginatedSignupRequestResponse, dependencies=[Depends(require_role("admin"))])
 def list_signup_requests(
     status: Optional[str] = Query(None, description="Filter by status: pending | approved | rejected"),
     search: Optional[str] = Query(None, description="Case-insensitive search on name, email, or designation"),
@@ -207,7 +207,7 @@ def list_signup_requests(
     )
 
 
-@router.patch("/{request_id}/approve", dependencies=[Depends(get_current_user)])
+@router.patch("/{request_id}/approve", dependencies=[Depends(require_role("admin"))])
 def approve_signup_request(
     request_id: int,
     reviewed_by: int = Query(0),
@@ -321,7 +321,7 @@ class UpdateSignupRequest(BaseModel):
     designation: Optional[str] = None
 
 
-@router.patch("/{request_id}", response_model=SignupRequestResponse, dependencies=[Depends(get_current_user)])
+@router.patch("/{request_id}", response_model=SignupRequestResponse, dependencies=[Depends(require_role("admin"))])
 def update_signup_request(
     request_id: int,
     payload: UpdateSignupRequest,
@@ -345,7 +345,7 @@ def update_signup_request(
     return _to_response(req)
 
 
-@router.patch("/{request_id}/reject", dependencies=[Depends(get_current_user)])
+@router.patch("/{request_id}/reject", dependencies=[Depends(require_role("admin"))])
 def reject_signup_request(
     request_id: int,
     reviewed_by: int = Query(0),
@@ -373,7 +373,7 @@ def reject_signup_request(
     return {"message": f"Signup request rejected. {req.email} has been notified.", "request_id": request_id}
 
 
-@router.patch("/{request_id}/undo-reject", dependencies=[Depends(get_current_user)])
+@router.patch("/{request_id}/undo-reject", dependencies=[Depends(require_role("admin"))])
 def undo_reject_signup_request(
     request_id: int,
     reviewed_by: int = Query(0),
@@ -393,7 +393,7 @@ def undo_reject_signup_request(
     return {"message": "Signup request reopened.", "request_id": request_id}
 
 
-@router.patch("/{request_id}/undo-approve", dependencies=[Depends(get_current_user)])
+@router.patch("/{request_id}/undo-approve", dependencies=[Depends(require_role("admin"))])
 def undo_approve_signup_request(
     request_id: int,
     reviewed_by: int = Query(0),
