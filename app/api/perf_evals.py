@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from app.services.auth_service import get_current_user
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
@@ -21,7 +22,7 @@ from app.constants.perf_params import PERF_PARAM_NAME_SET, RATING_MIN, RATING_MA
 from app.db.database import get_db
 from app.models.perf_eval import PerfEvaluation
 
-router = APIRouter(prefix="/api/perf-evals", tags=["Performance Evaluations"])
+router = APIRouter(prefix="/api/perf-evals", tags=["Performance Evaluations"], dependencies=[Depends(get_current_user)])
 
 PERIOD_OK = lambda v: isinstance(v, str) and len(v) == 7 and v[4] == "-" and v[:4].isdigit() and v[5:].isdigit() and 1 <= int(v[5:]) <= 12
 

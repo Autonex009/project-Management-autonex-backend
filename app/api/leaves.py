@@ -69,7 +69,9 @@ from app.services.slack_service import (
     try_send_leave_status_message,
 )
 
-router = APIRouter(prefix="/api/leaves", tags=["Leaves"])
+from app.services.auth_service import get_current_user
+
+router = APIRouter(prefix="/api/leaves", tags=["Leaves"], dependencies=[Depends(get_current_user)])
 
 
 def _push_notification(db: Session, user_id: int, title: str, message: str, notif_type: str) -> None:

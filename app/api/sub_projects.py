@@ -3,6 +3,7 @@ Sub-Projects API — The NEW intermediate hierarchy level.
 Hierarchy: MainProject → SubProject → DailySheet → Allocations
 """
 from fastapi import APIRouter, Depends, HTTPException
+from app.services.auth_service import get_current_user
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
@@ -12,7 +13,7 @@ from app.db.database import get_db
 from app.models.sub_project import SubProject
 from app.models.parent_project import MainProject
 
-router = APIRouter(prefix="/api/sub-projects-new", tags=["sub-projects-new"])
+router = APIRouter(prefix="/api/sub-projects-new", tags=["sub-projects-new"], dependencies=[Depends(get_current_user)])
 
 
 # ── Schemas ─────────────────────────────────────────────────────────

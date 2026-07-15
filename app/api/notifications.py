@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from app.services.auth_service import get_current_user
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import List, Optional
@@ -7,7 +8,7 @@ from datetime import datetime
 from app.db.deps import get_db
 from app.models.notification import Notification
 
-router = APIRouter(prefix="/api/notifications", tags=["notifications"])
+router = APIRouter(prefix="/api/notifications", tags=["notifications"], dependencies=[Depends(get_current_user)])
 
 
 class NotificationResponse(BaseModel):

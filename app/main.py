@@ -604,12 +604,18 @@ else:
     uploads_dir = Path(__file__).resolve().parents[1] / "uploads"
 uploads_dir.mkdir(parents=True, exist_ok=True)
 
-# Configure CORS dynamically without hardcoding any domains or localhost
-# This allows credentials (cookies) to be sent from any frontend origin (local, staging, prod, preview)
+# Configure CORS with an explicit origin allowlist.
+# Set CORS_ORIGINS env var as a comma-separated list for production/staging.
+# Falls back to common local dev origins when unset.
+_default_origins = "http://localhost:3000,http://localhost:5173,http://localhost:8000"
+_cors_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", _default_origins).split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[],
-    allow_origin_regex=r"https?://.*",
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
