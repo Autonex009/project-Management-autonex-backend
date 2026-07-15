@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from app.services.auth_service import get_current_user
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 from typing import List
@@ -18,7 +19,7 @@ from app.schemas.parent_project import (
     SubProjectSummary
 )
 
-router = APIRouter(prefix="/api/projects", tags=["projects"])
+router = APIRouter(prefix="/api/projects", tags=["projects"], dependencies=[Depends(get_current_user)])
 
 
 def get_pm_name(db: Session, pm_id: int) -> str | None:

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from app.services.auth_service import get_current_user
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -29,7 +30,7 @@ from app.services.slack_service import (
     try_get_or_cache_employee_slack_user_id,
 )
 
-router = APIRouter(prefix="/api/allocations", tags=["Allocations"])
+router = APIRouter(prefix="/api/allocations", tags=["Allocations"], dependencies=[Depends(get_current_user)])
 
 
 def _format_avg_time_per_task(project: Project) -> str:

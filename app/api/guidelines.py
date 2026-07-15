@@ -7,6 +7,7 @@ from typing import List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from app.services.auth_service import get_current_user
 from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.models.guideline import Guideline
 
-router = APIRouter(prefix="/api/guidelines", tags=["Guidelines"])
+router = APIRouter(prefix="/api/guidelines", tags=["Guidelines"], dependencies=[Depends(get_current_user)])
 
 import os
 _base = Path("/tmp/uploads") if os.environ.get("VERCEL") else Path(__file__).resolve().parents[2] / "uploads"

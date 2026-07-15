@@ -24,7 +24,7 @@ from app.schemas.employee import (
     EmployeeUpdate,
     EmployeeResponse,
 )
-from app.services.auth_service import hash_password
+from app.services.auth_service import get_current_user, hash_password
 from app.services.identity_validator import check_duplicate_identity
 from app.services.slack_service import (
     try_get_or_cache_employee_slack_user_id,
@@ -42,6 +42,7 @@ MAX_AVATAR_BYTES = 5 * 1024 * 1024  # 5 MB
 router = APIRouter(
     prefix="/api/employees",
     tags=["Employees"],
+    dependencies=[Depends(get_current_user)],
 )
 
 DEFAULT_EMPLOYEE_PASSWORD = "emp123"

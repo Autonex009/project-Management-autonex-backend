@@ -3,6 +3,7 @@ import logging
 from datetime import date, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
+from app.services.auth_service import get_current_user
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field, validator
 
@@ -16,7 +17,7 @@ from app.api.leaves import _get_pm_notification_targets, _get_admin_notification
 from app.constants.leave_types import is_intern_or_contractor
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/wfh", tags=["wfh"])
+router = APIRouter(prefix="/api/wfh", tags=["wfh"], dependencies=[Depends(get_current_user)])
 
 
 # ── Schemas ──────────────────────────────────────────────────────────────────

@@ -68,11 +68,14 @@ def require_payroll_passcode(
         raise HTTPException(status_code=401, detail="Invalid or missing payroll passcode")
 
 
+from app.services.auth_service import get_current_user
+
 # Passcode dependency applies to ALL routes on this router.
+# JWT auth (get_current_user) ensures identity; passcode ensures elevated authorization.
 router = APIRouter(
     prefix="/api/payroll",
     tags=["payroll"],
-    dependencies=[Depends(require_payroll_passcode)],
+    dependencies=[Depends(get_current_user), Depends(require_payroll_passcode)],
 )
 
 
@@ -379,22 +382,26 @@ def preview_payroll(
     db: Session = Depends(get_db),
 ):
     """
-    Compute salary for all active employees for the given month.
-    Approved leaves default to deduct=True.
-    Employees without a base_salary set are included but flagged.
+    Compute salary for the month from the `salary` table (the Pay tab), for every
+    row there that matches an active employee. Approved leaves default to deduct=True.
     """
     month_start, month_end = _month_bounds(month)
     working_days = _working_days_in_month(month_start, month_end)
     year = month_start.year
     year_start, year_end = date_type(year, 1, 1), date_type(year, 12, 31)
 
-    employees = db.query(Employee).filter(Employee.status == "active").order_by(Employee.name).all()
+    employees_by_name = {
+        _normalize_name(e.name): e
+        for e in db.query(Employee).filter(Employee.status == "active").all()
+    }
 
-    # Pay now comes from the `salary` table (the Pay tab's source of truth), matched
-    # to each employee by name. Rows marked Inactive there are excluded from the run.
-    salary_by_name = {}
-    for s in db.query(Salary).all():
-        salary_by_name[_normalize_name(s.full_name)] = s
+    # Monthly Pay is driven entirely from the `salary` table (the Pay tab's source
+    # of truth) — an employee only reaches this run once they have a row there.
+    # Rows marked Inactive there are excluded from the run.
+    salary_rows = [
+        s for s in db.query(Salary).order_by(Salary.id).all()
+        if (s.status or "").strip().lower() != "inactive"
+    ]
 
     # Fetch the whole CALENDAR YEAR of approved leaves (including NULL dates placeholders)
     # so the annual paid-leave entitlement can be applied chronologically.
@@ -440,15 +447,17 @@ def preview_payroll(
         }
 
     rows = []
-    for emp in employees:
-        # Resolve this employee's pay from the salary table (by name).
-        salary_row = salary_by_name.get(_normalize_name(emp.name))
-        # Skip anyone explicitly marked Inactive in the salary table.
-        if salary_row is not None and (salary_row.status or "").strip().lower() == "inactive":
+    for salary_row in salary_rows:
+        # Resolve the matching active employee by name; without one there's no
+        # employee_id to attach leaves/bonuses to, so skip (admin adds them separately).
+        emp = employees_by_name.get(_normalize_name(salary_row.full_name))
+        if emp is None:
             continue
-        emp_base_salary = _read_pay(salary_row.base_pay_monthly) if salary_row is not None else decrypt_salary(emp.base_salary_enc)
+        emp_base_salary = _read_pay(salary_row.base_pay_monthly)
+        if emp_base_salary is None:
+            continue
         # Bonus cap comes from the salary table; the granted amount (if any) is saved on the run.
-        emp_bonus_limit = (_read_pay(salary_row.opt_bonus_monthly) if salary_row is not None else None) or 0.0
+        emp_bonus_limit = _read_pay(salary_row.opt_bonus_monthly) or 0.0
         emp_bonus = saved_bonuses.get(emp.id, 0.0)
         emp_additional = saved_additional.get(emp.id, 0.0)
 
@@ -516,6 +525,9 @@ def preview_payroll(
         )
         row["salary_missing"] = emp_base_salary is None
         rows.append(row)
+
+    # Salary-driven iteration is no longer name-sorted; restore alphabetical order.
+    rows.sort(key=lambda r: r["employee_name"])
 
     return {
         "month": month,
@@ -791,9 +803,94 @@ def _salary_table_record(row: Salary) -> dict:
 
 @router.get("/salary-records")
 def list_salary_records(db: Session = Depends(get_db)):
-    """List every row from the salary table with actual pay values."""
-    rows = db.query(Salary).order_by(Salary.id).all()
-    return {"salaries": [_salary_table_record(r) for r in rows]}
+    """List every active employee, matched to their salary row where one exists.
+
+    Employees with no matching row yet come back as an "unset" record (id=None)
+    so the Pay tab can surface them and let an admin fill in their pay. Salary
+    rows that don't match any active employee (e.g. departed staff, name
+    mismatches) are still appended so nothing silently disappears from the tab.
+    """
+    employees = db.query(Employee).filter(Employee.status == "active").order_by(Employee.name).all()
+    salary_by_name = {_normalize_name(s.full_name): s for s in db.query(Salary).order_by(Salary.id).all()}
+
+    records = []
+    matched_names = set()
+    for emp in employees:
+        key = _normalize_name(emp.name)
+        row = salary_by_name.get(key)
+        if row is not None:
+            matched_names.add(key)
+            record = _salary_table_record(row)
+            record["employee_id"] = emp.id
+        else:
+            record = {
+                "id": None,
+                "employee_id": emp.id,
+                "full_name": emp.name,
+                "status": "Active",
+                "employment_type": emp.employee_type,
+                "base_pay_annual": None,
+                "optional_bonus_annual": None,
+                "base_pay_monthly": None,
+                "opt_bonus_monthly": None,
+            }
+        records.append(record)
+
+    for key, row in salary_by_name.items():
+        if key not in matched_names:
+            orphan = _salary_table_record(row)
+            orphan["employee_id"] = None
+            records.append(orphan)
+
+    return {"salaries": records}
+
+
+class SalaryRecordCreateIn(BaseModel):
+    employee_id: int
+    base_pay_monthly: float
+    opt_bonus_monthly: Optional[float] = None
+
+
+@router.post("/salary-records")
+def create_salary_record(body: SalaryRecordCreateIn, db: Session = Depends(get_db)):
+    """Create a salary row for an active employee who doesn't have one yet.
+
+    Only needed for employees the Pay tab surfaces as "unset" (no matching row
+    in `salary`) — existing rows are edited via PUT below.
+    """
+    if body.base_pay_monthly <= 0:
+        raise HTTPException(status_code=422, detail="base_pay_monthly must be a positive amount")
+
+    if not encryption_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Salary encryption is not configured on the server (SALARY_KEY unset); cannot store salary.",
+        )
+
+    emp = db.query(Employee).filter(Employee.id == body.employee_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    existing = {
+        _normalize_name(s.full_name)
+        for s in db.query(Salary).all()
+    }
+    if _normalize_name(emp.name) in existing:
+        raise HTTPException(status_code=409, detail="A salary record already exists for this employee")
+
+    row = Salary(
+        full_name=emp.name,
+        status="Active",
+        employment_type=emp.employee_type,
+        base_pay_monthly=encrypt_salary(body.base_pay_monthly),
+        opt_bonus_monthly=encrypt_salary(body.opt_bonus_monthly) if body.opt_bonus_monthly else None,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    record = _salary_table_record(row)
+    record["employee_id"] = emp.id
+    return record
 
 
 class SalaryRecordUpdateIn(BaseModel):

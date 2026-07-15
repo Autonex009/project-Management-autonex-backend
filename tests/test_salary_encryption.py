@@ -89,7 +89,13 @@ def client_and_db():
 
     app = FastAPI()
     app.include_router(employees_router)
+    from app.services.auth_service import get_current_user
+    from app.models.user import User
+    def override_get_current_user():
+        return User(id=1, email="admin@x.com", name="Admin", role="admin", is_active=True)
+
     app.dependency_overrides[database.get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = override_get_current_user
     db = TestingSessionLocal()
     yield TestClient(app), db
     db.close()

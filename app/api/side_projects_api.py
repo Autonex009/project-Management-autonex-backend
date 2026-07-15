@@ -4,6 +4,7 @@ from datetime import date, datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from app.services.auth_service import get_current_user
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -21,7 +22,7 @@ from app.services.slack_service import (
     try_get_or_cache_employee_slack_user_id,
 )
 
-router = APIRouter(prefix="/api/side-projects", tags=["Side Projects"])
+router = APIRouter(prefix="/api/side-projects", tags=["Side Projects"], dependencies=[Depends(get_current_user)])
 logger = logging.getLogger(__name__)
 
 

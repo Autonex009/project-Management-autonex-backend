@@ -39,7 +39,7 @@ from app.schemas.onboarding import (
 )
 from app.services.auth_service import get_current_user, require_role
 
-router = APIRouter(prefix="/api/onboarding", tags=["Onboarding"])
+router = APIRouter(prefix="/api/onboarding", tags=["Onboarding"], dependencies=[Depends(get_current_user)])
 
 # Try to import openpyxl for Excel imports; raise HTTP error if missing when route is called
 try:
