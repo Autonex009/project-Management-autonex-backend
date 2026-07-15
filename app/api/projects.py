@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, require_role
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -122,7 +122,7 @@ def _notify_allocated_employees_of_project_update(db: Session, project: Project,
         )
 
 # ✅ CREATE PROJECT
-@router.post("", response_model=ProjectResponse)
+@router.post("", response_model=ProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def create_project(
     payload: ProjectCreate,
     db: Session = Depends(get_db)
@@ -141,7 +141,7 @@ def list_projects(db: Session = Depends(get_db)):
 
 
 # ✅ UPDATE PROJECT
-@router.put("/{project_id}", response_model=ProjectResponse)
+@router.put("/{project_id}", response_model=ProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def update_project(
     project_id: int,
     payload: ProjectUpdate,
@@ -192,7 +192,7 @@ def update_project(
 
 
 # ✅ DELETE PROJECT
-@router.delete("/{project_id}")
+@router.delete("/{project_id}", dependencies=[Depends(require_role("admin", "pm"))])
 def delete_project(
     project_id: int,
     db: Session = Depends(get_db),

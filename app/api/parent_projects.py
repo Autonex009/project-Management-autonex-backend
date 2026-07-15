@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, require_role
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 from typing import List
@@ -136,7 +136,7 @@ def get_all_parent_projects(db: Session = Depends(get_db)):
     return result
 
 
-@router.post("", response_model=ParentProjectResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=ParentProjectResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_role("admin", "pm"))])
 def create_parent_project(
     parent_project: ParentProjectCreate,
     db: Session = Depends(get_db)
@@ -222,7 +222,7 @@ def get_parent_project(parent_project_id: int, db: Session = Depends(get_db)):
     )
 
 
-@router.put("/{parent_project_id}", response_model=ParentProjectResponse)
+@router.put("/{parent_project_id}", response_model=ParentProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def update_parent_project(
     parent_project_id: int,
     update_data: ParentProjectUpdate,
@@ -283,7 +283,7 @@ def update_parent_project(
     )
 
 
-@router.delete("/{parent_project_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{parent_project_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_role("admin", "pm"))])
 def delete_parent_project(parent_project_id: int, db: Session = Depends(get_db)):
     """
     Delete a project and everything under it:
@@ -327,7 +327,7 @@ def delete_parent_project(parent_project_id: int, db: Session = Depends(get_db))
     return None
 
 
-@router.get("/{parent_project_id}/context", response_model=dict)
+@router.get("/{parent_project_id}/context", response_model=dict, dependencies=[Depends(require_role("admin", "pm"))])
 def get_parent_context(parent_project_id: int, db: Session = Depends(get_db)):
     """
     Get context for inheriting into a new sub-project.
@@ -352,7 +352,7 @@ def get_parent_context(parent_project_id: int, db: Session = Depends(get_db)):
     }
 
 
-@router.get("/{parent_project_id}/clone-suggestions", response_model=dict)
+@router.get("/{parent_project_id}/clone-suggestions", response_model=dict, dependencies=[Depends(require_role("admin", "pm"))])
 def get_clone_suggestions(parent_project_id: int, db: Session = Depends(get_db)):
     """
     Get allocation suggestions from the most recent sibling project (optimized).

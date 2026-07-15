@@ -7,7 +7,7 @@ from typing import List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, require_role
 from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -78,7 +78,7 @@ def get_guideline(guideline_id: int, db: Session = Depends(get_db)):
     return guideline
 
 
-@router.post("", response_model=GuidelineResponse)
+@router.post("", response_model=GuidelineResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def create_guideline(payload: GuidelineCreate, db: Session = Depends(get_db)):
     guideline = Guideline(**payload.model_dump())
     db.add(guideline)
@@ -87,7 +87,7 @@ def create_guideline(payload: GuidelineCreate, db: Session = Depends(get_db)):
     return guideline
 
 
-@router.post("/upload", response_model=GuidelineResponse)
+@router.post("/upload", response_model=GuidelineResponse, dependencies=[Depends(require_role("admin", "pm"))])
 async def upload_guideline(
     request: Request,
     file: UploadFile = File(...),
@@ -129,7 +129,7 @@ async def upload_guideline(
         raise HTTPException(status_code=500, detail=f"Failed to save guideline upload: {exc.__class__.__name__}") from exc
 
 
-@router.put("/{guideline_id}", response_model=GuidelineResponse)
+@router.put("/{guideline_id}", response_model=GuidelineResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def update_guideline(guideline_id: int, payload: GuidelineUpdate, db: Session = Depends(get_db)):
     guideline = db.query(Guideline).filter(Guideline.id == guideline_id).first()
     if not guideline:
@@ -143,7 +143,7 @@ def update_guideline(guideline_id: int, payload: GuidelineUpdate, db: Session = 
     return guideline
 
 
-@router.delete("/{guideline_id}")
+@router.delete("/{guideline_id}", dependencies=[Depends(require_role("admin", "pm"))])
 def delete_guideline(guideline_id: int, db: Session = Depends(get_db)):
     guideline = db.query(Guideline).filter(Guideline.id == guideline_id).first()
     if not guideline:

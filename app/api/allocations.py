@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, require_role
+from app.models.user import User
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -148,7 +149,7 @@ def enrich_allocation_response(allocation: Allocation, db: Session) -> dict:
     }
 
 
-@router.post("/validate", response_model=AllocationValidationResponse)
+@router.post("/validate", response_model=AllocationValidationResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def validate_allocation(
     data: AllocationValidationRequest,
     db: Session = Depends(get_db)
@@ -201,7 +202,7 @@ def validate_allocation(
     )
 
 
-@router.post("", response_model=dict)
+@router.post("", response_model=dict, dependencies=[Depends(require_role("admin", "pm"))])
 def create_allocation(data: AllocationCreate, db: Session = Depends(get_db)):
     """Create a new allocation with validation."""
     # Validate time distribution if provided
@@ -278,7 +279,7 @@ def create_allocation(data: AllocationCreate, db: Session = Depends(get_db)):
     return response
 
 
-@router.get("", response_model=List[dict])
+@router.get("", response_model=List[dict], dependencies=[Depends(require_role("admin", "pm"))])
 def get_allocations(db: Session = Depends(get_db)):
     """Get all allocations with enriched data (optimized to avoid N+1 queries)."""
     allocations = db.query(Allocation).all()
@@ -328,7 +329,7 @@ def get_allocations(db: Session = Depends(get_db)):
     return result
 
 
-@router.get("/employee-status", response_model=dict)
+@router.get("/employee-status", response_model=dict, dependencies=[Depends(require_role("admin", "pm"))])
 def get_employee_allocation_status(
     active_only: bool = True,
     db: Session = Depends(get_db)
@@ -340,7 +341,7 @@ def get_employee_allocation_status(
     return get_all_employees_allocation_status(db, active_only)
 
 
-@router.get("/by-project/{project_id}", response_model=List[dict])
+@router.get("/by-project/{project_id}", response_model=List[dict], dependencies=[Depends(require_role("admin", "pm"))])
 def get_allocations_by_project(project_id: int, db: Session = Depends(get_db)):
     """Get all allocations for a specific project."""
     allocations = db.query(Allocation).filter(
@@ -350,15 +351,25 @@ def get_allocations_by_project(project_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/by-employee/{employee_id}", response_model=List[dict])
-def get_allocations_by_employee(employee_id: int, db: Session = Depends(get_db)):
+def get_allocations_by_employee(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Get all allocations for a specific employee."""
+    if current_user.role not in ["admin", "pm"]:
+        is_self = current_user.employee_id == employee_id
+        if not is_self:
+            employee = db.query(Employee).filter(Employee.id == employee_id).first()
+            if not employee or current_user.email != employee.email:
+                raise HTTPException(status_code=403, detail="Access denied")
     allocations = db.query(Allocation).filter(
         Allocation.employee_id == employee_id
     ).all()
     return [enrich_allocation_response(a, db) for a in allocations]
 
 
-@router.put("/{allocation_id}", response_model=dict)
+@router.put("/{allocation_id}", response_model=dict, dependencies=[Depends(require_role("admin", "pm"))])
 def update_allocation(
     allocation_id: int,
     data: AllocationUpdate,
@@ -448,7 +459,7 @@ def update_allocation(
     return response
 
 
-@router.delete("/{allocation_id}")
+@router.delete("/{allocation_id}", dependencies=[Depends(require_role("admin", "pm"))])
 def delete_allocation(allocation_id: int, db: Session = Depends(get_db)):
     """Delete an allocation."""
     allocation = db.query(Allocation).filter(Allocation.id == allocation_id).first()

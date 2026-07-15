@@ -69,9 +69,18 @@ from app.services.slack_service import (
     try_send_leave_status_message,
 )
 
-from app.services.auth_service import get_current_user
+from app.services.auth_service import get_current_user, require_role
 
 router = APIRouter(prefix="/api/leaves", tags=["Leaves"], dependencies=[Depends(get_current_user)])
+
+
+def check_leave_access(leave_employee_id: int, current_user: User, db: Session):
+    if current_user.role not in ["admin", "pm"]:
+        is_self = current_user.employee_id == leave_employee_id
+        if not is_self:
+            emp = db.query(Employee).filter(Employee.id == leave_employee_id).first()
+            if not emp or emp.email != current_user.email:
+                raise HTTPException(status_code=403, detail="Access denied")
 
 
 def _push_notification(db: Session, user_id: int, title: str, message: str, notif_type: str) -> None:
@@ -343,9 +352,25 @@ def get_all_leaves(
     employee_id: Optional[int] = None,
     start_date: Optional[date_type] = None,
     end_date: Optional[date_type] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """Get all leaves, optionally filtered by employee_id, start_date, or end_date"""
+    if current_user.role not in ["admin", "pm"]:
+        if employee_id is None:
+            employee_id = current_user.employee_id
+            if employee_id is None:
+                emp = db.query(Employee).filter(Employee.email == current_user.email).first()
+                if emp:
+                    employee_id = emp.id
+                else:
+                    raise HTTPException(status_code=403, detail="Access denied")
+        else:
+            is_self = current_user.employee_id == employee_id
+            if not is_self:
+                emp = db.query(Employee).filter(Employee.id == employee_id).first()
+                if not emp or emp.email != current_user.email:
+                    raise HTTPException(status_code=403, detail="Access denied")
     query = db.query(Leave)
     if employee_id:
         query = query.filter(Leave.employee_id == employee_id)
@@ -444,10 +469,15 @@ def get_calendar(
 
 
 @router.get("/{leave_id}", response_model=LeaveSchema)
-def get_leave(leave_id: int, db: Session = Depends(get_db)):
+def get_leave(
+    leave_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
+    check_leave_access(leave.employee_id, current_user, db)
     return LeaveSchema(
         leave_id=leave.id,
         employee_id=leave.employee_id,
@@ -532,7 +562,12 @@ def validate_consecutive_leaves(
 
 
 @router.post("", response_model=LeaveSchema, status_code=201)
-def create_leave(payload: LeaveCreate, db: Session = Depends(get_db)):
+def create_leave(
+    payload: LeaveCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    check_leave_access(payload.employee_id, current_user, db)
     employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
@@ -720,7 +755,7 @@ class ApproveBody(BaseModel):
     remark: Optional[str] = None
 
 
-@router.post("/{leave_id}/apply-to-razorpay")
+@router.post("/{leave_id}/apply-to-razorpay", dependencies=[Depends(require_role("admin", "pm"))])
 def apply_leave_to_razorpay(leave_id: int, db: Session = Depends(get_db)):
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
@@ -745,10 +780,17 @@ def apply_leave_to_razorpay(leave_id: int, db: Session = Depends(get_db)):
 
 
 @router.put("/{leave_id}", response_model=LeaveSchema)
-def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_db)):
+def update_leave(
+    leave_id: int,
+    payload: LeaveCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
+    check_leave_access(leave.employee_id, current_user, db)
+    check_leave_access(payload.employee_id, current_user, db)
     if leave.start_date <= date_type.today():
         raise HTTPException(status_code=400, detail="Cannot edit a leave that has already started")
 
@@ -848,7 +890,7 @@ def update_leave(leave_id: int, payload: LeaveCreate, db: Session = Depends(get_
 
 # ── Approve / Reject ───────────────────────────────────────────────
 
-@router.patch("/{leave_id}/approve")
+@router.patch("/{leave_id}/approve", dependencies=[Depends(require_role("admin", "pm"))])
 def approve_leave(
     leave_id: int,
     approved_by: int = Query(default=0),
@@ -933,7 +975,7 @@ def approve_leave(
     return result
 
 
-@router.patch("/{leave_id}/reject")
+@router.patch("/{leave_id}/reject", dependencies=[Depends(require_role("admin", "pm"))])
 def reject_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_db)):
     """Reject a leave request."""
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
@@ -981,7 +1023,7 @@ def reject_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_
     return {"message": "Leave rejected", "leave_id": leave_id, "status": "rejected"}
 
 
-@router.patch("/{leave_id}/undo-reject")
+@router.patch("/{leave_id}/undo-reject", dependencies=[Depends(require_role("admin", "pm"))])
 def undo_reject_leave(leave_id: int, approved_by: int = Query(default=0), db: Session = Depends(get_db)):
     """Reopen a rejected leave back to pending."""
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
@@ -1031,7 +1073,7 @@ def undo_reject_leave(leave_id: int, approved_by: int = Query(default=0), db: Se
     return {"message": "Leave reopened", "leave_id": leave_id, "status": "pending"}
 
 
-@router.patch("/{leave_id}/undo-approve")
+@router.patch("/{leave_id}/undo-approve", dependencies=[Depends(require_role("admin", "pm"))])
 def undo_approve_leave(leave_id: int, approved_by: int = Query(default=0), db: Session = Depends(get_db)):
     """Revoke an approval, reverting the leave back to pending. Reverses the Razorpay
     sync first (if applied) so the two systems never drift out of sync."""
@@ -1067,10 +1109,15 @@ def undo_approve_leave(leave_id: int, approved_by: int = Query(default=0), db: S
 
 
 @router.delete("/{leave_id}")
-def delete_leave(leave_id: int, db: Session = Depends(get_db)):
+def delete_leave(
+    leave_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
+    check_leave_access(leave.employee_id, current_user, db)
     if leave.start_date <= date_type.today():
         raise HTTPException(status_code=400, detail="Cannot delete a leave that has already started")
 

@@ -24,7 +24,7 @@ from app.schemas.employee import (
     EmployeeUpdate,
     EmployeeResponse,
 )
-from app.services.auth_service import get_current_user, hash_password
+from app.services.auth_service import get_current_user, hash_password, require_role
 from app.services.identity_validator import check_duplicate_identity
 from app.services.slack_service import (
     try_get_or_cache_employee_slack_user_id,
@@ -61,8 +61,16 @@ def get_user_role_from_designation(designation: str | None) -> str:
     return DESIGNATION_ROLE_MAP.get(designation, "employee")
 
 
+def check_employee_access(employee: Employee, current_user: User):
+    if current_user.role in ["admin", "pm"]:
+        return
+    is_self = (current_user.employee_id == employee.id) or (current_user.email == employee.email)
+    if not is_self:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+
 # ✅ CREATE EMPLOYEE
-@router.post("", response_model=EmployeeResponse)
+@router.post("", response_model=EmployeeResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def create_employee(
     payload: EmployeeCreate,
     db: Session = Depends(get_db)
@@ -95,7 +103,7 @@ def create_employee(
 
 
 # ✅ LIST EMPLOYEES
-@router.get("", response_model=list[EmployeeResponse])
+@router.get("", response_model=list[EmployeeResponse], dependencies=[Depends(require_role("admin", "pm"))])
 def list_employees(
     status: str = None,
     include_archived: bool = False,
@@ -112,17 +120,17 @@ def list_employees(
     return query.all()
 
 
-@router.get("/status/active", response_model=list[EmployeeResponse])
+@router.get("/status/active", response_model=list[EmployeeResponse], dependencies=[Depends(require_role("admin", "pm"))])
 def get_active_employees(db: Session = Depends(get_db)):
     return db.query(Employee).filter(Employee.status == "active").all()
 
 
-@router.get("/status/inactive", response_model=list[EmployeeResponse])
+@router.get("/status/inactive", response_model=list[EmployeeResponse], dependencies=[Depends(require_role("admin", "pm"))])
 def get_inactive_employees(db: Session = Depends(get_db)):
     return db.query(Employee).filter(Employee.status == "inactive").all()
 
 
-@router.get("/status/idle", response_model=list[EmployeeResponse])
+@router.get("/status/idle", response_model=list[EmployeeResponse], dependencies=[Depends(require_role("admin", "pm"))])
 def get_idle_employees(db: Session = Depends(get_db)):
     allocated_employee_ids = db.query(Allocation.employee_id).distinct()
     return db.query(Employee).filter(
@@ -136,11 +144,13 @@ def get_idle_employees(db: Session = Depends(get_db)):
 @router.get("/{employee_id}", response_model=EmployeeResponse)
 def get_employee(
     employee_id: int,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
+    check_employee_access(employee, current_user)
     return employee
 
 
@@ -150,11 +160,24 @@ def update_employee(
     employee_id: int,
     payload: EmployeeUpdate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
+    
+    check_employee_access(employee, current_user)
+    
+    if current_user.role not in ["admin", "pm"]:
+        admin_only_fields = {
+            "employee_type", "designation", "working_hours_per_day",
+            "weekly_availability", "productivity_baseline", "status", "base_salary"
+        }
+        requested_fields = set(payload.dict(exclude_unset=True).keys())
+        blocked = requested_fields.intersection(admin_only_fields)
+        if blocked:
+            raise HTTPException(status_code=403, detail=f"Cannot update administrative fields: {', '.join(blocked)}")
     
     # Ensure update doesn't introduce duplicate email or phone for another person
     if payload.email or payload.phone:
@@ -192,7 +215,7 @@ class ConvertToFulltimeBody(BaseModel):
 
 
 # ✅ CONVERT INTERN → FULL-TIME (in place — preserves all linked history)
-@router.post("/{employee_id}/convert-to-fulltime", response_model=EmployeeResponse)
+@router.post("/{employee_id}/convert-to-fulltime", response_model=EmployeeResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def convert_to_fulltime(
     employee_id: int,
     body: ConvertToFulltimeBody = ConvertToFulltimeBody(),
@@ -245,7 +268,7 @@ def convert_to_fulltime(
 
 
 # ✅ DELETE EMPLOYEE (SOFT-ARCHIVE)
-@router.delete("/{employee_id}")
+@router.delete("/{employee_id}", dependencies=[Depends(require_role("admin", "pm"))])
 def delete_employee(
     employee_id: int,
     db: Session = Depends(get_db),
@@ -277,7 +300,7 @@ def delete_employee(
 
 
 # ✅ RESTORE ARCHIVED EMPLOYEE
-@router.post("/{employee_id}/restore", response_model=EmployeeResponse)
+@router.post("/{employee_id}/restore", response_model=EmployeeResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def restore_employee(
     employee_id: int,
     db: Session = Depends(get_db),
@@ -306,7 +329,7 @@ def restore_employee(
 
 
 # ✅ EMPLOYEE AVAILABILITY (±30 days)
-@router.get("/{employee_id}/availability")
+@router.get("/{employee_id}/availability", dependencies=[Depends(require_role("admin", "pm"))])
 def get_employee_availability(employee_id: int, db: Session = Depends(get_db)):
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
@@ -415,7 +438,7 @@ def get_employee_availability(employee_id: int, db: Session = Depends(get_db)):
 
 
 # ✅ SLACK DM DEEP-LINK (resolve/cache the employee's Slack user id on demand)
-@router.get("/{employee_id}/slack-link")
+@router.get("/{employee_id}/slack-link", dependencies=[Depends(require_role("admin", "pm"))])
 def get_employee_slack_link(employee_id: int, db: Session = Depends(get_db)):
     """Return a browser deep-link that opens a Slack DM with the employee.
 
@@ -450,11 +473,14 @@ async def upload_employee_avatar(
     request: Request,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """Upload a profile picture for an employee and store its public URL."""
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    check_employee_access(employee, current_user)
 
     original_name = Path(file.filename or "").name
     suffix = Path(original_name).suffix.lower()
@@ -494,11 +520,17 @@ async def upload_employee_avatar(
 
 
 @router.post("/{employee_id}/avatar/from-slack", response_model=EmployeeResponse)
-def set_employee_avatar_from_slack(employee_id: int, db: Session = Depends(get_db)):
+def set_employee_avatar_from_slack(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Fetch the employee's Slack profile photo and store it as their avatar."""
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    check_employee_access(employee, current_user)
 
     avatar_url = try_lookup_user_avatar_by_email(employee.email)
     if not avatar_url:
@@ -514,11 +546,17 @@ def set_employee_avatar_from_slack(employee_id: int, db: Session = Depends(get_d
 
 
 @router.delete("/{employee_id}/avatar", response_model=EmployeeResponse)
-def delete_employee_avatar(employee_id: int, db: Session = Depends(get_db)):
+def delete_employee_avatar(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Remove an employee's profile picture."""
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    check_employee_access(employee, current_user)
 
     old_url = employee.avatar_url or ""
     if "/uploads/avatars/" in old_url:
