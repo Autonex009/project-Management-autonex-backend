@@ -13,6 +13,7 @@ from typing import List, Optional
 
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Query
+from app.services.auth_service import get_current_user
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -25,7 +26,7 @@ from app.services.email_service import try_send_signup_approved_email, try_send_
 from app.services.identity_validator import check_duplicate_identity
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/signup-requests", tags=["signup-requests"])
+router = APIRouter(prefix="/api/signup-requests", tags=["signup-requests"], dependencies=[Depends(get_current_user)])
 
 PORTAL_URL = "https://autonex-frontend.vercel.app/login/employee"
 

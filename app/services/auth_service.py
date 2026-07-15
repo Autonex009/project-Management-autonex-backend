@@ -17,7 +17,7 @@ from app.db.database import get_db
 from app.models.user import User
 
 # ── Config ──────────────────────────────────────────────────────────
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "autonex-super-secret-key-change-in-production")
+SECRET_KEY = os.environ["JWT_SECRET_KEY"]  # Required — no fallback; crash-fail on boot if unset
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
 PASSWORD_RESET_EXPIRE_MINUTES = int(os.getenv("PASSWORD_RESET_EXPIRE_MINUTES", "15"))

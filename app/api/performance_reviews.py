@@ -5,13 +5,14 @@ from datetime import datetime
 from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from app.services.auth_service import get_current_user
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.models.performance_review import PerformanceReview
 
-router = APIRouter(prefix="/api/performance-reviews", tags=["Performance Reviews"])
+router = APIRouter(prefix="/api/performance-reviews", tags=["Performance Reviews"], dependencies=[Depends(get_current_user)])
 
 ReviewType = Literal["feedback", "performance_review", "comment"]
 

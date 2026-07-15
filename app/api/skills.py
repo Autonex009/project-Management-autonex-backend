@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from app.services.auth_service import get_current_user
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -7,7 +8,7 @@ from app.schemas.skill import Skill, SkillCreate
 from app.services import skill as skill_crud
 from app.seed_skills import ALLOWED_SKILLS, seed_skills
 
-router = APIRouter(prefix="/api/skills", tags=["skills"])
+router = APIRouter(prefix="/api/skills", tags=["skills"], dependencies=[Depends(get_current_user)])
 
 
 @router.get("", response_model=List[Skill])

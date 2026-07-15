@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from app.services.auth_service import get_current_user
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -42,6 +43,7 @@ def normalize_project_payload(data: dict, db: Session | None = None) -> dict:
 router = APIRouter(
     prefix="/api/sub-projects",
     tags=["sub-projects"],
+    dependencies=[Depends(get_current_user)],
 )
 
 
