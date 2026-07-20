@@ -29,18 +29,37 @@ elif "postgresql" in DATABASE_URL:
     # For regular Postgres (non-Neon) we can set statement_timeout via startup options
     connect_args = {"connect_timeout": 10, "options": "-c statement_timeout=30000"}
 
-# On Vercel (serverless), each function instance is short-lived and there can be
-# many concurrent instances. Holding a connection pool there exhausts Supabase's
-# pooler (EMAXCONNSESSION). Use NullPool so every request opens/closes a single
-# connection and lets the Supabase transaction pooler (port 6543) do the pooling.
+# On Vercel the strategy depends on Fluid Compute:
+#   * With Fluid Compute ON, multiple invocations share one warm instance and its
+#     module-level globals, so a small connection pool persists across requests and
+#     gets reused instead of opening a brand-new connection every request. This is
+#     what lets serverless perform like a warm long-running server.
+#   * Keep the pool small and recycle often: an instance can be suspended with
+#     connections still open (SQLAlchemy has no pre-suspend close hook like JS's
+#     attachDatabasePool), so a short pool_recycle limits stale/leaked connections.
+# Requires Fluid Compute to be enabled on the Vercel project. Without it, classic
+# serverless tears instances down between requests and the pool can't be reused --
+# set DB_FORCE_NULLPOOL=true to fall back to a connection-per-request model.
 if DATABASE_URL.startswith("sqlite"):
     engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
-elif os.getenv("VERCEL"):
+elif os.getenv("VERCEL") and os.getenv("DB_FORCE_NULLPOOL", "false").lower() == "true":
+    # Fallback: classic serverless with no connection reuse (one conn per request).
     from sqlalchemy.pool import NullPool
     engine = create_engine(
         DATABASE_URL,
         poolclass=NullPool,
         pool_pre_ping=True,
+        connect_args=connect_args,
+    )
+elif os.getenv("VERCEL"):
+    # Fluid Compute: reuse a small warm pool across invocations in the same instance.
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True,
+        pool_size=1,        # keep one warm connection (min pool size 1, never max 1)
+        max_overflow=4,     # allow short bursts of concurrency within an instance
+        pool_recycle=60,    # drop connections after 60s to avoid stale/leaked idle conns
+        pool_timeout=10,
         connect_args=connect_args,
     )
 else:
