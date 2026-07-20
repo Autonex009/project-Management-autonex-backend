@@ -36,6 +36,10 @@ env/
 *.sqlite3
 *.db
 
+# Local-only DB engine override (copy from database_local.py.example)
+database_local.py
+
+
 # Mypy / caches
 .mypy_cache/
 pip-wheel-metadata/

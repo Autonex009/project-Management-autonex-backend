@@ -1,0 +1,25 @@
+"""
+Template for local-development database engine.
+
+Copy this file to database_local.py (which is gitignored) to override the engine
+used by database.py on your local machine. Without it, database.py uses its
+Vercel/Railway configuration. Adjust the pool settings below as needed.
+"""
+from sqlalchemy import create_engine
+
+
+def build_local_engine(database_url, connect_args):
+    if database_url.startswith("sqlite"):
+        # SQLite: no server-side pool tuning applies.
+        return create_engine(database_url, pool_pre_ping=True, connect_args=connect_args)
+
+    # Local Postgres (e.g. hitting Neon/Supabase from your machine).
+    return create_engine(
+        database_url,
+        pool_pre_ping=True,
+        pool_size=3,
+        max_overflow=5,
+        pool_recycle=300,
+        pool_timeout=15,
+        connect_args=connect_args,
+    )
