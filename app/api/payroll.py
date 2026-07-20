@@ -27,6 +27,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from app.db.database import get_db
 from app.models.employee import Employee
@@ -227,6 +228,9 @@ def _normalize_name(name: Optional[str]) -> str:
 def _parse_money(text: Optional[str]) -> Optional[float]:
     """Parse a stored pay string like '₹100,000' into a float. None/empty → None."""
     if text is None:
+        return None
+    # If it's a Fernet token that failed decryption, don't parse its digits
+    if str(text).startswith("gAAAAAB"):
         return None
     cleaned = "".join(ch for ch in str(text) if ch.isdigit() or ch == ".")
     if not cleaned:
@@ -878,12 +882,18 @@ def create_salary_record(body: SalaryRecordCreateIn, db: Session = Depends(get_d
     if _normalize_name(emp.name) in existing:
         raise HTTPException(status_code=409, detail="A salary record already exists for this employee")
 
+    max_id = db.query(func.max(Salary.id)).scalar()
+    next_id = (max_id or 0) + 1
+
     row = Salary(
+        id=next_id,
         full_name=emp.name,
         status="Active",
         employment_type=emp.employee_type,
         base_pay_monthly=encrypt_salary(body.base_pay_monthly),
         opt_bonus_monthly=encrypt_salary(body.opt_bonus_monthly) if body.opt_bonus_monthly else None,
+        base_pay_annual=encrypt_salary(body.base_pay_monthly * 12),
+        optional_bonus_annual=encrypt_salary(body.opt_bonus_monthly * 12) if body.opt_bonus_monthly else None,
     )
     db.add(row)
     db.commit()
@@ -922,6 +932,8 @@ def update_salary_record(record_id: int, body: SalaryRecordUpdateIn, db: Session
 
     row.base_pay_monthly = encrypt_salary(body.base_pay_monthly)
     row.opt_bonus_monthly = encrypt_salary(body.opt_bonus_monthly) if body.opt_bonus_monthly else None
+    row.base_pay_annual = encrypt_salary(body.base_pay_monthly * 12)
+    row.optional_bonus_annual = encrypt_salary(body.opt_bonus_monthly * 12) if body.opt_bonus_monthly else None
     db.commit()
     db.refresh(row)
     return _salary_table_record(row)
