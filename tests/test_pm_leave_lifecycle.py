@@ -366,16 +366,16 @@ def test_wfh_limits_intern_and_contractor(client_and_db):
     db.commit()
     db.refresh(intern)
 
-    wfh_dates = [
-        _next_weekday(date.today() + timedelta(days=20)),
-        _next_weekday(date.today() + timedelta(days=21)),
-        _next_weekday(date.today() + timedelta(days=22))
-    ]
+    base = date.today() + timedelta(days=20)
+    wfh_dates = []
+    d = base
+    while len(wfh_dates) < 3:
+        d = _next_weekday(d)
+        wfh_dates.append(d)
+        d += timedelta(days=1)
+
     # Ensure all are in the same calendar month
-    month = wfh_dates[0].month
-    wfh_dates = [d for d in wfh_dates if d.month == month]
-    # If we don't have enough weekdays in this month, use next month
-    if len(wfh_dates) < 3:
+    if wfh_dates[0].month != wfh_dates[-1].month:
         base = (date.today() + timedelta(days=40)).replace(day=1)
         wfh_dates = []
         d = base
