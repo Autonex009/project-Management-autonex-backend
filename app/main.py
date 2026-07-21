@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network,chat
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -33,8 +33,10 @@ from app.api.company_settings import router as company_settings_router
 from app.api.wifi_networks import router as wifi_networks_router
 from app.api.hiring_sync import router as hiring_sync_router
 from app.api.chat import router as chat_router
+from app.api.encord_sync import router as encord_sync_router
+from app.api.analytics import router as analytics_router
 from app.seed_skills import seed_skills
-# from app.services.scheduler_service import start_scheduler, shutdown_scheduler
+from app.services.scheduler_service import start_scheduler, shutdown_scheduler
 
 Base.metadata.create_all(bind=engine)
 
@@ -80,6 +82,47 @@ def sync_main_project_schema() -> None:
 
 
 sync_main_project_schema()
+
+
+def sync_encord_analytics_schema() -> None:
+    """Add Encord mapping columns to daily_sheets and (re)create the analytics table."""
+    inspector = inspect(engine)
+    try:
+        tables = set(inspector.get_table_names())
+    except Exception:
+        return
+
+    # daily_sheets: encord_project_hash + sentiment
+    try:
+        ds_cols = {c["name"] for c in inspector.get_columns("daily_sheets")}
+        alters = []
+        if "encord_project_hash" not in ds_cols:
+            alters.append("ALTER TABLE daily_sheets ADD COLUMN encord_project_hash TEXT")
+        if "sentiment" not in ds_cols:
+            alters.append("ALTER TABLE daily_sheets ADD COLUMN sentiment TEXT")
+        if alters:
+            with engine.begin() as connection:
+                for stmt in alters:
+                    connection.execute(text(stmt))
+    except Exception:
+        pass
+
+    # analytics table: create if missing; recreate if it still has the old
+    # main_project_id column (mapping moved to sub-project level; table is disposable).
+    if "encord_daily_time_spent" not in tables:
+        encord_analytics.Base.metadata.tables["encord_daily_time_spent"].create(bind=engine)
+    else:
+        try:
+            cols = {c["name"] for c in inspector.get_columns("encord_daily_time_spent")}
+        except Exception:
+            cols = set()
+        if "sub_project_id" not in cols:
+            with engine.begin() as connection:
+                connection.execute(text("DROP TABLE IF EXISTS encord_daily_time_spent"))
+            encord_analytics.Base.metadata.tables["encord_daily_time_spent"].create(bind=engine)
+
+
+sync_encord_analytics_schema()
 
 
 def sync_leave_schema() -> None:
@@ -590,9 +633,15 @@ async def lifespan(app: FastAPI):
         initialize_knowledge_base()
     except Exception as e:
         logger.warning("Knowledge base init skipped: %s", e)
-    # start_scheduler()
+    try:
+        start_scheduler()
+    except Exception as e:
+        logger.warning("Scheduler start skipped: %s", e)
     yield
-    # shutdown_scheduler()
+    try:
+        shutdown_scheduler()
+    except Exception:
+        pass
 
 
 app = FastAPI(title="Autonex Resource Planning Tool V2", lifespan=lifespan)
@@ -645,4 +694,6 @@ app.include_router(company_settings_router)
 app.include_router(wifi_networks_router)
 app.include_router(hiring_sync_router)
 app.include_router(chat_router)
+app.include_router(encord_sync_router)
+app.include_router(analytics_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
