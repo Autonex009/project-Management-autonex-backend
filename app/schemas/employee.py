@@ -31,6 +31,8 @@ class EmployeeBase(BaseModel):
     razorpay_email: Optional[str] = Field(None, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
     phone: Optional[str] = None
     slack_user_id: Optional[str] = None
+    # Encord account email/identity; used to map Encord analytics to this employee.
+    encord_id: Optional[str] = None
     avatar_url: Optional[str] = None
     employee_type: str
     
@@ -63,6 +65,7 @@ class EmployeeUpdate(BaseModel):
     razorpay_email: Optional[str] = Field(None, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
     phone: Optional[str] = None
     slack_user_id: Optional[str] = None
+    encord_id: Optional[str] = None
     avatar_url: Optional[str] = None
     employee_type: Optional[str] = None
     designation: Optional[str] = None

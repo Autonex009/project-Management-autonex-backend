@@ -18,6 +18,7 @@ from app.db.database import get_db
 from app.services.auth_service import require_role
 from app.models.project import DailySheet
 from app.models.encord_analytics import EncordDailyTimeSpent
+from app.models.employee import Employee
 
 router = APIRouter(prefix="/api/analytics", tags=["Analytics"], dependencies=[Depends(require_role("admin", "pm"))])
 
@@ -40,6 +41,22 @@ def _parse_date(s: Optional[str], default: date) -> date:
 
 def _month_start(d: date) -> date:
     return d.replace(day=1)
+
+
+def _names_for(db: Session, emails) -> dict:
+    """Map Encord account emails -> employee display name via employees.encord_id.
+
+    Falls back to the email itself for any Encord user not linked to an employee.
+    """
+    emails = {e for e in emails if e}
+    if not emails:
+        return {}
+    rows = (
+        db.query(Employee.encord_id, Employee.name)
+        .filter(Employee.encord_id.in_(emails))
+        .all()
+    )
+    return {encord_id: name for encord_id, name in rows if encord_id}
 
 
 def _rows_for(db: Session, sp: DailySheet, start: date, end: date):
@@ -122,11 +139,13 @@ def project_analytics(
         "avg_hours_per_annotator": round(_hours(total_seconds) / len(range_active_users), 2) if range_active_users else 0.0,
     }
 
+    name_by_email = _names_for(db, user_daily.keys())
     annotators = []
     for u, days in user_daily.items():
         total = sum(days.values())
         annotators.append({
             "user_email": u,
+            "employee_name": name_by_email.get(u),   # real name, or None if unlinked (UI falls back to user_email)
             "role": user_role.get(u),
             "total_hours": _hours(total),
             "daily": [{"date": d.isoformat(), "hours": _hours(s)} for d, s in sorted(days.items())],

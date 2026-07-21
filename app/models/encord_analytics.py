@@ -21,7 +21,7 @@ class EncordDailyTimeSpent(Base):
     encord_project_hash = Column(Text, nullable=False, index=True)
 
     metric_date = Column(Date, nullable=False, index=True)          # the day the time was spent
-    user_email = Column(Text, nullable=False, index=True)
+    user_email = Column(Text, nullable=False, index=True)            # Encord account email; join to employees.encord_email for the display name
     project_user_role = Column(String(32), nullable=True)            # e.g. "ANNOTATOR", "REVIEWER"
     workflow_stage = Column(Text, nullable=True)                     # stage title, may be null
 
