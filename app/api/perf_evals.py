@@ -23,10 +23,85 @@ from app.models.employee import Employee
 from app.constants.perf_params import PERF_PARAM_NAME_SET, RATING_MIN, RATING_MAX
 from app.db.database import get_db
 from app.models.perf_eval import PerfEvaluation
+from app.models.notification import Notification
+from app.models.project import DailySheet
+from app.models.sub_project import SubProject
+from app.models.parent_project import MainProject
 
 router = APIRouter(prefix="/api/perf-evals", tags=["Performance Evaluations"], dependencies=[Depends(get_current_user)])
 
 PERIOD_OK = lambda v: isinstance(v, str) and len(v) == 7 and v[4] == "-" and v[:4].isdigit() and v[5:].isdigit() and 1 <= int(v[5:]) <= 12
+
+
+def _period_label(period: str) -> str:
+    try:
+        y, m = period.split("-")
+        months = ["", "January", "February", "March", "April", "May", "June",
+                  "July", "August", "September", "October", "November", "December"]
+        return f"{months[int(m)]} {y}"
+    except Exception:
+        return period
+
+
+def _notify_on_submit(db: Session, ev: PerfEvaluation) -> None:
+    """Notify the right reviewers when an evaluation is submitted.
+
+    - PM self-report (project_id == 0) → notify all admins.
+    - Employee evaluation → notify the PM(s) of the project's parent; if none,
+      fall back to admins.
+    """
+    employee = db.query(Employee).filter(Employee.id == ev.employee_id).first()
+    who = employee.name if employee else f"Employee #{ev.employee_id}"
+    label = _period_label(ev.period)
+
+    def push(user_id: int, title: str, message: str, notif_type: str):
+        db.add(Notification(user_id=user_id, title=title, message=message, type=notif_type))
+
+    if ev.project_id == 0:
+        # PM self-report → all active admins
+        from app.models.user import User as _User
+        for admin_user in db.query(_User).filter(_User.role == "admin", _User.is_active == True).all():
+            push(admin_user.id,
+                 f"PM self-evaluation submitted",
+                 f"{who} submitted their {label} self-evaluation for your approval.",
+                 "perf_pm_submitted")
+        db.commit()
+        return
+
+    # Employee evaluation → notify the project's PM(s)
+    from app.models.user import User as _User
+    pm_employee_ids: set[int] = set()
+    sheet = db.query(DailySheet).filter(DailySheet.id == ev.project_id).first()
+    main_project_id = getattr(sheet, "main_project_id", None) if sheet else None
+    if not main_project_id and sheet and getattr(sheet, "sub_project_id", None):
+        sub = db.query(SubProject).filter(SubProject.id == sheet.sub_project_id).first()
+        main_project_id = getattr(sub, "main_project_id", None) if sub else None
+    if main_project_id:
+        mp = db.query(MainProject).filter(MainProject.id == main_project_id).first()
+        if mp:
+            if getattr(mp, "program_manager_ids", None):
+                pm_employee_ids.update([pid for pid in mp.program_manager_ids if pid])
+            if getattr(mp, "program_manager_id", None):
+                pm_employee_ids.add(mp.program_manager_id)
+
+    project_name = getattr(sheet, "name", None) or "a project"
+    notified = False
+    for emp_id in pm_employee_ids:
+        pm_user = db.query(_User).filter(_User.employee_id == emp_id, _User.is_active == True).first()
+        if pm_user:
+            notified = True
+            push(pm_user.id,
+                 "New self-evaluation submitted",
+                 f"{who} submitted a {label} self-evaluation for “{project_name}”.",
+                 "perf_submitted")
+
+    if not notified:
+        for admin_user in db.query(_User).filter(_User.role == "admin", _User.is_active == True).all():
+            push(admin_user.id,
+                 "New self-evaluation submitted",
+                 f"{who} submitted a {label} self-evaluation for “{project_name}” (no PM assigned).",
+                 "perf_submitted")
+    db.commit()
 
 
 def _mean(values: List[float]) -> Optional[float]:
@@ -208,6 +283,10 @@ def create_eval(
     db.add(ev)
     db.commit()
     db.refresh(ev)
+    try:
+        _notify_on_submit(db, ev)
+    except Exception:
+        db.rollback()  # notifications are best-effort; never fail the submission
     return ev
 
 
