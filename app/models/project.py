@@ -51,6 +51,10 @@ class DailySheet(Base):
     priority = Column(Text, default="medium")
     project_status = Column(Text, default="active")
 
+    # Encord integration + PM sentiment (one daily-sheet = one Encord project)
+    encord_project_hash = Column(Text, nullable=True, index=True)
+    sentiment = Column(Text, nullable=True)
+
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(
         TIMESTAMP,

@@ -6,10 +6,7 @@ from app.db.database import Base
 
 
 class MainProject(Base):
-    """
-    Main Project entity for hierarchical project management.
-    Hierarchy: MainProject → SubProject → DailySheet → Allocations
-    """
+
     __tablename__ = "main_projects"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -17,15 +14,14 @@ class MainProject(Base):
     # Core fields
     name = Column(Text, nullable=False)
     program_manager_id = Column(Integer, nullable=True)
-    # Multiple PMs per project; program_manager_id stays as the primary PM for backward compat
+  
     program_manager_ids = Column(JSON, nullable=True, default=list)
     description = Column(Text, nullable=True)
-    # Organization name (formerly "client")
+
     client = Column(Text, nullable=True)
     project_type = Column(Text, nullable=False, default="Full")
     is_annotation = Column(Boolean, default=False, nullable=True)
-    
-    # Timeline
+
     global_start_date = Column(Date, nullable=False)
     tentative_duration_months = Column(Integer, nullable=True)
     

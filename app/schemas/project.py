@@ -100,6 +100,8 @@ class ProjectBase(BaseModel):
     allocated_employees: Optional[int] = 0  # Actual allocations (auto-updated)
     priority: Optional[str] = "medium"
     is_annotation: Optional[bool] = False
+    encord_project_hash: Optional[str] = None  # maps this project to an Encord project
+    sentiment: Optional[str] = None            # PM-maintained sentiment note
 
 
 class ProjectCreate(ProjectBase):
@@ -137,6 +139,8 @@ class ProjectUpdate(BaseModel):
     priority: Optional[str] = None
     project_status: Optional[str] = None
     is_annotation: Optional[bool] = None
+    encord_project_hash: Optional[str] = None
+    sentiment: Optional[str] = None
 
 
 class ProjectResponse(ProjectBase):
