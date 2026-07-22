@@ -101,7 +101,14 @@ class ProjectBase(BaseModel):
     priority: Optional[str] = "medium"
     is_annotation: Optional[bool] = False
     encord_project_hash: Optional[str] = None  # maps this project to an Encord project
-    sentiment: Optional[str] = None            # PM-maintained sentiment note
+    sentiment: Optional[str] = None            # GOOD | AVG | Poor
+    # Team composition (manual, informational)
+    annotators_total: Optional[int] = 0
+    workforce_annotators: Optional[int] = 0
+    autonex_annotators: Optional[int] = 0
+    autonex_reviewers: Optional[int] = 0
+    workforce_reviewers: Optional[int] = 0
+    qc_count: Optional[int] = 0
 
 
 class ProjectCreate(ProjectBase):
@@ -141,6 +148,12 @@ class ProjectUpdate(BaseModel):
     is_annotation: Optional[bool] = None
     encord_project_hash: Optional[str] = None
     sentiment: Optional[str] = None
+    annotators_total: Optional[int] = None
+    workforce_annotators: Optional[int] = None
+    autonex_annotators: Optional[int] = None
+    autonex_reviewers: Optional[int] = None
+    workforce_reviewers: Optional[int] = None
+    qc_count: Optional[int] = None
 
 
 class ProjectResponse(ProjectBase):

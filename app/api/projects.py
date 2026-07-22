@@ -40,6 +40,15 @@ def normalize_project_payload(data: dict, db: Session | None = None) -> dict:
 
     return normalized
 
+
+def _autonex_headcount(source) -> int:
+    """required_manpower = Autonex Annotators + Autonex Reviewers + QC."""
+    def g(name):
+        if isinstance(source, dict):
+            return source.get(name) or 0
+        return getattr(source, name, 0) or 0
+    return int(g("autonex_annotators")) + int(g("autonex_reviewers")) + int(g("qc_count"))
+
 router = APIRouter(
     prefix="/api/sub-projects",
     tags=["sub-projects"],
@@ -127,7 +136,9 @@ def create_project(
     payload: ProjectCreate,
     db: Session = Depends(get_db)
 ):
-    project = Project(**normalize_project_payload(payload.model_dump(), db))
+    data = normalize_project_payload(payload.model_dump(), db)
+    data["required_manpower"] = _autonex_headcount(data)  # auto: Autonex annotators + reviewers + QC
+    project = Project(**data)
     db.add(project)
     db.commit()
     db.refresh(project)
@@ -173,6 +184,9 @@ def update_project(
 
     for key, value in update_data.items():
         setattr(project, key, value)
+
+    # Keep required_manpower in sync with the Autonex headcount
+    project.required_manpower = _autonex_headcount(project)
 
     # Auto-release: when project is completed, delete all allocations
     if new_status == 'completed' and old_status != 'completed':

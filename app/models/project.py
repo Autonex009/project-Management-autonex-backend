@@ -53,7 +53,16 @@ class DailySheet(Base):
 
     # Encord integration + PM sentiment (one daily-sheet = one Encord project)
     encord_project_hash = Column(Text, nullable=True, index=True)
-    sentiment = Column(Text, nullable=True)
+    sentiment = Column(Text, nullable=True)  # GOOD | AVG | Poor
+
+    # Team composition (manual, informational). required_manpower is auto-computed
+    # as autonex_annotators + autonex_reviewers + qc_count.
+    annotators_total = Column(Integer, default=0)
+    workforce_annotators = Column(Integer, default=0)
+    autonex_annotators = Column(Integer, default=0)
+    autonex_reviewers = Column(Integer, default=0)
+    workforce_reviewers = Column(Integer, default=0)
+    qc_count = Column(Integer, default=0)
 
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(

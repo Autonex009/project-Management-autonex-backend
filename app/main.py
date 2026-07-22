@@ -100,6 +100,10 @@ def sync_encord_analytics_schema() -> None:
             alters.append("ALTER TABLE daily_sheets ADD COLUMN encord_project_hash TEXT")
         if "sentiment" not in ds_cols:
             alters.append("ALTER TABLE daily_sheets ADD COLUMN sentiment TEXT")
+        for col in ("annotators_total", "workforce_annotators", "autonex_annotators",
+                    "autonex_reviewers", "workforce_reviewers", "qc_count"):
+            if col not in ds_cols:
+                alters.append(f"ALTER TABLE daily_sheets ADD COLUMN {col} INTEGER DEFAULT 0")
         if alters:
             with engine.begin() as connection:
                 for stmt in alters:
