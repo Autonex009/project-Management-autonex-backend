@@ -77,7 +77,9 @@ class ProjectBase(BaseModel):
     project_type: Optional[str] = "Full"
 
     total_tasks: int = Field(..., ge=0)
-    estimated_time_per_task: float = Field(..., gt=0)
+    estimated_time_per_task: float = Field(..., gt=0)       # annotation time per task (hours)
+    review_time_per_task: Optional[float] = None            # reviewer time per task (hours)
+    gearing_ratio: Optional[float] = None                   # informational
 
     required_expertise: List[str]
     assigned_employee_ids: Optional[List[int]] = []
@@ -100,8 +102,16 @@ class ProjectBase(BaseModel):
     allocated_employees: Optional[int] = 0  # Actual allocations (auto-updated)
     priority: Optional[str] = "medium"
     is_annotation: Optional[bool] = False
+    project_types: Optional[dict] = {}          # { category: subtype }
     encord_project_hash: Optional[str] = None  # maps this project to an Encord project
-    sentiment: Optional[str] = None            # PM-maintained sentiment note
+    sentiment: Optional[str] = None            # GOOD | AVG | Poor
+    # Team composition (manual, informational)
+    annotators_total: Optional[int] = 0
+    workforce_vendors: Optional[List[str]] = []
+    autonex_annotators: Optional[int] = 0
+    autonex_reviewers: Optional[int] = 0
+    workforce_reviewers: Optional[int] = 0
+    qc_count: Optional[int] = 0
 
 
 class ProjectCreate(ProjectBase):
@@ -115,6 +125,8 @@ class ProjectUpdate(BaseModel):
 
     total_tasks: Optional[int] = None
     estimated_time_per_task: Optional[float] = None
+    review_time_per_task: Optional[float] = None
+    gearing_ratio: Optional[float] = None
 
     required_expertise: Optional[List[str]] = None
     assigned_employee_ids: Optional[List[int]] = None
@@ -139,8 +151,15 @@ class ProjectUpdate(BaseModel):
     priority: Optional[str] = None
     project_status: Optional[str] = None
     is_annotation: Optional[bool] = None
+    project_types: Optional[dict] = None
     encord_project_hash: Optional[str] = None
     sentiment: Optional[str] = None
+    annotators_total: Optional[int] = None
+    workforce_vendors: Optional[List[str]] = None
+    autonex_annotators: Optional[int] = None
+    autonex_reviewers: Optional[int] = None
+    workforce_reviewers: Optional[int] = None
+    qc_count: Optional[int] = None
 
 
 class ProjectResponse(ProjectBase):

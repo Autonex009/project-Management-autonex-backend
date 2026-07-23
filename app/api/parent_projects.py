@@ -141,14 +141,10 @@ def create_parent_project(
     parent_project: ParentProjectCreate,
     db: Session = Depends(get_db)
 ):
-    """Create a new parent project."""
-    # Normalize/validate PM fields (supports multiple PMs)
+    """Create a new organization. Only the name is required; a PM is optional
+    (attached automatically when a PM creates it)."""
+    # Normalize PM fields (supports multiple PMs). PMs are optional here.
     data = normalize_pm_fields(db, parent_project.model_dump())
-    if not data["program_manager_ids"]:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="At least one valid Program Manager is required"
-        )
 
     db_parent_project = ParentProject(**data)
     db.add(db_parent_project)

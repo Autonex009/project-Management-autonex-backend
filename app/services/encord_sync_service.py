@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 
 from app.models.project import DailySheet
 from app.models.encord_analytics import EncordDailyTimeSpent
+from app.models.encord_activity import EncordDailyActivity
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,86 @@ def _upsert(db: Session, *, sub_project_id, project_hash, metric_date, user_emai
     return "inserted"
 
 
+def _upsert_activity(db: Session, *, sub_project_id, project_hash, metric_date, user_email,
+                     tasks_submitted=0, labels_created=0, review_actions=0):
+    row = (
+        db.query(EncordDailyActivity)
+        .filter(
+            EncordDailyActivity.encord_project_hash == project_hash,
+            EncordDailyActivity.metric_date == metric_date,
+            EncordDailyActivity.user_email == user_email,
+        )
+        .first()
+    )
+    if row:
+        row.tasks_submitted = tasks_submitted
+        row.labels_created = labels_created
+        row.review_actions = review_actions
+        row.sub_project_id = sub_project_id
+        return "updated"
+    db.add(EncordDailyActivity(
+        sub_project_id=sub_project_id,
+        encord_project_hash=project_hash,
+        metric_date=metric_date,
+        user_email=user_email,
+        tasks_submitted=tasks_submitted,
+        labels_created=labels_created,
+        review_actions=review_actions,
+    ))
+    return "inserted"
+
+
+def _sync_project_activity(db: Session, project, sp, start: datetime, end: datetime) -> int:
+    """Pull task actions + label logs for one project; upsert per (day, user). Returns row count."""
+    # (day, user) -> {"tasks": n, "labels": n, "review": n}
+    agg: dict[tuple, dict] = {}
+
+    def bucket(day, email):
+        return agg.setdefault((day, email), {"tasks": 0, "labels": 0, "review": 0})
+
+    # Task actions: SUBMIT -> tasks; APPROVE/REJECT -> review actions.
+    try:
+        from encord.orm.analytics import TaskActionType
+        for win_start, win_end in _windows(start, end):
+            for act in project.get_task_actions(after=win_start, before=win_end):
+                email = getattr(act, "actor_email", None)
+                ts = getattr(act, "timestamp", None)
+                if not email or ts is None:
+                    continue
+                day = ts.date()
+                atype = getattr(act, "action_type", None)
+                b = bucket(day, email)
+                if atype == TaskActionType.SUBMIT:
+                    b["tasks"] += 1
+                elif atype in (TaskActionType.APPROVE, TaskActionType.REJECT):
+                    b["review"] += 1
+    except Exception as exc:
+        logger.warning("[encord_sync] task actions for %s skipped: %s", sp.id, exc)
+
+    # Label logs: ADD -> labels created.
+    try:
+        from encord.orm.label_log import Action
+        for win_start, win_end in _windows(start, end):
+            for log in project.get_label_logs(after=win_start, before=win_end):
+                email = getattr(log, "user_email", None)
+                created = getattr(log, "created_at", None)
+                if not email or created is None:
+                    continue
+                day = created.date()
+                if getattr(log, "action", None) == Action.ADD:
+                    bucket(day, email)["labels"] += 1
+    except Exception as exc:
+        logger.warning("[encord_sync] label logs for %s skipped: %s", sp.id, exc)
+
+    for (day, email), b in agg.items():
+        _upsert_activity(
+            db, sub_project_id=sp.id, project_hash=sp.encord_project_hash,
+            metric_date=day, user_email=email,
+            tasks_submitted=b["tasks"], labels_created=b["labels"], review_actions=b["review"],
+        )
+    return len(agg)
+
+
 def run_sync(db: Session, start: datetime | None = None, end: datetime | None = None) -> dict:
     """Pull time-spent for all mapped projects and upsert daily rows. Returns a summary."""
     if start is None or end is None:
@@ -162,9 +243,13 @@ def run_sync(db: Session, start: datetime | None = None, end: datetime | None = 
                     user_email=email, role=bucket["role"], stage=stage, seconds=bucket["seconds"],
                 )
                 summary[outcome] += 1
+
+            # Also pull tasks-submitted / labels-created / review actions.
+            activity_rows = _sync_project_activity(db, project, sp, start, end)
+
             db.commit()
             summary["projects"] += 1
-            summary["details"].append({"sub_project_id": sp.id, "encord_project_hash": phash, "rows": len(agg)})
+            summary["details"].append({"sub_project_id": sp.id, "encord_project_hash": phash, "rows": len(agg), "activity_rows": activity_rows})
         except Exception as exc:
             db.rollback()
             summary["errors"] += 1
