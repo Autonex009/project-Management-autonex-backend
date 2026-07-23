@@ -32,7 +32,9 @@ class DailySheet(Base):
     project_type = Column(Text, nullable=False)
 
     total_tasks = Column(Integer, nullable=False)
-    estimated_time_per_task = Column(Float, nullable=False)
+    estimated_time_per_task = Column(Float, nullable=False)   # annotation time per task (hours)
+    review_time_per_task = Column(Float, nullable=True)       # reviewer time per task (hours)
+    gearing_ratio = Column(Float, nullable=True)              # informational (e.g. 3, 3.1)
 
     required_expertise = Column(JSON, nullable=True)
     assigned_employee_ids = Column(JSON, nullable=True, default=[])
@@ -48,6 +50,9 @@ class DailySheet(Base):
     allocated_employees = Column(Integer, default=0)
 
     is_annotation = Column(Boolean, default=False, nullable=True)
+    # Project type classification: { category: subtype }, e.g.
+    # {"Data Modalities": "Video", "Annotation Types (By Data)": "Classification"}
+    project_types = Column(JSON, nullable=True, default=dict)
     priority = Column(Text, default="medium")
     project_status = Column(Text, default="active")
 
@@ -58,7 +63,7 @@ class DailySheet(Base):
     # Team composition (manual, informational). required_manpower is auto-computed
     # as autonex_annotators + autonex_reviewers + qc_count.
     annotators_total = Column(Integer, default=0)
-    workforce_annotators = Column(Integer, default=0)
+    workforce_vendors = Column(JSON, nullable=True, default=list)   # list of vendor names
     autonex_annotators = Column(Integer, default=0)
     autonex_reviewers = Column(Integer, default=0)
     workforce_reviewers = Column(Integer, default=0)

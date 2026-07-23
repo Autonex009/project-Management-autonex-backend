@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -15,6 +15,7 @@ from app.api.allocations import router as allocation_router
 from app.api.leaves import router as leave_router
 from app.api.employees import router as employee_router
 from app.api.skills import router as skills_router
+from app.api.vendors import router as vendors_router
 from app.api.auth import router as auth_router
 from app.api.parent_projects import router as parent_projects_router
 from app.api.recommendations import router as recommendations_router
@@ -104,6 +105,14 @@ def sync_encord_analytics_schema() -> None:
                     "autonex_reviewers", "workforce_reviewers", "qc_count"):
             if col not in ds_cols:
                 alters.append(f"ALTER TABLE daily_sheets ADD COLUMN {col} INTEGER DEFAULT 0")
+        for col in ("review_time_per_task", "gearing_ratio"):
+            if col not in ds_cols:
+                alters.append(f"ALTER TABLE daily_sheets ADD COLUMN {col} DOUBLE PRECISION")
+        # Workforce is now a list of vendors (JSON) instead of an integer count.
+        if "workforce_vendors" not in ds_cols:
+            alters.append("ALTER TABLE daily_sheets ADD COLUMN workforce_vendors JSON")
+        if "project_types" not in ds_cols:
+            alters.append("ALTER TABLE daily_sheets ADD COLUMN project_types JSON")
         if alters:
             with engine.begin() as connection:
                 for stmt in alters:
@@ -683,6 +692,7 @@ app.include_router(allocation_router)
 app.include_router(leave_router)
 app.include_router(employee_router)
 app.include_router(skills_router)
+app.include_router(vendors_router) 
 app.include_router(auth_router)
 app.include_router(parent_projects_router)
 app.include_router(recommendations_router)
