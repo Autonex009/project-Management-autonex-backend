@@ -27,6 +27,10 @@ class Employee(Base):
 
     slack_user_id = Column(String(64), nullable=True)
 
+    # Encord account email/identity. Matches encord_daily_time_spent.user_email so
+    # analytics can resolve an Encord user to this employee's real name.
+    encord_id = Column(Text, nullable=True, index=True)
+
     # Profile picture URL (uploaded file under /uploads/avatars or a remote Slack/Razorpay URL)
     avatar_url = Column(Text, nullable=True)
 
