@@ -11,15 +11,15 @@ class ParentProjectBase(BaseModel):
     description: Optional[str] = Field(None, description="Scope of work")
     client: Optional[str] = Field(None, description="Organization name")
     project_type: str = Field("Full", description="Project type: Full, POC, Side")
-    global_start_date: date = Field(..., description="Project start date")
+    global_start_date: Optional[date] = Field(None, description="Project start date")
     tentative_duration_months: Optional[int] = Field(None, ge=1, description="Expected duration in months")
     status: Optional[str] = Field("active", description="Status: active, completed, archived")
     is_annotation: Optional[bool] = Field(False, description="Flag indicating if this is an annotation project")
 
 
 class ParentProjectCreate(ParentProjectBase):
-    """Schema for creating a new parent project. Requires at least one PM
-    (either program_manager_id or a non-empty program_manager_ids list)."""
+    """Schema for creating a new organization. Only `name` is required; a PM is
+    optional (attached automatically when a PM creates the organization)."""
     pass
 
 

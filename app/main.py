@@ -58,6 +58,11 @@ def sync_main_project_schema() -> None:
     if "program_manager_ids" not in columns:
         statements.append("ALTER TABLE main_projects ADD COLUMN program_manager_ids JSON")
 
+    # An organization is just a name + optional PM(s); it no longer requires a
+    # start date, so relax the legacy NOT NULL constraint if present.
+    if "global_start_date" in columns and engine.dialect.name == "postgresql":
+        statements.append("ALTER TABLE main_projects ALTER COLUMN global_start_date DROP NOT NULL")
+
     if not statements:
         return
 

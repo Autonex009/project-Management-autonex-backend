@@ -22,7 +22,7 @@ class MainProject(Base):
     project_type = Column(Text, nullable=False, default="Full")
     is_annotation = Column(Boolean, default=False, nullable=True)
 
-    global_start_date = Column(Date, nullable=False)
+    global_start_date = Column(Date, nullable=True)
     tentative_duration_months = Column(Integer, nullable=True)
     
     # Status: active, completed, archived
