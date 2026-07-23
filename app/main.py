@@ -6,7 +6,7 @@ from pathlib import Path
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -124,6 +124,10 @@ def sync_encord_analytics_schema() -> None:
             with engine.begin() as connection:
                 connection.execute(text("DROP TABLE IF EXISTS encord_daily_time_spent"))
             encord_analytics.Base.metadata.tables["encord_daily_time_spent"].create(bind=engine)
+
+    # Per-user daily activity (tasks/labels) table.
+    if "encord_daily_activity" not in tables:
+        encord_activity.Base.metadata.tables["encord_daily_activity"].create(bind=engine)
 
 
 sync_encord_analytics_schema()

@@ -12,9 +12,10 @@ logger = logging.getLogger(__name__)
 
 _scheduler = BackgroundScheduler()
 
-# How often to pull Encord analytics (minutes). Frequent + small window keeps
-# the dashboard near-real-time; upsert makes re-pulling the same day idempotent.
-ENCORD_SYNC_MINUTES = int(os.getenv("ENCORD_SYNC_MINUTES", "10"))
+# Encord analytics are pulled once a day, at end of day. Hour is 24h local time
+# (default 23:30). Upsert makes the pull idempotent if re-run.
+ENCORD_SYNC_HOUR = int(os.getenv("ENCORD_SYNC_HOUR", "23"))
+ENCORD_SYNC_MINUTE = int(os.getenv("ENCORD_SYNC_MINUTE", "30"))
 
 
 def _scheduled_hiring_sync() -> None:
@@ -34,8 +35,8 @@ def _scheduled_hiring_sync() -> None:
 def _scheduled_encord_sync() -> None:
     db = SessionLocal()
     try:
-        # Pull yesterday 00:00 → now every run: keeps today live and captures
-        # late edits to yesterday. Upsert makes repeated same-day pulls idempotent.
+        # Daily end-of-day pull: cover the full current day (00:00 → now) plus
+        # yesterday to capture late edits. Upsert makes repeated pulls idempotent.
         now = datetime.now()
         start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         result = run_encord_sync(db, start=start, end=now)
@@ -50,16 +51,16 @@ def _scheduled_encord_sync() -> None:
 
 
 def start_scheduler() -> None:
-    # Encord analytics pull every ENCORD_SYNC_MINUTES (default 10), running once on
-    # startup. max_instances=1 + coalesce so slow runs never pile up.
+    # Encord analytics pull once a day at end of day (ENCORD_SYNC_HOUR:MINUTE).
+    # max_instances=1 + coalesce so a slow run never overlaps the next.
     if not _scheduler.get_job("encord_sync"):
         _scheduler.add_job(
             _scheduled_encord_sync,
-            trigger="interval",
-            minutes=ENCORD_SYNC_MINUTES,
+            trigger="cron",
+            hour=ENCORD_SYNC_HOUR,
+            minute=ENCORD_SYNC_MINUTE,
             id="encord_sync",
             replace_existing=True,
-            next_run_time=datetime.now(),
             max_instances=1,
             coalesce=True,
         )
