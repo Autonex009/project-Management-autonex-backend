@@ -40,4 +40,4 @@ def sync(payload: Optional[SyncRange] = None, db: Session = Depends(get_db)):
     try:
         return encord_sync_service.run_sync(db, start=start, end=end)
     except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc))
