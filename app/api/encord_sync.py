@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.services.auth_service import require_role
 from app.services import encord_sync_service
+from arq.jobs import Job, JobStatus
 
 router = APIRouter(prefix="/api/encord", tags=["Encord Sync"], dependencies=[Depends(require_role("admin"))])
 
@@ -72,3 +73,30 @@ async def sync(request: Request, payload: Optional[SyncRange] = None):
         "job_id": job.job_id,
         "status": "processing"
     }
+
+@router.get("/sync/status/{job_id}")
+async def get_sync_status(request: Request, job_id: str):
+    """Check the status of a background ARQ job."""
+    redis = request.app.state.redis_pool
+    job = Job(job_id, redis)
+    
+    # Get current status (queued, in_progress, complete, not_found)
+    status = await job.status()
+    
+    if status == JobStatus.not_found:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    # Get job execution info (result, errors, etc.)
+    info = await job.info()
+    
+    response = {
+        "job_id": job_id,
+        "status": status.value,
+    }
+    
+    # If the job is done, attach the final result or error
+    if status == JobStatus.complete and info:
+        response["success"] = info.success
+        response["result"] = info.result  # This will be whatever your worker returns
+        
+    return response
