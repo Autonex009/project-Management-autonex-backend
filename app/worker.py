@@ -7,6 +7,8 @@ from arq.connections import RedisSettings
 
 # Import your DB and sync service
 from app.db.database import SessionLocal
+from app.db.database import Base, engine
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor
 from app.services import encord_sync_service
 
 logger = logging.getLogger(__name__)
