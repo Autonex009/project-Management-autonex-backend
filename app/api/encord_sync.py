@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -23,11 +23,30 @@ def preview(db: Session = Depends(get_db)):
     return encord_sync_service.preview(db)
 
 
-@router.post("/sync")
-def sync(payload: Optional[SyncRange] = None, db: Session = Depends(get_db)):
+# @router.post("/sync")
+# def sync(payload: Optional[SyncRange] = None, db: Session = Depends(get_db)):
+#     """
+#     Trigger an Encord pull now. Optional date_from/date_to (YYYY-MM-DD) for a backfill;
+#     otherwise the previous day is pulled. The same logic runs daily via the scheduler.
+#     """
+#     start = end = None
+#     if payload and payload.date_from:
+#         try:
+#             start = datetime.strptime(payload.date_from, "%Y-%m-%d")
+#             end = (datetime.strptime(payload.date_to, "%Y-%m-%d")
+#                    if payload.date_to else datetime.now())
+#         except ValueError:
+#             raise HTTPException(status_code=400, detail="Dates must be YYYY-MM-DD")
+#     try:
+#         return encord_sync_service.run_sync(db, start=start, end=end)
+#     except RuntimeError as exc:
+#         raise HTTPException(status_code=500, detail=str(exc))
+
+# 1. Add status_code=202 (Accepted)
+@router.post("/sync", status_code=202)
+async def sync(request: Request, payload: Optional[SyncRange] = None):
     """
-    Trigger an Encord pull now. Optional date_from/date_to (YYYY-MM-DD) for a backfill;
-    otherwise the previous day is pulled. The same logic runs daily via the scheduler.
+    Validates input and pushes the sync job to the Redis queue.
     """
     start = end = None
     if payload and payload.date_from:
@@ -37,7 +56,19 @@ def sync(payload: Optional[SyncRange] = None, db: Session = Depends(get_db)):
                    if payload.date_to else datetime.now())
         except ValueError:
             raise HTTPException(status_code=400, detail="Dates must be YYYY-MM-DD")
-    try:
-        return encord_sync_service.run_sync(db, start=start, end=end)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=502, detail=str(exc))
+            
+    # 2. Access the Redis pool attached to the app state in main.py
+    redis = request.app.state.redis_pool
+    
+    # 3. Enqueue the job. The string "run_encord_sync" MUST match the async function name in worker.py
+    job = await redis.enqueue_job("run_encord_sync", start, end)
+    
+    if not job:
+        raise HTTPException(status_code=500, detail="Failed to enqueue sync job in Redis.")
+    
+    # 4. Return immediately while the worker handles the heavy lifting
+    return {
+        "message": "Sync job accepted and enqueued.", 
+        "job_id": job.job_id,
+        "status": "processing"
+    }

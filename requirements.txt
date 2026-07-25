@@ -17,3 +17,5 @@ google-genai>=0.2.0
 sse-starlette>=2.0.0
 numpy>=1.26.0
 encord>=0.1.150
+arq>=0.25.0
+redis>=5.0.0

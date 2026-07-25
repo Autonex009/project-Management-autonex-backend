@@ -2,6 +2,8 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+from arq import create_pool
+from arq.connections import RedisSettings
 
 from sqlalchemy import inspect, text
 
@@ -649,6 +651,10 @@ seed_skills()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # --- ARQ REDIS POOL SETUP ---
+    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+    app.state.redis_pool = await create_pool(RedisSettings.from_dsn(redis_url))
+
     # Initialize knowledge base for the chat RAG pipeline
     try:
         from app.services.knowledge_service import initialize_knowledge_base
@@ -660,10 +666,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Scheduler start skipped: %s", e)
     yield
+    
+    # --- TEARDOWN ---
     try:
         shutdown_scheduler()
     except Exception:
         pass
+        
+    # Close ARQ Redis pool gracefully
+    if hasattr(app.state, "redis_pool"):
+        await app.state.redis_pool.close()
 
 
 app = FastAPI(title="Autonex Resource Planning Tool V2", lifespan=lifespan)
