@@ -80,8 +80,9 @@ def start_scheduler() -> None:
         _scheduler.start()
 
     logger.info(
-        "[scheduler] Started — Encord sync every %s min; hiring sync %s",
-        ENCORD_SYNC_MINUTES,
+        "[scheduler] Started — Encord sync daily at %02d:%02d; hiring sync %s",
+        ENCORD_SYNC_HOUR,
+        ENCORD_SYNC_MINUTE,
         "ENABLED (every 12h)" if os.getenv("ENABLE_HIRING_SYNC") else "disabled",
     )
 
