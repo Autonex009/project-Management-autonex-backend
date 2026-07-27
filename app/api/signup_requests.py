@@ -28,7 +28,7 @@ from app.services.identity_validator import check_duplicate_identity
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/signup-requests", tags=["signup-requests"])
 
-PORTAL_URL = "https://autonex-frontend.vercel.app/login/employee"
+PORTAL_URL = "https://pmportal.autonexai360.com/login/employee"
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
