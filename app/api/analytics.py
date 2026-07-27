@@ -35,6 +35,19 @@ def is_autonex_email(email: str | None) -> bool:
     return bool(email) and email.lower().endswith(AUTONEX_EMAIL_SUFFIX)
 
 
+# Annotator / reviewer HEAD-COUNTS are classified by the Encord workflow stage the
+# person actually worked in (not their permission role) — a user tagged TEAM_MANAGER
+# who logs time in a "Review" stage is a reviewer for counting purposes. This is what
+# makes the per-project counts reflect real work instead of showing 0 when everyone
+# happens to hold a manager/admin role.
+def _is_annotation_stage(stage: str | None) -> bool:
+    return "annotate" in (stage or "").lower()
+
+
+def _is_review_stage(stage: str | None) -> bool:
+    return "review" in (stage or "").lower()
+
+
 def _range_start(range_key: str | None, today: date) -> date:
     """Map a range key (1|7|30) to an inclusive start date."""
     days = {"1": 1, "7": 7, "30": 30}.get(str(range_key or "7"), 7)
@@ -199,16 +212,45 @@ def summary(db: Session = Depends(get_db)):
         du_seconds: dict = defaultdict(int)
         du_role: dict = {}
         people = set()
+        # Autonex-only (billing) accumulators. Active annotator/reviewer is decided
+        # by the workflow STAGE worked in: a (day, user) counts toward annotators if
+        # its annotation-stage seconds that day exceed the threshold, toward reviewers
+        # likewise for review stages. Someone who both annotates and reviews counts in
+        # both (two independent head-counts, never summed).
+        ax_total = 0
+        ax_people = set()
+        ax_ann_day: dict = defaultdict(int)   # (date, user) -> annotator-role secs
+        ax_rev_day: dict = defaultdict(int)   # (date, user) -> reviewer-role secs
         for r in rows:
-            total_seconds += r.time_spent_seconds or 0
+            secs = r.time_spent_seconds or 0
+            total_seconds += secs
             people.add(r.user_email)
-            du_seconds[(r.metric_date, r.user_email)] += r.time_spent_seconds or 0
+            du_seconds[(r.metric_date, r.user_email)] += secs
             if r.project_user_role:
                 du_role[(r.metric_date, r.user_email)] = r.project_user_role
+            if is_autonex_email(r.user_email):
+                ax_total += secs
+                ax_people.add(r.user_email)
+                key = (r.metric_date, r.user_email)
+                if _is_annotation_stage(r.workflow_stage):
+                    ax_ann_day[key] += secs
+                if _is_review_stage(r.workflow_stage):
+                    ax_rev_day[key] += secs
         active_users = {
             u for (d, u), secs in du_seconds.items()
             if secs > ACTIVE_THRESHOLD_SECONDS and du_role.get((d, u)) in ANNOTATOR_ROLES
         }
+        ax_annotators = {u for (d, u), s in ax_ann_day.items() if s > ACTIVE_THRESHOLD_SECONDS}
+        ax_reviewers = {u for (d, u), s in ax_rev_day.items() if s > ACTIVE_THRESHOLD_SECONDS}
+        # Mutually exclusive buckets so the columns sum cleanly: a person is either
+        # annotation-only, review-only, or both. (Sum = everyone who did >1h of stage
+        # work; ax_people may be larger — it also counts sub-threshold / other stages.)
+        ax_both = ax_annotators & ax_reviewers
+        ax_ann_only = ax_annotators - ax_reviewers
+        ax_rev_only = ax_reviewers - ax_annotators
+        # Resolve Encord emails -> employee display names (falls back to the email).
+        names_map = _names_for(db, ax_annotators | ax_reviewers)
+        disp = lambda emails: sorted(names_map.get(e, e) for e in emails)
         out.append({
             "project_id": sp.id,
             "name": sp.name,
@@ -218,9 +260,21 @@ def summary(db: Session = Depends(get_db)):
             "month_platform_hours": _hours(total_seconds),
             "active_annotators": len(active_users),
             "people_involved": len(people),
+            # Autonex-only billing figures (team members: *_theta@encord.ai)
+            "autonex_platform_hours": _hours(ax_total),
+            "autonex_active_annotators": len(ax_annotators),
+            "autonex_active_reviewers": len(ax_reviewers),
+            # Mutually exclusive head-count buckets (+ names for hover)
+            "autonex_annotator_only": len(ax_ann_only),
+            "autonex_reviewer_only": len(ax_rev_only),
+            "autonex_both": len(ax_both),
+            "autonex_annotator_only_names": disp(ax_ann_only),
+            "autonex_reviewer_only_names": disp(ax_rev_only),
+            "autonex_both_names": disp(ax_both),
+            "autonex_people": len(ax_people),
             "sentiment": sp.sentiment,
         })
-    out.sort(key=lambda p: p["month_platform_hours"], reverse=True)
+    out.sort(key=lambda p: p["autonex_platform_hours"], reverse=True)
     return out
 
 
@@ -246,17 +300,31 @@ def _autonex_kpis(db: Session, *, start: date, end: date, project_hash: str | No
     annotation_seconds = 0
     review_seconds = 0
     daily_seconds: dict = defaultdict(int)
+    people = set()
+    ann_day: dict = defaultdict(int)   # (date, user) -> annotator-role secs that day
+    rev_day: dict = defaultdict(int)   # (date, user) -> reviewer-role secs that day
     for r in time_q.all():
         if not is_autonex_email(r.user_email):
             continue
         secs = r.time_spent_seconds or 0
         total_seconds += secs
         daily_seconds[r.metric_date] += secs
+        people.add(r.user_email)
         role = (r.project_user_role or "").upper()
+        key = (r.metric_date, r.user_email)
+        # Hours split by role (unchanged); head-counts by workflow stage.
         if role in ANNOTATOR_ROLES:
             annotation_seconds += secs
         if role in REVIEWER_ROLES:
             review_seconds += secs
+        if _is_annotation_stage(r.workflow_stage):
+            ann_day[key] += secs
+        if _is_review_stage(r.workflow_stage):
+            rev_day[key] += secs
+
+    # Distinct people, active = >1h of annotation- (or review-) stage work on a day.
+    active_annotators = len({u for (d, u), s in ann_day.items() if s > ACTIVE_THRESHOLD_SECONDS})
+    active_reviewers = len({u for (d, u), s in rev_day.items() if s > ACTIVE_THRESHOLD_SECONDS})
 
     tasks_submitted = 0
     labels_created = 0
@@ -282,6 +350,9 @@ def _autonex_kpis(db: Session, *, start: date, end: date, project_hash: str | No
             "labels_created": labels_created,
             "avg_minutes_per_task": avg_minutes_per_task,
             "review_hours": _hours(review_seconds),
+            "active_annotators": active_annotators,
+            "active_reviewers": active_reviewers,
+            "people": len(people),
         },
         "daily": daily,
     }
@@ -326,12 +397,24 @@ def autonex_overview(db: Session = Depends(get_db)):
 
     user_seconds: dict = defaultdict(int)
     project_seconds: dict = defaultdict(int)
+    ann_day: dict = defaultdict(int)   # (date, user) -> annotator-role secs that day
+    rev_day: dict = defaultdict(int)   # (date, user) -> reviewer-role secs that day
     for r in rows:
         if not is_autonex_email(r.user_email):
             continue
         secs = r.time_spent_seconds or 0
         user_seconds[r.user_email] += secs
         project_seconds[r.encord_project_hash] += secs
+        key = (r.metric_date, r.user_email)
+        if _is_annotation_stage(r.workflow_stage):
+            ann_day[key] += secs
+        if _is_review_stage(r.workflow_stage):
+            rev_day[key] += secs
+
+    # Distinct people, deduped across every project. Active = >1h of annotation- (or
+    # review-) stage work on at least one day. Someone who does both counts in both.
+    active_annotators = {u for (d, u), s in ann_day.items() if s > ACTIVE_THRESHOLD_SECONDS}
+    active_reviewers = {u for (d, u), s in rev_day.items() if s > ACTIVE_THRESHOLD_SECONDS}
 
     name_by_email = _names_for(db, user_seconds.keys())
     top_users = [
@@ -353,6 +436,9 @@ def autonex_overview(db: Session = Depends(get_db)):
     return {
         "range": {"from": start.isoformat(), "to": today.isoformat()},
         "autonex_total_hours": _hours(sum(user_seconds.values())),
+        "active_annotators": len(active_annotators),
+        "active_reviewers": len(active_reviewers),
+        "autonex_people": len(user_seconds),
         "top_users": top_users,
         "top_projects": top_projects,
     }

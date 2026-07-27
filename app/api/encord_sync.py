@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from arq.jobs import Job, JobStatus
 
 from app.db.database import get_db
 from app.services.auth_service import require_role
