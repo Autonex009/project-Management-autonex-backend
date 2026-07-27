@@ -159,8 +159,8 @@ def send_signup_approved_email(*, to_email: str, to_name: str, temp_password: st
       </div>
       <a href="{portal_url}" class="btn">Sign In Now</a>
       <p style="font-size:13px;color:#6b7280;margin-top:14px;">
-        Reset password: <a href="https://autonex-frontend.vercel.app/forgot-password" style="color:#2b67ff;">
-        autonex-frontend.vercel.app/forgot-password</a>
+        Reset password: <a href="https://pmportal.autonexai360.com/forgot-password" style="color:#2b67ff;">
+        pmportal.autonexai360.com/forgot-password</a>
       </p>
       <p>If you have any questions, reach out in <strong>#autonex-tool-support</strong> on Slack.</p>
       <p>Best regards,<br><strong>The Autonex AI Team</strong></p>
