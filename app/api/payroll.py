@@ -19,6 +19,7 @@ import os
 import json
 import hmac
 import hashlib
+from types import SimpleNamespace
 from calendar import monthrange
 from datetime import date as date_type, timedelta
 from typing import List, Optional
@@ -396,7 +397,7 @@ def preview_payroll(
 
     employees_by_name = {
         _normalize_name(e.name): e
-        for e in db.query(Employee).filter(Employee.status == "active").all()
+        for e in db.query(Employee).all()
     }
 
     # Monthly Pay is driven entirely from the `salary` table (the Pay tab's source
@@ -456,10 +457,31 @@ def preview_payroll(
         # employee_id to attach leaves/bonuses to, so skip (admin adds them separately).
         emp = employees_by_name.get(_normalize_name(salary_row.full_name))
         if emp is None:
+            # Orphan salary row: an Active row whose name matches no employee.
+            # Show it in the run anyway (base pay decrypts to its real number,
+            # or 0 if it can't be decrypted) with no leaves or bonuses. A negative
+            # sentinel id keeps it distinct on the frontend and can never collide
+            # with a real employee id. To drop it from the run, an admin marks the
+            # row Inactive on the Pay tab (Inactive rows are excluded above).
+            orphan_base = _read_pay(salary_row.base_pay_monthly) or 0.0
+            orphan_emp = SimpleNamespace(
+                id=-(salary_row.id),
+                name=salary_row.full_name or "(unnamed salary row)",
+                designation=None,
+                employee_type=salary_row.employment_type,
+            )
+            orphan_row = _build_employee_row(
+                orphan_emp, [], working_days, {},
+                None, base_salary=orphan_base,
+                bonus_limit=0.0, bonus=0.0, additional_payment=0.0,
+            )
+            orphan_row["salary_missing"] = False
+            orphan_row["is_orphan"] = True
+            rows.append(orphan_row)
             continue
         emp_base_salary = _read_pay(salary_row.base_pay_monthly)
         if emp_base_salary is None:
-            continue
+            emp_base_salary = 0.0
         # Bonus cap comes from the salary table; the granted amount (if any) is saved on the run.
         emp_bonus_limit = _read_pay(salary_row.opt_bonus_monthly) or 0.0
         emp_bonus = saved_bonuses.get(emp.id, 0.0)
@@ -531,7 +553,7 @@ def preview_payroll(
         rows.append(row)
 
     # Salary-driven iteration is no longer name-sorted; restore alphabetical order.
-    rows.sort(key=lambda r: r["employee_name"])
+    rows.sort(key=lambda r: (r["employee_name"] or "").lower())
 
     return {
         "month": month,
@@ -645,6 +667,10 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
         amount = max(0.0, ap.amount or 0.0)
         if amount <= 0:
             continue
+        # Orphan salary rows surface in the run with a negative sentinel id and no
+        # real employee — skip any payment aimed at one so we never hit an FK error.
+        if ap.employee_id not in emp_name_by_id:
+            continue
         db.add(PayrollAdditionalPayment(
             payroll_run_id=run.id,
             employee_id=ap.employee_id,
@@ -742,7 +768,7 @@ def list_salaries(db: Session = Depends(get_db)):
     """
     employees = (
         db.query(Employee)
-        .filter(Employee.status == "active")
+        .filter(Employee.status != "archived")
         .order_by(Employee.name)
         .all()
     )
@@ -805,16 +831,70 @@ def _salary_table_record(row: Salary) -> dict:
     }
 
 
+def _ensure_salary_rows_for_active_employees(db: Session) -> int:
+    """Back-fill a `salary` row for every active employee that lacks one.
+
+    Monthly Pay only ever includes people who already have a salary row, so a
+    newly-added employee stays invisible there until someone sets their pay. To
+    avoid that, each time the Payroll page loads we make sure every active
+    employee has a row, seeding it with a base monthly pay of 0 (the minimum) —
+    enough to make them appear in the run; an admin then edits the real figure.
+
+    Matching is by normalized name. EXISTING rows are never modified — in
+    particular the rows whose ciphertext predates the current key are left
+    untouched. No-op when SALARY_KEY is unset (we can't write encrypted pay).
+
+    Returns the number of rows created.
+    """
+    if not encryption_enabled():
+        return 0
+
+    existing_names = {_normalize_name(s.full_name) for s in db.query(Salary).all()}
+    active_employees = db.query(Employee).filter(Employee.status != "archived").all()
+    missing = [e for e in active_employees if _normalize_name(e.name) not in existing_names]
+    if not missing:
+        return 0
+
+    next_id = (db.query(func.max(Salary.id)).scalar() or 0) + 1
+    zero = encrypt_salary(0)  # valid ciphertext for 0.0; decrypts back to 0.0
+    seen = set()
+    created = 0
+    for emp in missing:
+        key = _normalize_name(emp.name)
+        if key in seen:  # guard against two active employees sharing a name
+            continue
+        seen.add(key)
+        db.add(Salary(
+            id=next_id,
+            full_name=emp.name,
+            status="Active",
+            employment_type=emp.employee_type,
+            base_pay_monthly=zero,
+            base_pay_annual=zero,
+            opt_bonus_monthly=None,
+            optional_bonus_annual=None,
+        ))
+        next_id += 1
+        created += 1
+
+    if created:
+        db.commit()
+    return created
+
+
 @router.get("/salary-records")
 def list_salary_records(db: Session = Depends(get_db)):
     """List every active employee, matched to their salary row where one exists.
 
-    Employees with no matching row yet come back as an "unset" record (id=None)
-    so the Pay tab can surface them and let an admin fill in their pay. Salary
-    rows that don't match any active employee (e.g. departed staff, name
-    mismatches) are still appended so nothing silently disappears from the tab.
+    Before listing, we back-fill a salary row (base pay 0) for any active
+    employee that doesn't have one yet, so everyone shows up here and in the
+    Monthly Pay run. Salary rows that don't match any active employee (e.g.
+    departed staff, name mismatches) are still appended so nothing silently
+    disappears from the tab.
     """
-    employees = db.query(Employee).filter(Employee.status == "active").order_by(Employee.name).all()
+    _ensure_salary_rows_for_active_employees(db)
+
+    employees = db.query(Employee).filter(Employee.status != "archived").order_by(Employee.name).all()
     salary_by_name = {_normalize_name(s.full_name): s for s in db.query(Salary).order_by(Salary.id).all()}
 
     records = []
