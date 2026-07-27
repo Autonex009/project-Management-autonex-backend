@@ -4,6 +4,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from sqlalchemy import inspect, text
+from arq import create_pool
+from arq.connections import RedisSettings
 
 from app.db.database import Base, engine
 from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor
@@ -649,6 +651,15 @@ seed_skills()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ARQ Redis pool for background jobs (e.g. the manual Encord sync). Wrapped so the
+    # app still boots if Redis is unreachable — sync endpoints then return 503 until
+    # Redis + the worker are up.
+    app.state.redis_pool = None
+    try:
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+        app.state.redis_pool = await create_pool(RedisSettings.from_dsn(redis_url))
+    except Exception as e:
+        logger.warning("ARQ Redis pool init skipped: %s", e)
     # Initialize knowledge base for the chat RAG pipeline
     try:
         from app.services.knowledge_service import initialize_knowledge_base
@@ -664,6 +675,11 @@ async def lifespan(app: FastAPI):
         shutdown_scheduler()
     except Exception:
         pass
+    if getattr(app.state, "redis_pool", None):
+        try:
+            await app.state.redis_pool.close()
+        except Exception:
+            pass
 
 
 app = FastAPI(title="Autonex Resource Planning Tool V2", lifespan=lifespan)
