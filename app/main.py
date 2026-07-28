@@ -654,8 +654,17 @@ seed_skills()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- ARQ REDIS POOL SETUP ---
-    redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
-    app.state.redis_pool = await create_pool(RedisSettings.from_dsn(redis_url))
+    # Only attempt Redis when REDIS_URL is set. On Railway it's injected (background
+    # job queue used). On Vercel/serverless (and local dev) it's absent, so we skip
+    # entirely — no connection attempt, no cold-start penalty — and /sync falls back
+    # to running inline. Wrapped so a transient Redis error never blocks startup.
+    app.state.redis_pool = None
+    redis_url = os.getenv("REDIS_URL")
+    if redis_url:
+        try:
+            app.state.redis_pool = await create_pool(RedisSettings.from_dsn(redis_url))
+        except Exception as e:
+            logger.warning("ARQ Redis pool unavailable — /sync will run inline: %s", e)
 
     # Initialize knowledge base for the chat RAG pipeline
     try:
@@ -668,16 +677,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning("Scheduler start skipped: %s", e)
     yield
-    
+
     # --- TEARDOWN ---
     try:
         shutdown_scheduler()
     except Exception:
         pass
-        
-    # Close ARQ Redis pool gracefully
-    if hasattr(app.state, "redis_pool"):
-        await app.state.redis_pool.close()
+
+    # Close ARQ Redis pool gracefully (only if it connected).
+    if getattr(app.state, "redis_pool", None):
+        try:
+            await app.state.redis_pool.close()
+        except Exception:
+            pass
 
 
 app = FastAPI(title="Autonex Resource Planning Tool V2", lifespan=lifespan)
