@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from app.services.auth_service import get_current_user, require_role
+from app.services.storage_service import delete_guideline_file, upload_guideline_file
 from pydantic import BaseModel
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -106,15 +107,23 @@ async def upload_guideline(
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
     stored_name = f"{uuid4().hex}{Path(original_name).suffix}"
-    destination = UPLOAD_DIR / stored_name
-    destination.write_bytes(file_bytes)
+    try:
+        file_url, destination = upload_guideline_file(
+            file_bytes=file_bytes,
+            stored_name=stored_name,
+            content_type=file.content_type or "application/octet-stream",
+            base_url=str(request.base_url),
+            upload_dir=UPLOAD_DIR,
+        )
+    except RuntimeError as err:
+        raise HTTPException(status_code=500, detail=str(err)) from err
 
     guideline = Guideline(
         title=title or Path(original_name).stem,
         main_project_id=main_project_id,
         sub_project_id=sub_project_id,
         file_name=original_name,
-        file_url=str(request.base_url).rstrip("/") + f"/uploads/guidelines/{stored_name}",
+        file_url=file_url,
         uploaded_by=uploaded_by,
     )
     try:
@@ -124,8 +133,9 @@ async def upload_guideline(
         return guideline
     except SQLAlchemyError as exc:
         db.rollback()
-        if destination.exists():
+        if destination and destination.exists():
             destination.unlink()
+        delete_guideline_file(file_url=file_url, upload_dir=UPLOAD_DIR)
         raise HTTPException(status_code=500, detail=f"Failed to save guideline upload: {exc.__class__.__name__}") from exc
 
 
@@ -149,12 +159,10 @@ def delete_guideline(guideline_id: int, db: Session = Depends(get_db)):
     if not guideline:
         raise HTTPException(status_code=404, detail="Guideline not found")
 
-    if guideline.file_url and "/uploads/guidelines/" in guideline.file_url:
-        stored_name = guideline.file_url.rsplit("/", 1)[-1]
-        stored_file = UPLOAD_DIR / stored_name
-        if stored_file.exists():
-            stored_file.unlink()
+    if guideline.file_url:
+        delete_guideline_file(file_url=guideline.file_url, upload_dir=UPLOAD_DIR)
 
     db.delete(guideline)
     db.commit()
     return {"message": "Guideline deleted successfully"}
+
