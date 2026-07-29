@@ -1,19 +1,31 @@
 """
 Employee Signup Request API
-- Public: POST /api/signup-requests         — submit a request
-- Admin:  GET  /api/signup-requests         — list all requests
+
+Signup is a TWO-STEP flow, because an unverified email address was creating real
+admin work: an applicant who typed kisan12@ instead of kisan123@ still got
+approved, then couldn't log in, and an admin had to correct the address by hand.
+
+- Public: POST /api/signup-requests/verify-email        — step 1: email a signup link
+- Public: GET  /api/signup-requests/verify-email/check  — validate a link's token
+- Public: POST /api/signup-requests                     — step 2: submit (token required)
+- Admin:  GET  /api/signup-requests                     — list all requests
 - Admin:  PATCH /api/signup-requests/{id}/approve
 - Admin:  PATCH /api/signup-requests/{id}/reject
+
+Step 2 takes the email from the signed token, never from the request body, so the
+address on an admin's queue is always one the applicant can receive mail at.
 """
 import logging
+import os
 import secrets
 import string
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 
 import bcrypt
-from fastapi import APIRouter, Depends, HTTPException, Query
-from app.services.auth_service import get_current_user, require_role
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from jose import JWTError, jwt
+from app.services.auth_service import ALGORITHM, SECRET_KEY, get_current_user, require_role
 from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 
@@ -22,7 +34,11 @@ from app.models.employee import Employee
 from app.models.notification import Notification
 from app.models.signup_request import SignupRequest
 from app.models.user import User
-from app.services.email_service import try_send_signup_approved_email, try_send_signup_rejected_email
+from app.services.email_service import (
+    send_signup_verification_email,
+    try_send_signup_approved_email,
+    try_send_signup_rejected_email,
+)
 from app.services.identity_validator import check_duplicate_identity
 
 logger = logging.getLogger(__name__)
@@ -30,12 +46,24 @@ router = APIRouter(prefix="/api/signup-requests", tags=["signup-requests"])
 
 PORTAL_URL = "https://pmportal.autonexai360.com/login/employee"
 
+# Email-verification tokens are stateless signed JWTs — no table, no cleanup job.
+# Reuse within the TTL is fine and deliberate: it just reopens the form if the
+# applicant closes the tab.
+SIGNUP_VERIFY_PURPOSE = "signup_email_verify"
+SIGNUP_VERIFY_TTL_MINUTES = int(os.getenv("SIGNUP_VERIFY_TTL_MINUTES", "60"))
+
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
-class SignupRequestCreate(BaseModel):
-    name: str
+class EmailVerifyRequest(BaseModel):
     email: EmailStr
+
+
+class SignupRequestCreate(BaseModel):
+    """Step 2 payload. Note there is deliberately NO email field — the address is
+    read out of verification_token, so a client can't substitute a different one."""
+    name: str
+    verification_token: str
     phone: Optional[str] = None
     designation: Optional[str] = None
     employee_type: str = "Full-time"
@@ -88,6 +116,62 @@ def _gen_temp_password(length: int = 10) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def _normalize_email(email: Optional[str]) -> str:
+    return (email or "").strip().lower()
+
+
+def _frontend_base_url(request: Request) -> str:
+    """Base URL the signup link points at — mirrors the password-reset flow."""
+    return (
+        os.getenv("SIGNUP_FRONTEND_URL")
+        or os.getenv("FRONTEND_URL")
+        or request.headers.get("origin")
+        or "http://localhost:5173"
+    ).strip().rstrip("/")
+
+
+def _dev_return_link() -> bool:
+    """DEV_RETURN_SIGNUP_LINK=true returns the link in the API response instead of
+    requiring a working mailbox. Local testing only — it hands the link to whoever
+    called the endpoint, which defeats the whole point of verifying the address."""
+    return os.getenv("DEV_RETURN_SIGNUP_LINK", "false").lower() == "true"
+
+
+def _create_verify_token(email: str) -> str:
+    """Sign a short-lived token carrying the address the link is mailed to."""
+    return jwt.encode(
+        {
+            "sub": _normalize_email(email),
+            "exp": datetime.utcnow() + timedelta(minutes=SIGNUP_VERIFY_TTL_MINUTES),
+            "purpose": SIGNUP_VERIFY_PURPOSE,
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+
+def _email_from_verify_token(token: str) -> str:
+    """Return the verified address inside a signup token, or raise 400.
+
+    Because the address is *inside* the signature, it can only be the one the link
+    was mailed to — that is the whole basis for trusting it downstream.
+    """
+    expired_or_bad = "This verification link is invalid or has expired. Please request a new one."
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError as exc:
+        raise HTTPException(status_code=400, detail=expired_or_bad) from exc
+
+    if payload.get("purpose") != SIGNUP_VERIFY_PURPOSE:
+        # e.g. someone pasting a password-reset token here.
+        raise HTTPException(status_code=400, detail=expired_or_bad)
+
+    email = _normalize_email(payload.get("sub"))
+    if not email:
+        raise HTTPException(status_code=400, detail=expired_or_bad)
+    return email
+
+
 def _push_notification(db: Session, user_id: int, title: str, message: str, notif_type: str):
     db.add(Notification(user_id=user_id, title=title, message=message, type=notif_type))
 
@@ -112,24 +196,100 @@ def _to_response(req: SignupRequest) -> SignupRequestResponse:
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+@router.post("/verify-email")
+def request_email_verification(
+    payload: EmailVerifyRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """Step 1 — public. Email the applicant a link to the actual signup form.
+
+    Nothing is written to the database here; the token is self-contained. Duplicate
+    identity is checked up front so an applicant who already has an account (or a
+    request in flight) is told immediately, instead of after filling in the form.
+    """
+    email = _normalize_email(payload.email)
+
+    # Raises 409 with a specific reason (existing employee / user / request in flight).
+    # A previously *rejected* request is not counted, so re-applying still works.
+    check_duplicate_identity(db, email=email)
+
+    link = f"{_frontend_base_url(request)}/employee-signup?token={_create_verify_token(email)}"
+
+    if _dev_return_link():
+        logger.warning(
+            "[signup-verify] DEV_RETURN_SIGNUP_LINK=true — returning the signup link "
+            "in the response. NEVER enable this in production!"
+        )
+        return {
+            "message": "[DEV MODE] Verification email skipped — use the link below.",
+            "email": email,
+            "expires_in_minutes": SIGNUP_VERIFY_TTL_MINUTES,
+            "verification_link": link,
+        }
+
+    try:
+        send_signup_verification_email(
+            to_email=email,
+            signup_link=link,
+            expires_minutes=SIGNUP_VERIFY_TTL_MINUTES,
+        )
+    except Exception as exc:
+        logger.error("[signup-verify] Could not email %s: %s", email, exc)
+        raise HTTPException(
+            status_code=503,
+            detail="Could not send the verification email. Please check the address and try again.",
+        ) from exc
+
+    logger.info("[signup-verify] Verification link sent to %s", email)
+    return {
+        "message": f"Verification link sent to {email}. Open it to finish signing up.",
+        "email": email,
+        "expires_in_minutes": SIGNUP_VERIFY_TTL_MINUTES,
+    }
+
+
+@router.get("/verify-email/check")
+def check_email_verification(
+    token: str = Query(..., min_length=1),
+    db: Session = Depends(get_db),
+):
+    """Validate a signup link and hand back the address it proves — public.
+
+    The form uses this to pre-fill and lock the email field. Duplicates are
+    re-checked because an admin may have created the account between the link
+    being sent and it being opened.
+    """
+    email = _email_from_verify_token(token)
+    check_duplicate_identity(db, email=email)
+    return {"email": email, "verified": True}
+
+
 @router.post("", response_model=SignupRequestResponse, status_code=201)
 def submit_signup_request(payload: SignupRequestCreate, db: Session = Depends(get_db)):
-    """Public endpoint — anyone can submit a signup request."""
-    # Clean up old rejected signup request if it exists, to allow re-application
-    existing_rejected = db.query(SignupRequest).filter(
-        SignupRequest.email == payload.email,
-        SignupRequest.status == "rejected"
-    ).first()
-    if existing_rejected:
-        db.delete(existing_rejected)
-        db.flush()
+    """Step 2 — public, but only reachable with a valid verification token.
+
+    The email comes from the token, not the body, so the stored address is always
+    the one that received the link.
+    """
+    email = _email_from_verify_token(payload.verification_token)
+
+    # Clean up old rejected signup request(s) so a rejected applicant can re-apply.
+    # Matched case-insensitively: the token's address is normalized to lower case,
+    # while an older row may hold whatever casing was typed at the time.
+    for stale in db.query(SignupRequest).filter(
+        SignupRequest.email.ilike(email),
+        SignupRequest.status == "rejected",
+    ).all():
+        db.delete(stale)
+    db.flush()
 
     # Enforce unique identity check
-    check_duplicate_identity(db, email=payload.email, phone=payload.phone)
+    check_duplicate_identity(db, email=email, phone=payload.phone)
 
     req = SignupRequest(
         name=payload.name,
-        email=payload.email,
+        email=email,
         phone=payload.phone,
         designation=payload.designation,
         employee_type=payload.employee_type,

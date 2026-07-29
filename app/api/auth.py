@@ -14,6 +14,8 @@ from jose import ExpiredSignatureError, JWTError
 from app.db.database import get_db
 from app.models.user import User
 from app.models.employee import Employee
+# Aliased: the Pydantic request schema below is also called SignupRequest.
+from app.models.signup_request import SignupRequest as SignupRequestRecord
 from app.services.auth_service import (
     hash_password,
     verify_password,
@@ -218,8 +220,45 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
 
     user = db.query(User).filter(User.email == body.email).first()
     if not user:
+        # Say WHICH thing is wrong, and where the email stands. The generic
+        # "invalid email or password" is the textbook answer because it hides
+        # whether an address is registered, but on a closed staff portal that
+        # secrecy only cost people time — they could not tell a typo from a
+        # missing account. `field` tells the form which input to mark.
         logger.warning("[login] User not found: %s", body.email)
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        employee = db.query(Employee).filter(Employee.email == body.email).first()
+        request_row = (
+            db.query(SignupRequestRecord)
+            .filter(SignupRequestRecord.email == body.email)
+            .first()
+        )
+        request_status = (request_row.status or "").lower() if request_row else None
+
+        if request_status == "pending":
+            detail = {
+                "code": "signup_pending",
+                "field": "email",
+                "message": "Your access request is still waiting for approval. You'll be able to sign in once an admin approves it.",
+            }
+        elif request_status == "rejected":
+            detail = {
+                "code": "signup_rejected",
+                "field": "email",
+                "message": "Your access request was declined. Contact an admin if you think that's a mistake.",
+            }
+        elif employee:
+            detail = {
+                "code": "no_login_yet",
+                "field": "email",
+                "message": "This email is on the employee roster but has no login yet. Use Request Access or ask an admin to create one.",
+            }
+        else:
+            detail = {
+                "code": "email_not_found",
+                "field": "email",
+                "message": "No account exists for this email. Check the spelling, or use Request Access.",
+            }
+        raise HTTPException(status_code=401, detail=detail)
 
     logger.debug("[login] User found: id=%s is_active=%s role=%s", user.id, user.is_active, user.role)
 
@@ -227,12 +266,27 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     logger.debug("[login] bcrypt.verify result: %s for user id=%s", password_ok, user.id)
 
     if not password_ok:
+        # The email is confirmed good at this point, so name the real problem.
         logger.warning("[login] Wrong password for email=%s", body.email)
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "wrong_password",
+                "field": "password",
+                "message": "Wrong password for this email. Try again or use Reset Password.",
+            },
+        )
 
     if not user.is_active:
         logger.warning("[login] Deactivated account: email=%s", body.email)
-        raise HTTPException(status_code=403, detail="Account is deactivated")
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "account_deactivated",
+                "field": "email",
+                "message": "This account has been deactivated. Contact an admin to restore access.",
+            },
+        )
 
     # Auto-link PM/employee users to an Employee record if not yet linked
     if user.employee_id is None:
@@ -269,7 +323,11 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         )
         raise HTTPException(
             status_code=403,
-            detail=f"Access denied. This account must sign in through the {response_user.role} portal.",
+            detail={
+                "code": "wrong_portal",
+                "field": "email",
+                "message": f"Correct email and password, but this is a {response_user.role} account — sign in through the {response_user.role} portal instead.",
+            },
         )
 
     token = create_access_token({
@@ -306,14 +364,35 @@ def forgot_password(body: ForgotPasswordRequest, request: Request, db: Session =
     Production:  Sends email via SMTP. Requires SMTP_HOST / SMTP_USER / SMTP_PASSWORD.
     Dev/testing: Set DEV_RETURN_RESET_TOKEN=true to skip email and return the token directly.
     """
-    generic_message = "If an account exists for that email, reset instructions have been sent."
     logger.info("[forgot-password] Request for email=%s", body.email)
 
+    # Say whether the address is actually registered, and distinguish "no such
+    # account" from "account switched off" — the old single generic reply hid both
+    # and left people waiting for mail that was never going to arrive. It was
+    # there to stop the endpoint confirming which addresses exist; that guard is
+    # deliberately dropped here, matching the login form.
     user = db.query(User).filter(User.email == body.email).first()
-    if not user or not user.is_active:
-        logger.warning("[forgot-password] Email not found or inactive: %s", body.email)
-        # Always return the same message to prevent user enumeration
-        return MessageResponse(message=generic_message)
+    if not user:
+        logger.warning("[forgot-password] Email not found: %s", body.email)
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "email_not_found",
+                "field": "email",
+                "message": "No account exists for this email.",
+            },
+        )
+
+    if not user.is_active:
+        logger.warning("[forgot-password] Inactive account: %s", body.email)
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "account_deactivated",
+                "field": "email",
+                "message": "This account has been deactivated, so its password can't be reset. Contact an admin.",
+            },
+        )
 
     logger.debug("[forgot-password] Generating reset token for user id=%s", user.id)
     reset_token, expires_at = create_password_reset_token(user.id)
@@ -360,7 +439,11 @@ def forgot_password(body: ForgotPasswordRequest, request: Request, db: Session =
             detail="Failed to send reset email. Please try again later.",
         ) from exc
 
-    return MessageResponse(message=generic_message)
+    # The address is confirmed at this point, so name it: people check the wrong
+    # mailbox otherwise.
+    return MessageResponse(
+        message=f"Reset link sent to {user.email}. It expires in 15 minutes."
+    )
 
 
 @router.post("/reset-password", response_model=MessageResponse)
