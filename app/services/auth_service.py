@@ -119,10 +119,14 @@ def require_role(*roles):
     Usage: user = Depends(require_role("admin", "pm"))
     """
     def role_checker(user: User = Depends(get_current_user)) -> User:
-        if user.role not in roles:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access denied. Required role: {', '.join(roles)}",
-            )
-        return user
+        if user.role in roles:
+            return user
+        # HR has combined Admin + PM access: it passes any check that permits
+        # either an admin or a pm.
+        if user.role == "hr" and ("admin" in roles or "pm" in roles):
+            return user
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied. Required role: {', '.join(roles)}",
+        )
     return role_checker
