@@ -5,7 +5,17 @@ from app.db.database import Base
 
 
 class PayrollRun(Base):
-    """One record per month when a payroll is finalized."""
+    """One record per month when a payroll is finalized.
+
+    A finalized run is LOCKED — /save refuses to write it back to draft, so the
+    month's numbers stop moving. `POST /api/payroll/reopen` is the undo: it flips
+    the status back to draft and touches nothing else, so every adjustment, bonus
+    and additional payment survives and can be edited and re-finalized.
+
+    The finalized_/reopened_ columns are an audit trail of that lock/unlock only.
+    They do NOT snapshot the figures — /save still replaces the child rows on each
+    finalize, so previous amounts are not recoverable.
+    """
     __tablename__ = "payroll_runs"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -14,6 +24,13 @@ class PayrollRun(Base):
     working_days = Column(Integer, nullable=False, default=22)
     notes = Column(Text, nullable=True)
     processed_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # When the run was last finalized, and by whom. Kept as-is on reopen so the UI
+    # can still show "finalized on X, reopened on Y".
+    finalized_at = Column(TIMESTAMP, nullable=True)
+    finalized_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    # When the run was last reopened (undo), and by whom. Cleared on re-finalize.
+    reopened_at = Column(TIMESTAMP, nullable=True)
+    reopened_by = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())
 

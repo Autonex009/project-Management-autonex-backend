@@ -474,6 +474,35 @@ def sync_daily_sheet_annotation_schema() -> None:
 sync_daily_sheet_annotation_schema()
 
 
+def sync_payroll_run_audit_schema() -> None:
+    """Add the finalize/reopen audit columns to payroll_runs if not present.
+
+    Records who locked (finalized) a month's payroll and who unlocked it (undo),
+    so a reopen leaves a trace. Purely additive — existing runs get NULLs.
+    """
+    inspector = inspect(engine)
+    try:
+        columns = {column["name"] for column in inspector.get_columns("payroll_runs")}
+    except Exception:
+        return
+    statements = []
+    if "finalized_at" not in columns:
+        statements.append("ALTER TABLE payroll_runs ADD COLUMN finalized_at TIMESTAMP")
+    if "finalized_by" not in columns:
+        statements.append("ALTER TABLE payroll_runs ADD COLUMN finalized_by INTEGER")
+    if "reopened_at" not in columns:
+        statements.append("ALTER TABLE payroll_runs ADD COLUMN reopened_at TIMESTAMP")
+    if "reopened_by" not in columns:
+        statements.append("ALTER TABLE payroll_runs ADD COLUMN reopened_by INTEGER")
+    if statements:
+        with engine.begin() as connection:
+            for stmt in statements:
+                connection.execute(text(stmt))
+
+
+sync_payroll_run_audit_schema()
+
+
 
 def sync_wfh_end_date_schema() -> None:
     """Add end_date column to wfh_requests and backfill existing rows."""
