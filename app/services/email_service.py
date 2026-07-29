@@ -206,6 +206,126 @@ def send_signup_rejected_email(*, to_email: str, to_name: str, reason: str = "")
     _send(to_email=to_email, to_name=to_name, subject="Update on your Autonex AI signup request", html_body=html)
 
 
+def send_signup_verification_email(*, to_email: str, signup_link: str, expires_minutes: int) -> None:
+    """Step 1 of signup: prove the applicant can actually receive mail at this address.
+
+    The signup form is only reachable from this link, so the address that reaches
+    the admin queue is always one that works — a typo can never get that far.
+    """
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f4f7; margin: 0; padding: 0; }}
+    .container {{ max-width: 560px; margin: 40px auto; background: #fff; border-radius: 8px;
+                  padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+    h2 {{ color: #1a1a2e; margin-top: 0; }}
+    .btn {{ display: inline-block; margin-top: 24px; background: #059669; color: #fff !important;
+            text-decoration: none; padding: 12px 28px; border-radius: 6px; font-size: 15px; }}
+    p {{ color: #374151; line-height: 1.6; }}
+    .email {{ font-weight: bold; color: #1a1a2e; }}
+    .note {{ font-size: 13px; color: #6b7280; margin-top: 20px; }}
+    .footer {{ margin-top: 32px; font-size: 12px; color: #9ca3af;
+               border-top: 1px solid #e5e7eb; padding-top: 16px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Confirm your email to continue signing up</h2>
+    <p>Hi,</p>
+    <p>Someone started an Autonex Resource Planning Portal signup with
+       <span class="email">{to_email}</span>. Click below to confirm this address
+       and fill in the rest of your details.</p>
+    <a href="{signup_link}" class="btn">Continue Signup</a>
+    <p class="note">
+      This link expires in <strong>{expires_minutes} minutes</strong>, and your
+      account will use <span class="email">{to_email}</span> — the address this
+      email arrived at. If you didn't start a signup, you can ignore this email.
+    </p>
+    <div class="footer">
+      <p>Autonex AI &mdash; {os.getenv("MAIL_FROM", "")}</p>
+    </div>
+  </div>
+</body>
+</html>"""
+    _send(
+        to_email=to_email,
+        to_name=to_email,
+        subject="Confirm your email to join the Autonex portal",
+        html_body=html,
+    )
+
+
+def send_email_changed_email(*, to_email: str, to_name: str, old_email: str, portal_url: str) -> None:
+    """Confirm a self-service login-email change, sent to the NEW address.
+
+    Deliberately restates that the password is unchanged — the one thing people
+    assume must have been reset when their login identity moves.
+    """
+    first = (to_name or to_email).split()[0]
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f4f7; margin: 0; padding: 0; }}
+    .container {{ max-width: 560px; margin: 40px auto; background: #fff; border-radius: 8px;
+                  padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+    h2 {{ color: #1a1a2e; margin-top: 0; }}
+    .btn {{ display: inline-block; margin-top: 24px; background: #059669; color: #fff !important;
+            text-decoration: none; padding: 12px 28px; border-radius: 6px; font-size: 15px; }}
+    p {{ color: #374151; line-height: 1.6; }}
+    .box {{ background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px;
+            padding: 16px; margin: 20px 0; }}
+    .row {{ font-size: 14px; color: #374151; margin: 4px 0; }}
+    .old {{ color: #9ca3af; text-decoration: line-through; }}
+    .new {{ font-weight: bold; color: #065f46; }}
+    .note {{ font-size: 13px; color: #6b7280; margin-top: 20px; }}
+    .footer {{ margin-top: 32px; font-size: 12px; color: #9ca3af;
+               border-top: 1px solid #e5e7eb; padding-top: 16px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Your login email has been changed</h2>
+    <p>Hi {first},</p>
+    <p>Your Autonex portal login email was updated successfully.</p>
+    <div class="box">
+      <p class="row">Previous: <span class="old">{old_email}</span></p>
+      <p class="row">Current: <span class="new">{to_email}</span></p>
+    </div>
+    <p>Sign in with your <strong>new email address</strong> and the
+       <strong>same password as before</strong> — your password has not changed.</p>
+    <a href="{portal_url}" class="btn">Sign In</a>
+    <p class="note">
+      If you did not make this change, contact an admin or reach out on
+      <strong>#autonex-tool-support</strong> in Slack straight away.
+    </p>
+    <div class="footer">
+      <p>Autonex AI &mdash; {os.getenv("MAIL_FROM", "")}</p>
+    </div>
+  </div>
+</body>
+</html>"""
+    _send(
+        to_email=to_email,
+        to_name=to_name or to_email,
+        subject="Your Autonex login email has been changed",
+        html_body=html,
+    )
+
+
+def try_send_email_changed_email(**kwargs) -> bool:
+    """Returns True on success, False on failure (logs the error)."""
+    try:
+        send_email_changed_email(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning("[email] Email-changed notice failed: %s", exc)
+        return False
+
+
 def try_send_signup_approved_email(**kwargs) -> bool:
     try:
         send_signup_approved_email(**kwargs)
