@@ -117,30 +117,31 @@ def project_analytics(
 
     rows = _rows_for(db, sp, start, end)
 
-    # (date, user) -> seconds ; (date, user) -> role
-    du_seconds: dict = defaultdict(int)
-    du_role: dict = {}
-    date_seconds: dict = defaultdict(int)
+    # Autonex team only (billing view). An "active annotator" on a day = an Autonex
+    # user with >1h of annotation-stage work that day (same definition as the summary
+    # table / KPIs), so counts stay consistent across the dashboard.
+    du_ann_seconds: dict = defaultdict(int)   # (date, user) -> annotation-stage secs
+    date_seconds: dict = defaultdict(int)      # date -> Autonex platform secs
     user_daily: dict = defaultdict(lambda: defaultdict(int))   # user -> date -> seconds
     user_role: dict = {}
 
     for r in rows:
+        if not is_autonex_email(r.user_email):
+            continue
         d, u = r.metric_date, r.user_email
         secs = r.time_spent_seconds or 0
-        du_seconds[(d, u)] += secs
         date_seconds[d] += secs
         user_daily[u][d] += secs
-        role = r.project_user_role
-        if role:
-            du_role[(d, u)] = role
-            user_role.setdefault(u, role)
+        if _is_annotation_stage(r.workflow_stage):
+            du_ann_seconds[(d, u)] += secs
+        if r.project_user_role:
+            user_role.setdefault(u, r.project_user_role)
 
     def active_annotators_on(d: date) -> int:
-        n = 0
-        for (dd, u), secs in du_seconds.items():
-            if dd == d and secs > ACTIVE_THRESHOLD_SECONDS and (du_role.get((dd, u)) in ANNOTATOR_ROLES):
-                n += 1
-        return n
+        return sum(
+            1 for (dd, u), secs in du_ann_seconds.items()
+            if dd == d and secs > ACTIVE_THRESHOLD_SECONDS
+        )
 
     daily = []
     for d in sorted(date_seconds.keys()):
@@ -157,14 +158,20 @@ def project_analytics(
     total_seconds = sum(date_seconds.values())
     # distinct active annotators over the whole range (any day > threshold)
     range_active_users = {
-        u for (d, u), secs in du_seconds.items()
-        if secs > ACTIVE_THRESHOLD_SECONDS and du_role.get((d, u)) in ANNOTATOR_ROLES
+        u for (d, u), secs in du_ann_seconds.items()
+        if secs > ACTIVE_THRESHOLD_SECONDS
     }
+    people_count = len(user_daily)   # distinct Autonex people who logged any time
+    total_hours = _hours(total_seconds)
     month = {
-        "platform_hours": _hours(total_seconds),
+        "platform_hours": total_hours,
         "active_annotators_peak": max((x["active_annotators"] for x in daily), default=0),
         "active_annotators": len(range_active_users),
-        "avg_hours_per_annotator": round(_hours(total_seconds) / len(range_active_users), 2) if range_active_users else 0.0,
+        # avg per active annotator (>1h annotation/day)
+        "avg_hours_per_annotator": round(total_hours / len(range_active_users), 2) if range_active_users else 0.0,
+        # avg across everyone who touched the project (matches the People count)
+        "people": people_count,
+        "avg_hours_per_person": round(total_hours / people_count, 2) if people_count else 0.0,
     }
 
     name_by_email = _names_for(db, user_daily.keys())
@@ -180,6 +187,41 @@ def project_analytics(
         })
     annotators.sort(key=lambda a: a["total_hours"], reverse=True)
 
+    # Fixed reference windows (independent of the selected range), all ending today:
+    # today (1d), last 7 days, last 30 days. Autonex-only, stage-based annotators.
+    # One 30-day query, derived in Python for the shorter windows.
+    win_rows = [
+        (r.metric_date, r.user_email, r.time_spent_seconds or 0, r.workflow_stage)
+        for r in _rows_for(db, sp, today - timedelta(days=29), today)
+        if is_autonex_email(r.user_email)
+    ]
+
+    def _summarise(entries) -> dict:
+        total = 0
+        ann_day: dict = defaultdict(int)
+        for d, u, secs, stage in entries:
+            total += secs
+            if _is_annotation_stage(stage):
+                ann_day[(d, u)] += secs
+        active = {u for (d, u), s in ann_day.items() if s > ACTIVE_THRESHOLD_SECONDS}
+        n = len(active)
+        hrs = _hours(total)
+        return {
+            "active_annotators": n,
+            "platform_hours": hrs,
+            "avg_hours_per_annotator": round(hrs / n, 2) if n else 0.0,
+        }
+
+    # "Today" = the latest day that actually has data. The sync runs ~23:30, so the
+    # current day is usually empty until then — fall back to the most recent synced
+    # day (typically yesterday) and report which date it is. Rolling 7/30-day figures
+    # aren't computed here: the range toggle already drives the range-based cards.
+    latest_date = max((e[0] for e in win_rows), default=None)
+    day = _summarise([e for e in win_rows if e[0] == latest_date]) if latest_date else _summarise([])
+    day["date"] = latest_date.isoformat() if latest_date else None
+
+    fixed = {"today": day}
+
     return {
         "project_id": sp.id,
         "name": sp.name,
@@ -190,13 +232,16 @@ def project_analytics(
         "daily": daily,
         "month": month,
         "annotators": annotators,
+        "fixed": fixed,
     }
 
 
 @router.get("/summary")
-def summary(db: Session = Depends(get_db)):
+def summary(range: Optional[str] = None, db: Session = Depends(get_db)):
     today = date.today()
-    start = _month_start(today)
+    # Window follows the dashboard range toggle (1|7|30 days). Falls back to
+    # month-to-date when no range is given, preserving the old default.
+    start = _range_start(range, today) if range else _month_start(today)
 
     projects = (
         db.query(DailySheet)
