@@ -3,6 +3,8 @@ Payroll Calculation API
 -----------------------
 GET  /api/payroll/preview?month=YYYY-MM      — compute salary for all employees (no save)
 POST /api/payroll/save                        — save / finalize a payroll run
+POST /api/payroll/reopen                      — UNDO a finalize: unlock back to draft, keep all numbers
+DELETE /api/payroll/run?month=YYYY-MM        — discard a run entirely (start over from auto figures)
 GET  /api/payroll/saved?month=YYYY-MM        — retrieve a saved run with final numbers
 PATCH /api/employees/{id}/salary             — update employee base salary
 
@@ -21,7 +23,7 @@ import hmac
 import hashlib
 from types import SimpleNamespace
 from calendar import monthrange
-from datetime import date as date_type, timedelta
+from datetime import date as date_type, datetime, timedelta
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Header
@@ -219,6 +221,18 @@ def _month_bounds(month: str):
         raise HTTPException(status_code=400, detail="month must be YYYY-MM")
     last_day = monthrange(year, mo)[1]
     return date_type(year, mo, 1), date_type(year, mo, last_day)
+
+
+def _utc_iso(stamp) -> Optional[str]:
+    """Serialize a naive UTC timestamp with an explicit 'Z'.
+
+    The audit columns are TIMESTAMP WITHOUT TIME ZONE holding datetime.utcnow(),
+    so a bare isoformat() has no offset and browsers would read it as local time
+    (5h30m off in IST). The suffix makes the UTC intent unambiguous.
+    """
+    if stamp is None:
+        return None
+    return f"{stamp.isoformat()}Z"
 
 
 def _normalize_name(name: Optional[str]) -> str:
@@ -561,6 +575,10 @@ def preview_payroll(
         "annual_leave_quota": ANNUAL_LEAVE_QUOTA,
         "run_status": existing_run.status if existing_run else None,
         "run_id": existing_run.id if existing_run else None,
+        # Lock/unlock audit so the UI can say "finalized on X · reopened on Y".
+        # A run in draft WITH a finalized_at is one that was finalized then undone.
+        "finalized_at": _utc_iso(existing_run.finalized_at) if existing_run else None,
+        "reopened_at": _utc_iso(existing_run.reopened_at) if existing_run else None,
         "employees": rows,
     }
 
@@ -598,6 +616,10 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
     """
     Upsert a payroll run and its leave adjustments.
     Calling with status='finalized' locks the run.
+
+    A finalized run can't be written back to draft here — that's deliberate, so a
+    stray Save Draft can't silently unlock a month. Use POST /reopen to undo the
+    finalize; it unlocks the run and keeps every saved figure intact.
     """
     if body.status not in ("draft", "finalized"):
         raise HTTPException(status_code=422, detail="status must be 'draft' or 'finalized'")
@@ -608,7 +630,10 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
     run = db.query(PayrollRun).filter(PayrollRun.month == body.month).first()
     if run:
         if run.status == "finalized" and body.status != "finalized":
-            raise HTTPException(status_code=400, detail="Payroll already finalized for this month")
+            raise HTTPException(
+                status_code=400,
+                detail="Payroll is finalized for this month. Use Undo (reopen) to unlock it before saving a draft.",
+            )
         run.status = body.status
         run.working_days = working_days
         run.notes = body.notes
@@ -633,6 +658,14 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
         )
         db.add(run)
         db.flush()
+
+    # Stamp the lock. Finalizing (or re-finalizing) records who locked it and clears
+    # any earlier reopen marker, so the audit fields always describe the CURRENT state.
+    if body.status == "finalized":
+        run.finalized_at = datetime.utcnow()
+        run.finalized_by = body.processed_by
+        run.reopened_at = None
+        run.reopened_by = None
 
     for adj in body.adjustments:
         db.add(PayrollLeaveAdjustment(
@@ -680,6 +713,88 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(run)
     return {"message": f"Payroll {body.status} for {body.month}", "run_id": run.id, "status": run.status}
+
+
+class ReopenPayrollBody(BaseModel):
+    month: str
+    reopened_by: Optional[int] = None
+
+
+@router.post("/reopen")
+def reopen_payroll(body: ReopenPayrollBody, db: Session = Depends(get_db)):
+    """Undo a finalize: unlock the month back to draft, changing NO figures.
+
+    This is deliberately the *only* thing it does. Every PayrollLeaveAdjustment,
+    PayrollBonus and PayrollAdditionalPayment row is left exactly as saved, so the
+    next Generate returns the same numbers the finalized run showed — the admin
+    edits on top of them and re-finalizes. Nothing is deleted, so this is safe to
+    click and safe to repeat.
+
+    To instead throw the run away and go back to the auto-computed figures, use
+    DELETE /run — that one is destructive.
+    """
+    run = db.query(PayrollRun).filter(PayrollRun.month == body.month).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="No payroll run found for this month")
+    if run.status != "finalized":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Payroll for {body.month} is not finalized (status: {run.status}); nothing to undo.",
+        )
+
+    run.status = "draft"
+    run.reopened_at = datetime.utcnow()
+    run.reopened_by = body.reopened_by
+    db.commit()
+    db.refresh(run)
+    return {
+        "message": f"Payroll for {body.month} reopened — adjustments kept, you can edit and re-finalize.",
+        "run_id": run.id,
+        "status": run.status,
+        "finalized_at": _utc_iso(run.finalized_at),
+        "reopened_at": _utc_iso(run.reopened_at),
+    }
+
+
+@router.delete("/run")
+def discard_payroll_run(
+    month: str = Query(..., description="YYYY-MM"),
+    db: Session = Depends(get_db),
+):
+    """Discard a payroll run entirely — DESTRUCTIVE, and not the undo.
+
+    Deletes the run and every adjustment / bonus / additional payment attached to
+    it, so the next Generate recomputes the month purely from the auto leave
+    classification and the salary table. Use this only to start a month over; use
+    POST /reopen to merely unlock a finalized month.
+
+    Children are deleted explicitly rather than trusting ON DELETE CASCADE, since
+    the FK may not carry it on databases whose tables predate the current models.
+    """
+    run = db.query(PayrollRun).filter(PayrollRun.month == month).first()
+    if not run:
+        raise HTTPException(status_code=404, detail="No payroll run found for this month")
+
+    previous_status = run.status
+    deleted = {
+        "adjustments": db.query(PayrollLeaveAdjustment).filter(
+            PayrollLeaveAdjustment.payroll_run_id == run.id
+        ).delete(),
+        "bonuses": db.query(PayrollBonus).filter(
+            PayrollBonus.payroll_run_id == run.id
+        ).delete(),
+        "additional_payments": db.query(PayrollAdditionalPayment).filter(
+            PayrollAdditionalPayment.payroll_run_id == run.id
+        ).delete(),
+    }
+    db.delete(run)
+    db.commit()
+    return {
+        "message": f"Payroll run for {month} discarded — the month will recompute from scratch.",
+        "month": month,
+        "previous_status": previous_status,
+        "deleted": deleted,
+    }
 
 
 @router.get("/saved")
