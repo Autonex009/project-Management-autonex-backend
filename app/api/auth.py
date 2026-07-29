@@ -85,6 +85,7 @@ class MessageResponse(BaseModel):
 
 DESIGNATION_ACCESS = {
     "Admin": "admin",
+    "HR": "hr",   # combined Admin + PM access (see require_role)
     "Program Manager": "pm",
     "Annotator/ Reviewer": "employee",
     "Annotator/Reviewer": "employee",
@@ -255,7 +256,13 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
             logger.info("[login] Auto-linked user id=%s to employee id=%s", user.id, user.employee_id)
 
     response_user = build_user_response(user, db)
-    if body.portal and response_user.role != body.portal:
+    # HR uses the Admin login page but carries its own combined role.
+    portal_ok = (
+        not body.portal
+        or response_user.role == body.portal
+        or (response_user.role == "hr" and body.portal == "admin")
+    )
+    if not portal_ok:
         logger.warning(
             "[login] Portal mismatch: email=%s role=%s requested_portal=%s",
             body.email, response_user.role, body.portal,

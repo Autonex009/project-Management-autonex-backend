@@ -48,6 +48,7 @@ router = APIRouter(
 DEFAULT_EMPLOYEE_PASSWORD = "emp123"
 DESIGNATION_ROLE_MAP = {
     "Admin": "admin",
+    "HR": "hr",   # combined Admin + PM access
     "Program Manager": "pm",
     "Annotator/ Reviewer": "employee",
     "Annotator/Reviewer": "employee",
