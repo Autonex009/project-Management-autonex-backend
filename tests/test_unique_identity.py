@@ -50,6 +50,19 @@ auth_api.hash_password = lambda pw: "hashed-pw"
 auth_api.verify_password = lambda plain, hashed: True
 
 
+def submit_signup(client, *, email, **fields):
+    """POST a signup request through the two-step flow.
+
+    Signup now requires a verification token proving the applicant can receive
+    mail at the address, and the server reads the email out of that token rather
+    than from the body — so these tests mint a token instead of sending an email.
+    """
+    return client.post("/api/signup-requests", json={
+        "verification_token": signup_requests_api._create_verify_token(email),
+        **fields,
+    })
+
+
 @pytest.fixture()
 def client_and_db():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -84,31 +97,34 @@ def test_signup_request_duplicate_email(client_and_db):
     client, db = client_and_db
     
     # 1. Submit initial signup request
-    resp = client.post("/api/signup-requests", json={
-        "name": "Arjun Mehta",
-        "email": "arjun@autonex.com",
-        "phone": "+91 98765 43210",
-        "designation": "Developer"
-    })
+    resp = submit_signup(
+        client,
+        email="arjun@autonex.com",
+        name="Arjun Mehta",
+        phone="+91 98765 43210",
+        designation="Developer",
+    )
     assert resp.status_code == 201
 
     # 2. Try to submit duplicate request with same email
-    resp2 = client.post("/api/signup-requests", json={
-        "name": "Arjun Duplicate",
-        "email": "arjun@autonex.com",
-        "phone": "9999999999",
-        "designation": "Developer"
-    })
+    resp2 = submit_signup(
+        client,
+        email="arjun@autonex.com",
+        name="Arjun Duplicate",
+        phone="9999999999",
+        designation="Developer",
+    )
     assert resp2.status_code == 409
     assert "already" in resp2.json()["detail"]
 
     # 3. Try to submit duplicate request with same email but uppercase
-    resp3 = client.post("/api/signup-requests", json={
-        "name": "Arjun Duplicate",
-        "email": "ARJUN@AUTONEX.COM",
-        "phone": "9999999999",
-        "designation": "Developer"
-    })
+    resp3 = submit_signup(
+        client,
+        email="ARJUN@AUTONEX.COM",
+        name="Arjun Duplicate",
+        phone="9999999999",
+        designation="Developer",
+    )
     assert resp3.status_code == 409
 
 
@@ -116,21 +132,23 @@ def test_signup_request_duplicate_phone(client_and_db):
     client, db = client_and_db
     
     # 1. Submit initial signup request
-    resp = client.post("/api/signup-requests", json={
-        "name": "Rahul Verma",
-        "email": "rahul@autonex.com",
-        "phone": "+91-98765-43210",
-        "designation": "Developer"
-    })
+    resp = submit_signup(
+        client,
+        email="rahul@autonex.com",
+        name="Rahul Verma",
+        phone="+91-98765-43210",
+        designation="Developer",
+    )
     assert resp.status_code == 201
 
     # 2. Try to submit duplicate request with formatted duplicate phone number
-    resp2 = client.post("/api/signup-requests", json={
-        "name": "Rahul Duplicate",
-        "email": "rahul.diff@autonex.com",
-        "phone": "9876543210",
-        "designation": "Developer"
-    })
+    resp2 = submit_signup(
+        client,
+        email="rahul.diff@autonex.com",
+        name="Rahul Duplicate",
+        phone="9876543210",
+        designation="Developer",
+    )
     assert resp2.status_code == 409
     assert "phone number" in resp2.json()["detail"]
 
@@ -266,13 +284,14 @@ def test_update_employee_with_existing_signup_request(client_and_db):
     client, db = client_and_db
     
     # 1. Submit signup request
-    signup_resp = client.post("/api/signup-requests", json={
-        "name": "Jane Doe",
-        "email": "jane@autonex.com",
-        "phone": "9876543219",
-        "designation": "Developer",
-        "employee_type": "Full-time"
-    })
+    signup_resp = submit_signup(
+        client,
+        email="jane@autonex.com",
+        name="Jane Doe",
+        phone="9876543219",
+        designation="Developer",
+        employee_type="Full-time",
+    )
     assert signup_resp.status_code == 201
     signup_id = signup_resp.json()["id"]
 

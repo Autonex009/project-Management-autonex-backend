@@ -2,10 +2,11 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
+import logging
 import os
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -25,6 +26,7 @@ from app.schemas.employee import (
     EmployeeResponse,
 )
 from app.services.auth_service import get_current_user, hash_password, require_role
+from app.services.email_service import try_send_email_changed_email
 from app.services.identity_validator import check_duplicate_identity
 from app.services.slack_service import (
     try_get_or_cache_employee_slack_user_id,
@@ -39,6 +41,8 @@ AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_AVATAR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 MAX_AVATAR_BYTES = 5 * 1024 * 1024  # 5 MB
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(
     prefix="/api/employees",
     tags=["Employees"],
@@ -46,6 +50,11 @@ router = APIRouter(
 )
 
 DEFAULT_EMPLOYEE_PASSWORD = "emp123"
+
+# Self-service email changes are confined to the company domain — an employee can
+# move their login onto their real work address, but not onto an arbitrary one.
+COMPANY_EMAIL_DOMAIN = os.getenv("COMPANY_EMAIL_DOMAIN", "autonexai360.com").strip().lower().lstrip("@")
+EMPLOYEE_PORTAL_URL = os.getenv("EMPLOYEE_PORTAL_URL", "https://pmportal.autonexai360.com/login/employee")
 DESIGNATION_ROLE_MAP = {
     "Admin": "admin",
     "HR": "hr",   # combined Admin + PM access
@@ -171,7 +180,11 @@ def update_employee(
     check_employee_access(employee, current_user)
     
     if current_user.role not in ["admin", "pm"]:
+        # `email` is here so the company-domain rule on PATCH /{id}/email can't be
+        # sidestepped by patching the field directly — self-service email changes
+        # must go through that endpoint, which validates the domain and notifies.
         admin_only_fields = {
+            "email",
             "employee_type", "designation", "working_hours_per_day",
             "weekly_availability", "productivity_baseline", "status", "base_salary"
         }
@@ -207,6 +220,82 @@ def update_employee(
     
     db.commit()
     db.refresh(employee)
+    return employee
+
+
+class ChangeEmailBody(BaseModel):
+    new_email: EmailStr
+
+
+@router.patch("/{employee_id}/email", response_model=EmployeeResponse)
+def change_employee_email(
+    employee_id: int,
+    body: ChangeEmailBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Move an employee's login onto their real company address.
+
+    Restricted to @{COMPANY_EMAIL_DOMAIN} so an employee can correct a personal
+    address to their work one, but can't point their login at somewhere arbitrary.
+
+    Updates Employee.email AND the linked User.email (login reads User.email), and
+    leaves password_hash untouched — the same password keeps working, which is what
+    the confirmation email tells them.
+    """
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    # Self, or an admin/PM acting on their behalf.
+    check_employee_access(employee, current_user)
+
+    new_email = (body.new_email or "").strip().lower()
+    old_email = employee.email or ""
+
+    domain = new_email.rsplit("@", 1)[-1]
+    if domain != COMPANY_EMAIL_DOMAIN:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Your login email must be a @{COMPANY_EMAIL_DOMAIN} address.",
+        )
+
+    if new_email == old_email.strip().lower():
+        raise HTTPException(
+            status_code=400,
+            detail="That is already your current email address.",
+        )
+
+    linked_user = db.query(User).filter(User.employee_id == employee.id).first()
+    # Excluding this person's own records so their existing rows don't self-conflict.
+    check_duplicate_identity(
+        db,
+        email=new_email,
+        exclude_employee_id=employee.id,
+        exclude_user_id=linked_user.id if linked_user else None,
+    )
+
+    employee.email = new_email
+    if linked_user:
+        linked_user.email = new_email
+    db.commit()
+    db.refresh(employee)
+
+    # Best-effort: the change is already committed, so a mail failure must not undo
+    # it or 500 the request. It's logged, and the new address is on screen anyway.
+    sent = try_send_email_changed_email(
+        to_email=new_email,
+        to_name=employee.name or new_email,
+        old_email=old_email,
+        portal_url=EMPLOYEE_PORTAL_URL,
+    )
+    logger.info(
+        "[change-email] employee id=%s %s -> %s (login row %s, notice %s)",
+        employee.id, old_email, new_email,
+        "updated" if linked_user else "MISSING",
+        "sent" if sent else "FAILED",
+    )
+
     return employee
 
 
