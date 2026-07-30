@@ -76,12 +76,15 @@ class ProjectBase(BaseModel):
     client: Optional[str] = ""  # Optional - sub-projects inherit from parent
     project_type: Optional[str] = "Full"
 
-    total_tasks: int = Field(..., ge=0)
-    estimated_time_per_task: float = Field(..., gt=0)       # annotation time per task (hours)
+    total_tasks: Optional[int] = Field(default=0, ge=0)
+    # 0 is allowed — this field was removed from the create UI, so new projects carry 0.
+    # (Kept lenient here because ProjectResponse inherits ProjectBase: one row violating
+    # a constraint would otherwise 500 the entire /sub-projects list.)
+    estimated_time_per_task: Optional[float] = Field(default=0, ge=0)   # annotation time per task (hours)
     review_time_per_task: Optional[float] = None            # reviewer time per task (hours)
     gearing_ratio: Optional[float] = None                   # informational
 
-    required_expertise: List[str]
+    required_expertise: Optional[List[str]] = []   # skills removed from UI; tolerate empty/None
     assigned_employee_ids: Optional[List[int]] = []
     
     # NEW: Hierarchy fields
