@@ -344,6 +344,8 @@ def _autonex_kpis(db: Session, *, start: date, end: date, project_hash: str | No
     total_seconds = 0
     annotation_seconds = 0
     review_seconds = 0
+    other_seconds = 0
+    other_stages: dict = defaultdict(int)   # stage name -> secs (neither annotate nor review)
     daily_seconds: dict = defaultdict(int)
     people = set()
     ann_day: dict = defaultdict(int)   # (date, user) -> annotator-role secs that day
@@ -355,17 +357,23 @@ def _autonex_kpis(db: Session, *, start: date, end: date, project_hash: str | No
         total_seconds += secs
         daily_seconds[r.metric_date] += secs
         people.add(r.user_email)
-        role = (r.project_user_role or "").upper()
         key = (r.metric_date, r.user_email)
-        # Hours split by role (unchanged); head-counts by workflow stage.
-        if role in ANNOTATOR_ROLES:
+        # Hours AND head-counts both keyed by workflow stage: a row's seconds only
+        # count toward annotation_seconds if the row's own stage is an annotate stage,
+        # and only toward review_seconds if the row's own stage is a review stage.
+        # Anything else (Skipped Tasks, Agent Rejected, Consensus, ...) is "Other", so
+        # annotation + review + other == platform hours exactly.
+        is_ann = _is_annotation_stage(r.workflow_stage)
+        is_rev = _is_review_stage(r.workflow_stage)
+        if is_ann:
             annotation_seconds += secs
-        if role in REVIEWER_ROLES:
-            review_seconds += secs
-        if _is_annotation_stage(r.workflow_stage):
             ann_day[key] += secs
-        if _is_review_stage(r.workflow_stage):
+        if is_rev:
+            review_seconds += secs
             rev_day[key] += secs
+        if not is_ann and not is_rev:
+            other_seconds += secs
+            other_stages[r.workflow_stage or "(none)"] += secs
 
     # Distinct people, active = >1h of annotation- (or review-) stage work on a day.
     active_annotators = len({u for (d, u), s in ann_day.items() if s > ACTIVE_THRESHOLD_SECONDS})
@@ -395,6 +403,12 @@ def _autonex_kpis(db: Session, *, start: date, end: date, project_hash: str | No
             "labels_created": labels_created,
             "avg_minutes_per_task": avg_minutes_per_task,
             "review_hours": _hours(review_seconds),
+            "other_hours": _hours(other_seconds),
+            # per-stage breakdown of the "Other" bucket, for the hover tooltip
+            "other_breakdown": [
+                {"stage": s, "hours": _hours(sec)}
+                for s, sec in sorted(other_stages.items(), key=lambda kv: kv[1], reverse=True)
+            ],
             "active_annotators": active_annotators,
             "active_reviewers": active_reviewers,
             "people": len(people),
