@@ -180,7 +180,7 @@ def list_referrals(
     """
     q = db.query(Referral)
 
-    if current_user.role != "admin":
+    if current_user.role not in ("admin", "hr"):
         # Scope to logged-in employee's own referrals
         emp_id = current_user.employee_id
         if not emp_id:
@@ -208,7 +208,7 @@ def get_referral(
         raise HTTPException(status_code=404, detail="Referral not found")
 
     # Non-admins can only view their own
-    if current_user.role != "admin":
+    if current_user.role not in ("admin", "hr"):
         emp_id = current_user.employee_id
         if not emp_id:
             emp = db.query(Employee).filter(Employee.email == current_user.email).first()
@@ -227,7 +227,7 @@ def update_referral_status(
     db: Session = Depends(get_db),
 ):
     """Admin-only: update referral status and optionally add a note."""
-    if current_user.role != "admin":
+    if current_user.role not in ("admin", "hr"):
         raise HTTPException(status_code=403, detail="Admin access required")
 
     if body.status not in VALID_STATUSES:
@@ -289,7 +289,7 @@ def delete_referral(
     if not ref:
         raise HTTPException(status_code=404, detail="Referral not found")
 
-    if current_user.role != "admin":
+    if current_user.role not in ("admin", "hr"):
         emp_id = current_user.employee_id
         if not emp_id:
             emp = db.query(Employee).filter(Employee.email == current_user.email).first()

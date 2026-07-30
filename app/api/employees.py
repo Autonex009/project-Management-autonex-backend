@@ -72,7 +72,7 @@ def get_user_role_from_designation(designation: str | None) -> str:
 
 
 def check_employee_access(employee: Employee, current_user: User):
-    if current_user.role in ["admin", "pm"]:
+    if current_user.role in ["admin", "pm", "hr"]:
         return
     is_self = (current_user.employee_id == employee.id) or (current_user.email == employee.email)
     if not is_self:
@@ -179,7 +179,7 @@ def update_employee(
     
     check_employee_access(employee, current_user)
     
-    if current_user.role not in ["admin", "pm"]:
+    if current_user.role not in ["admin", "pm", "hr"]:
         # `email` is here so the company-domain rule on PATCH /{id}/email can't be
         # sidestepped by patching the field directly — self-service email changes
         # must go through that endpoint, which validates the domain and notifies.

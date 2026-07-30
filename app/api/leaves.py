@@ -75,7 +75,7 @@ router = APIRouter(prefix="/api/leaves", tags=["Leaves"], dependencies=[Depends(
 
 
 def check_leave_access(leave_employee_id: int, current_user: User, db: Session):
-    if current_user.role not in ["admin", "pm"]:
+    if current_user.role not in ["admin", "pm", "hr"]:
         is_self = current_user.employee_id == leave_employee_id
         if not is_self:
             emp = db.query(Employee).filter(Employee.id == leave_employee_id).first()
@@ -356,7 +356,7 @@ def get_all_leaves(
     current_user: User = Depends(get_current_user)
 ):
     """Get all leaves, optionally filtered by employee_id, start_date, or end_date"""
-    if current_user.role not in ["admin", "pm"]:
+    if current_user.role not in ["admin", "pm", "hr"]:
         if employee_id is None:
             employee_id = current_user.employee_id
             if employee_id is None:

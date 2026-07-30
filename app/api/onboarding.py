@@ -61,7 +61,7 @@ def _has_annotation_skill(skills) -> bool:
 def _is_pm_or_admin(user: User, employee: Employee) -> bool:
     """PMs/Admins can list annotation skills (many came from annotation roles) but must not
     appear as onboarding candidates. Annotator/Reviewer designation is handled separately."""
-    if user.role in ("admin", "pm"):
+    if user.role in ("admin", "pm", "hr"):
         return True
     designation = (employee.designation or "").lower()
     return "program manager" in designation or "project manager" in designation or "admin" in designation
@@ -121,13 +121,13 @@ def is_module_locked(user_id: int, module_id: int, db: Session) -> bool:
 # may target another user by passing an explicit user_id.
 
 def _resolve_target_user_id(current_user: User, requested_user_id: Optional[int]) -> int:
-    if current_user.role in ("admin", "pm") and requested_user_id:
+    if current_user.role in ("admin", "pm", "hr") and requested_user_id:
         return requested_user_id
     return current_user.id
 
 
 def _ensure_can_view_user(current_user: User, user_id: int) -> None:
-    if current_user.role not in ("admin", "pm") and current_user.id != user_id:
+    if current_user.role not in ("admin", "pm", "hr") and current_user.id != user_id:
         raise HTTPException(status_code=403, detail="Not authorized to view this user's onboarding data.")
 
 
@@ -253,7 +253,7 @@ def get_module(
         if is_module_locked(current_user.id, module_id, db):
             raise HTTPException(status_code=403, detail="This module is locked.")
 
-    include_answers = current_user.role in ("admin", "pm")
+    include_answers = current_user.role in ("admin", "pm", "hr")
     return _serialize_module(module, include_answers=include_answers)
 
 
@@ -261,7 +261,7 @@ def get_module(
 def create_module(
     payload: OnboardingModuleCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Create a new module. Restricted to Admins and PMs."""
     module_data = payload.model_dump(exclude={"sections"})
@@ -313,7 +313,7 @@ def update_module(
     module_id: int,
     payload: OnboardingModuleCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Update a module and replace its nested sections/docs/questions. Restricted to Admins and PMs."""
     module = db.query(OnboardingModule).filter(OnboardingModule.id == module_id).first()
@@ -369,7 +369,7 @@ def update_module(
 def delete_module(
     module_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Delete a module. Restricted to Admins and PMs."""
     module = db.query(OnboardingModule).filter(OnboardingModule.id == module_id).first()
@@ -388,7 +388,7 @@ class ModuleReorderPayload(BaseModel):
 def reorder_modules(
     payload: ModuleReorderPayload,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Persist a new module display order.
 
@@ -412,7 +412,7 @@ def create_section(
     module_id: int,
     payload: OnboardingSectionCreate,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Create a section within a module, including nested documents and quiz questions."""
     module = db.query(OnboardingModule).filter(OnboardingModule.id == module_id).first()
@@ -458,7 +458,7 @@ def create_section(
 def delete_section(
     section_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Delete a section. Restricted to Admins and PMs."""
     section = db.query(OnboardingSection).filter(OnboardingSection.id == section_id).first()
@@ -477,7 +477,7 @@ async def import_quiz_questions(
     section_id: int,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Import quiz questions from an Excel sheet into a specific section."""
     if not OPENPYXL_AVAILABLE:
@@ -824,7 +824,7 @@ def get_candidate_dashboard(
 @router.get("/analytics/dashboard")
 def get_analytics_dashboard(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Retrieve high-level onboarding KPIs and recent registrations."""
     candidates = get_onboarding_candidates(db)
@@ -867,7 +867,7 @@ def get_analytics_dashboard(
 @router.get("/analytics/full")
 def get_full_analytics(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Retrieve full analytics data distributions and weekly metrics."""
     candidates = get_onboarding_candidates(db)
@@ -1047,7 +1047,7 @@ def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] 
 @router.get("/reports")
 def get_onboarding_reports(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Retrieve full detailed reports on candidate onboarding progress."""
     return fetch_onboarding_reports_data(db)
@@ -1056,7 +1056,7 @@ def get_onboarding_reports(
 @router.get("/newly-onboarded")
 def get_newly_onboarded(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Annotation employees not yet allocated to any project, with their onboarding
     progress and MCQ stats. Lets all PMs/Admins triage new annotators by assessment
@@ -1112,7 +1112,7 @@ def get_newly_onboarded(
 @router.get("/reports/export")
 def export_onboarding_reports(
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Export onboarding progress report as a CSV file download."""
     reports = fetch_onboarding_reports_data(db)
@@ -1153,7 +1153,7 @@ def export_onboarding_reports(
 def get_mentees(
     mentor_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm"))
+    current_user: User = Depends(require_role("admin", "pm", "hr"))
 ):
     """Retrieve all candidate employees assigned to a PM (mentor) as mentees or allocated to their annotation projects."""
     pm_user = db.query(User).filter(User.id == mentor_id).first()

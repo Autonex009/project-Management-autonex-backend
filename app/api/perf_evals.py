@@ -211,7 +211,7 @@ def list_evals(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.role not in ["admin", "pm"]:
+    if current_user.role not in ["admin", "pm", "hr"]:
         if employee_id is None:
             employee_id = current_user.employee_id
             if employee_id is None:
@@ -244,7 +244,7 @@ def create_eval(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.role not in ["admin", "pm"]:
+    if current_user.role not in ["admin", "pm", "hr"]:
         is_self = current_user.employee_id == payload.employee_id
         if not is_self:
             emp = db.query(Employee).filter(Employee.id == payload.employee_id).first()

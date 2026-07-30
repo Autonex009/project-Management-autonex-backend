@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api/wfh", tags=["wfh"], dependencies=[Depends(get_cu
 
 
 def check_wfh_access(wfh_employee_id: int, current_user: User, db: Session):
-    if current_user.role not in ["admin", "pm"]:
+    if current_user.role not in ["admin", "pm", "hr"]:
         is_self = current_user.employee_id == wfh_employee_id
         if not is_self:
             emp = db.query(Employee).filter(Employee.id == wfh_employee_id).first()
@@ -159,7 +159,7 @@ def get_wfh_requests(
     current_user: User = Depends(get_current_user)
 ):
     """Get WFH requests. Filter by employee_id and/or month (YYYY-MM)."""
-    if current_user.role not in ["admin", "pm"]:
+    if current_user.role not in ["admin", "pm", "hr"]:
         if employee_id is None:
             employee_id = current_user.employee_id
             if employee_id is None:

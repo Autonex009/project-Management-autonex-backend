@@ -357,7 +357,7 @@ def get_allocations_by_employee(
     current_user: User = Depends(get_current_user)
 ):
     """Get all allocations for a specific employee."""
-    if current_user.role not in ["admin", "pm"]:
+    if current_user.role not in ["admin", "pm", "hr"]:
         is_self = current_user.employee_id == employee_id
         if not is_self:
             employee = db.query(Employee).filter(Employee.id == employee_id).first()
