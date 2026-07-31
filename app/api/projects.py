@@ -6,6 +6,7 @@ from app.db.database import get_db
 from app.models.project import SubProject, Project  # SubProject with alias
 from app.models.allocation import Allocation
 from app.models.employee import Employee
+from app.models.user import User
 from app.models.parent_project import ParentProject
 from app.models.perf_eval import PerfEvaluation, PerfProjectParams
 from app.schemas.project import (
@@ -57,10 +58,21 @@ router = APIRouter(
 @router.post("", response_model=ProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def create_project(
     payload: ProjectCreate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     data = normalize_project_payload(payload.model_dump(), db)
     data["required_manpower"] = _autonex_headcount(data)  # auto: Autonex annotators + reviewers + QC
+    # A PM (or HR) who creates a project owns it. Guarantee they're recorded as a
+    # project-level PM using their authoritative token identity, so the project is
+    # always visible to them — even if the client omitted the assignment (e.g. a
+    # cached session whose user object had no employee_id). Admin-created projects
+    # are left as-is (admins see everything anyway).
+    if current_user.role in ("pm", "hr") and current_user.employee_id:
+        ids = list(data.get("assigned_employee_ids") or [])
+        if current_user.employee_id not in ids:
+            ids.insert(0, current_user.employee_id)
+        data["assigned_employee_ids"] = ids
     project = Project(**data)
     db.add(project)
     db.commit()
@@ -80,6 +92,7 @@ def update_project(
     project_id: int,
     payload: ProjectUpdate,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
 
@@ -89,6 +102,18 @@ def update_project(
     update_data = normalize_project_payload(payload.model_dump(exclude_unset=True), db)
     old_status = project.project_status
     new_status = update_data.get('project_status', old_status)
+
+    # A PM (or HR) editing a project can't drop themselves off it — keep them among
+    # the project PMs so they never lose visibility of their own project.
+    if (
+        "assigned_employee_ids" in update_data
+        and current_user.role in ("pm", "hr")
+        and current_user.employee_id
+    ):
+        ids = list(update_data.get("assigned_employee_ids") or [])
+        if current_user.employee_id not in ids:
+            ids.insert(0, current_user.employee_id)
+        update_data["assigned_employee_ids"] = ids
 
     for key, value in update_data.items():
         setattr(project, key, value)
