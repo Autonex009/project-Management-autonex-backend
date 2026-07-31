@@ -374,6 +374,7 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
     return {
         "employee_id": emp.id,
         "employee_name": emp.name,
+        "avatar_url": getattr(emp, "avatar_url", None),
         "designation": emp.designation,
         "employee_type": emp.employee_type,
         "base_salary": base,
@@ -797,6 +798,27 @@ def discard_payroll_run(
     }
 
 
+@router.get("/runs")
+def list_payroll_runs(db: Session = Depends(get_db)):
+    """List all historical payroll runs."""
+    runs = db.query(PayrollRun).order_by(PayrollRun.month.desc()).all()
+    return {
+        "runs": [
+            {
+                "id": r.id,
+                "month": r.month,
+                "status": r.status,
+                "working_days": r.working_days,
+                "notes": r.notes,
+                "processed_by": r.processed_by,
+                "finalized_at": _utc_iso(r.finalized_at),
+                "reopened_at": _utc_iso(r.reopened_at),
+            }
+            for r in runs
+        ]
+    }
+
+
 @router.get("/saved")
 def get_saved_payroll(
     month: str = Query(..., description="YYYY-MM"),
@@ -820,6 +842,7 @@ def export_payroll_csv(
     data = preview_payroll(month=month, db=db)
 
     output = io.StringIO()
+    output.write('\ufeff')  # UTF-8 BOM for Excel
     writer = csv.writer(output)
     writer.writerow([
         "Employee", "Designation", "Type",
@@ -1021,6 +1044,7 @@ def list_salary_records(db: Session = Depends(get_db)):
             matched_names.add(key)
             record = _salary_table_record(row)
             record["employee_id"] = emp.id
+            record["avatar_url"] = emp.avatar_url
         else:
             record = {
                 "id": None,
@@ -1032,6 +1056,7 @@ def list_salary_records(db: Session = Depends(get_db)):
                 "optional_bonus_annual": None,
                 "base_pay_monthly": None,
                 "opt_bonus_monthly": None,
+                "avatar_url": emp.avatar_url,
             }
         records.append(record)
 
