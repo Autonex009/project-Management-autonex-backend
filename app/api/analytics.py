@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.db.database import get_db
 from app.services.auth_service import require_role
 from app.models.project import DailySheet
+from app.models.parent_project import MainProject
 from app.models.encord_analytics import EncordDailyTimeSpent
 from app.models.encord_activity import EncordDailyActivity
 from app.models.employee import Employee
@@ -222,10 +223,25 @@ def project_analytics(
 
     fixed = {"today": day}
 
+    # Project PM name(s): the project's own assigned PMs, falling back to the
+    # organization's PMs when the project has none.
+    pm_ids = list(sp.assigned_employee_ids or [])
+    if not pm_ids and sp.main_project_id:
+        org = db.query(MainProject).filter(MainProject.id == sp.main_project_id).first()
+        if org:
+            pm_ids = org.program_manager_ids or ([org.program_manager_id] if org.program_manager_id else [])
+    pm_names = []
+    if pm_ids:
+        name_by_id = dict(
+            db.query(Employee.id, Employee.name).filter(Employee.id.in_(pm_ids)).all()
+        )
+        pm_names = [name_by_id[i] for i in pm_ids if i in name_by_id]
+
     return {
         "project_id": sp.id,
         "name": sp.name,
         "client": sp.client,
+        "pm_names": pm_names,
         "encord_project_hash": sp.encord_project_hash,
         "sentiment": sp.sentiment,
         "range": {"from": start.isoformat(), "to": end.isoformat()},

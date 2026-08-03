@@ -26,36 +26,60 @@ BACKFILL_DAYS = int(os.getenv("ENCORD_BACKFILL_DAYS", "90"))
 _MAX_WINDOW_DAYS = 29  # Encord log endpoints cap windows; chunk backfills to be safe.
 
 
-def _normalise_key() -> str | None:
-    """Return the SSH private key contents with real newlines, or None."""
-    raw = os.getenv("ENCORD_SSH_KEY")
+def _normalise_key(env_name: str) -> str | None:
+    """Return the SSH private key contents from env `env_name` with real newlines, or None."""
+    raw = os.getenv(env_name)
     if raw:
         return raw.replace("\\n", "\n").strip() + "\n"
     return None
 
 
-def _client():
-    """Build an authenticated EncordUserClient. Raises RuntimeError on config/SDK errors."""
+# Encord regions. Each region is a separate Encord deployment with its own API
+# domain and its own SSH key — a key only sees projects in its region. We build a
+# client per configured region and, for each project, use whichever region's client
+# can actually see it (see `run_sync`). US default domain per Encord's US deployment.
+_REGIONS = (
+    # (label, key-env, key-file-env, domain-env, default-domain)
+    ("EU", "ENCORD_SSH_KEY", "ENCORD_SSH_KEY_FILE", "ENCORD_DOMAIN", None),
+    ("US", "ENCORD_SSH_KEY_US", "ENCORD_SSH_KEY_US_FILE", "ENCORD_DOMAIN_US", "https://api.us.encord.com"),
+)
+
+
+def _build_client(key_env: str, key_file_env: str, domain_env: str, default_domain: str | None):
+    """Build one EncordUserClient for a region, or None if that region isn't configured."""
+    from encord import EncordUserClient  # lazy import (validated by caller)
+
+    key_contents = _normalise_key(key_env)
+    key_path = os.getenv(key_file_env) or None
+    if not key_contents and not key_path:
+        return None
+
+    domain = os.getenv(domain_env) or default_domain
+    kwargs = {"domain": domain} if domain else {}
+    if key_contents:
+        return EncordUserClient.create_with_ssh_private_key(ssh_private_key=key_contents, **kwargs)
+    return EncordUserClient.create_with_ssh_private_key(ssh_private_key_path=key_path, **kwargs)
+
+
+def _region_clients():
+    """Return [(region_label, client), ...] for every configured Encord region."""
     try:
-        from encord import EncordUserClient  # lazy import
+        from encord import EncordUserClient  # noqa: F401  (ensure the package is present)
     except ImportError as exc:
         raise RuntimeError("The 'encord' package is not installed (pip install encord).") from exc
 
-    domain = os.getenv("ENCORD_DOMAIN") or None
-    key_contents = _normalise_key()
-    key_path = os.getenv("ENCORD_SSH_KEY_FILE") or None
+    clients = []
+    for label, key_env, key_file_env, domain_env, default_domain in _REGIONS:
+        try:
+            client = _build_client(key_env, key_file_env, domain_env, default_domain)
+        except Exception as exc:
+            raise RuntimeError(f"Encord authentication failed for region {label}: {exc}") from exc
+        if client is not None:
+            clients.append((label, client))
 
-    kwargs = {}
-    if domain:
-        kwargs["domain"] = domain
-    try:
-        if key_contents:
-            return EncordUserClient.create_with_ssh_private_key(ssh_private_key=key_contents, **kwargs)
-        if key_path:
-            return EncordUserClient.create_with_ssh_private_key(ssh_private_key_path=key_path, **kwargs)
-    except Exception as exc:
-        raise RuntimeError(f"Encord authentication failed: {exc}") from exc
-    raise RuntimeError("No Encord SSH key configured (set ENCORD_SSH_KEY or ENCORD_SSH_KEY_FILE).")
+    if not clients:
+        raise RuntimeError("No Encord SSH key configured (set ENCORD_SSH_KEY and/or ENCORD_SSH_KEY_US).")
+    return clients
 
 
 def _role_name(role) -> str | None:
@@ -219,13 +243,35 @@ def run_sync(db: Session, start: datetime | None = None, end: datetime | None = 
     if start is None or end is None:
         start, end = _default_window()
 
-    client = _client()
+    clients = _region_clients()   # [(region, client), ...] across all configured regions
     summary = {"projects": 0, "inserted": 0, "updated": 0, "errors": 0, "details": []}
 
     for sp in mapped_projects(db):
         phash = sp.encord_project_hash
+        # Find which region can actually see this project. Try each region's client;
+        # the first that returns the project wins. If none can, the hash is invalid.
+        project = None
+        region = None
+        resolve_errors = []
+        for reg, client in clients:
+            try:
+                project = client.get_project(phash)
+                region = reg
+                break
+            except Exception as exc:
+                resolve_errors.append(f"{reg}: {exc}")
+        if project is None:
+            db.rollback()
+            summary["errors"] += 1
+            summary["details"].append({
+                "sub_project_id": sp.id,
+                "encord_project_hash": phash,
+                "error": "project not found in any region (" + "; ".join(resolve_errors) + ")",
+            })
+            logger.error("[encord_sync] project %s (%s) not found in any region: %s", sp.id, phash, resolve_errors)
+            continue
+
         try:
-            project = client.get_project(phash)
             # aggregate seconds per (date, user, stage)
             agg: dict[tuple, dict] = {}
             for win_start, win_end in _windows(start, end):
@@ -249,7 +295,7 @@ def run_sync(db: Session, start: datetime | None = None, end: datetime | None = 
 
             db.commit()
             summary["projects"] += 1
-            summary["details"].append({"sub_project_id": sp.id, "encord_project_hash": phash, "rows": len(agg), "activity_rows": activity_rows})
+            summary["details"].append({"sub_project_id": sp.id, "encord_project_hash": phash, "region": region, "rows": len(agg), "activity_rows": activity_rows})
         except Exception as exc:
             db.rollback()
             summary["errors"] += 1
