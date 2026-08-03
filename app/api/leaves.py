@@ -40,7 +40,9 @@ def validate_half_day_timing(start_date: date_type, half_day_slot: str) -> None:
             detail="Invalid half-day slot. Must be 'first_half' or 'second_half'.",
         )
 
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
+# pyrefly: ignore [missing-import]
 from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
@@ -396,6 +398,8 @@ def get_all_leaves(
             is_emergency=leave.is_emergency or False,
             is_half_day=leave.is_half_day or False,
             half_day_slot=leave.half_day_slot,
+            created_at=leave.created_at.isoformat() if leave.created_at else None,
+            updated_at=leave.updated_at.isoformat() if leave.updated_at else None,
         )
         for leave in leaves
     ]
@@ -492,6 +496,8 @@ def get_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=leave.created_at.isoformat() if leave.created_at else None,
+        updated_at=leave.updated_at.isoformat() if leave.updated_at else None,
     )
 
 
@@ -752,6 +758,8 @@ def create_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=leave.created_at.isoformat() if leave.created_at else None,
+        updated_at=leave.updated_at.isoformat() if leave.updated_at else None,
     )
 
 
@@ -891,6 +899,8 @@ def update_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=leave.created_at.isoformat() if leave.created_at else None,
+        updated_at=leave.updated_at.isoformat() if leave.updated_at else None,
     )
 
 
