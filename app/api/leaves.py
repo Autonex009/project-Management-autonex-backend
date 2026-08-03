@@ -393,6 +393,7 @@ def get_all_leaves(
             razorpay_applied=leave.razorpay_applied or False,
             flagged=leave.flagged or False,
             approval_remark=leave.approval_remark,
+            is_emergency=leave.is_emergency or False,
             is_half_day=leave.is_half_day or False,
             half_day_slot=leave.half_day_slot,
         )
@@ -488,6 +489,7 @@ def get_leave(
         status=leave.status or "pending",
         approved_by=leave.approved_by,
         razorpay_applied=leave.razorpay_applied or False,
+        is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
     )
@@ -657,6 +659,7 @@ def create_leave(
         end_date=payload.end_date,
         leave_type=payload.leave_type,
         reason=payload.reason,
+        is_emergency=payload.is_emergency or False,
         status="pending",
         flagged=flagged,
         is_half_day=payload.is_half_day or False,
@@ -746,6 +749,7 @@ def create_leave(
         razorpay_applied=leave.razorpay_applied or False,
         flagged=leave.flagged or False,
         approval_remark=leave.approval_remark,
+        is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
     )
@@ -866,6 +870,7 @@ def update_leave(
     leave.end_date = payload.end_date
     leave.leave_type = payload.leave_type
     leave.reason = payload.reason
+    leave.is_emergency = payload.is_emergency or False
     leave.status = "pending"  # reset to pending so PM re-reviews the edited request
     leave.is_half_day = payload.is_half_day or False
     leave.half_day_slot = payload.half_day_slot
@@ -883,6 +888,7 @@ def update_leave(
         razorpay_applied=leave.razorpay_applied or False,
         flagged=leave.flagged or False,
         approval_remark=leave.approval_remark,
+        is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
     )
@@ -1118,7 +1124,7 @@ def delete_leave(
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
     check_leave_access(leave.employee_id, current_user, db)
-    if leave.start_date <= date_type.today():
+    if leave.start_date <= date_type.today() and current_user.role not in ["admin", "hr"]:
         raise HTTPException(status_code=400, detail="Cannot delete a leave that has already started")
 
     # If this leave was pushed to Razorpay, reverse it there FIRST. If Razorpay rejects,
