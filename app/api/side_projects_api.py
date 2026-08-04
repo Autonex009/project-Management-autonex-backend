@@ -3,8 +3,10 @@ import logging
 from datetime import date, datetime
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from app.services.auth_service import get_current_user
+from app.services import audit_service
+from app.models.user import User
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -139,13 +141,42 @@ def list_side_projects(employee_id: Optional[int] = None, db: Session = Depends(
 
 
 @router.post("", response_model=SideProjectResponse, status_code=201)
-def create_side_project(payload: SideProjectCreate, db: Session = Depends(get_db)):
+def create_side_project(
+    payload: SideProjectCreate,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
     sp = SideProject(**payload.dict())
     db.add(sp)
+    db.flush()
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="side_project.created",
+        category="Side Projects",
+        action_type="Created",
+        entity_type="side_project",
+        entity_id=sp.id,
+        entity_name=sp.name,
+        subject_employee_id=sp.employee_id,
+        subject_name=employee.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", None, sp.status),
+            audit_service.field_diff(
+                "Period", None,
+                f"{sp.start_date} → {sp.end_date}" if sp.start_date else None,
+            ),
+        ),
+        summary=f"Added side project '{sp.name}' for {employee.name}",
+        request=http_request,
+    )
+
     db.commit()
     db.refresh(sp)
 
@@ -174,19 +205,31 @@ def create_side_project(payload: SideProjectCreate, db: Session = Depends(get_db
 
 
 @router.put("/{sp_id}", response_model=SideProjectResponse)
-def update_side_project(sp_id: int, payload: SideProjectUpdate, db: Session = Depends(get_db)):
+def update_side_project(
+    sp_id: int,
+    payload: SideProjectUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     sp = db.query(SideProject).filter(SideProject.id == sp_id).first()
     if not sp:
         raise HTTPException(status_code=404, detail="Side project not found")
+
     for key, value in payload.dict(exclude_unset=True).items():
         setattr(sp, key, value)
+
     db.commit()
     db.refresh(sp)
     return sp
 
 
 @router.delete("/{sp_id}")
-def delete_side_project(sp_id: int, db: Session = Depends(get_db)):
+def delete_side_project(
+    sp_id: int,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     sp = db.query(SideProject).filter(SideProject.id == sp_id).first()
     if not sp:
         raise HTTPException(status_code=404, detail="Side project not found")
@@ -196,6 +239,25 @@ def delete_side_project(sp_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Employee not found")
 
     pm_targets = _get_side_project_pm_targets(db, employee)
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="side_project.deleted",
+        category="Side Projects",
+        action_type="Deleted",
+        entity_type="side_project",
+        entity_id=sp.id,
+        entity_name=sp.name,
+        subject_employee_id=sp.employee_id,
+        subject_name=employee.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Status at deletion", sp.status, None),
+        ),
+        summary=f"Deleted side project '{sp.name}' for {employee.name}",
+        request=http_request,
+    )
+
     db.delete(sp)
     db.commit()
 
