@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.models.guideline import Guideline
+from app.models.user import User
+from app.services import audit_service
 
 router = APIRouter(prefix="/api/guidelines", tags=["Guidelines"], dependencies=[Depends(get_current_user)])
 
@@ -79,24 +81,49 @@ def get_guideline(guideline_id: int, db: Session = Depends(get_db)):
     return guideline
 
 
-@router.post("", response_model=GuidelineResponse, dependencies=[Depends(require_role("admin", "pm"))])
-def create_guideline(payload: GuidelineCreate, db: Session = Depends(get_db)):
-    guideline = Guideline(**payload.model_dump())
+@router.post("", response_model=GuidelineResponse)
+def create_guideline(
+    payload: GuidelineCreate,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
+    # uploaded_by is overwritten with the session user: it is the record of who put
+    # this document in front of the team, so a client-supplied value can't be trusted.
+    data = payload.model_dump()
+    data["uploaded_by"] = current_user.id
+    guideline = Guideline(**data)
     db.add(guideline)
+    db.flush()
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="guideline.created",
+        category="Guidelines",
+        action_type="Created",
+        entity_type="guideline",
+        entity_id=guideline.id,
+        entity_name=guideline.title,
+        summary=f"Created guideline '{guideline.title}'",
+        request=http_request,
+    )
+
     db.commit()
     db.refresh(guideline)
     return guideline
 
 
-@router.post("/upload", response_model=GuidelineResponse, dependencies=[Depends(require_role("admin", "pm"))])
+@router.post("/upload", response_model=GuidelineResponse)
 async def upload_guideline(
     request: Request,
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
     main_project_id: Optional[int] = Form(None),
     sub_project_id: Optional[int] = Form(None),
-    uploaded_by: Optional[int] = Form(None),
+    uploaded_by: Optional[int] = Form(None, deprecated=True),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
     original_name = Path(file.filename or "").name
     if not original_name:
@@ -124,10 +151,29 @@ async def upload_guideline(
         sub_project_id=sub_project_id,
         file_name=original_name,
         file_url=file_url,
-        uploaded_by=uploaded_by,
+        # From the session, not the form field: uploaded_by is the record of who put
+        # this document in front of the team.
+        uploaded_by=current_user.id,
     )
     try:
         db.add(guideline)
+        db.flush()
+        audit_service.record(
+            db,
+            actor=current_user,
+            action="guideline.uploaded",
+            category="Guidelines",
+            action_type="Created",
+            entity_type="guideline",
+            entity_id=guideline.id,
+            entity_name=guideline.title,
+            details=audit_service.changes(
+                audit_service.field_diff("File", None, original_name),
+                audit_service.field_diff("Size", None, f"{len(file_bytes) // 1024} KB"),
+            ),
+            summary=f"Uploaded guideline document '{guideline.title}' ({original_name})",
+            request=request,
+        )
         db.commit()
         db.refresh(guideline)
         return guideline
@@ -139,8 +185,13 @@ async def upload_guideline(
         raise HTTPException(status_code=500, detail=f"Failed to save guideline upload: {exc.__class__.__name__}") from exc
 
 
-@router.put("/{guideline_id}", response_model=GuidelineResponse, dependencies=[Depends(require_role("admin", "pm"))])
-def update_guideline(guideline_id: int, payload: GuidelineUpdate, db: Session = Depends(get_db)):
+@router.put("/{guideline_id}", response_model=GuidelineResponse)
+def update_guideline(
+    guideline_id: int,
+    payload: GuidelineUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     guideline = db.query(Guideline).filter(Guideline.id == guideline_id).first()
     if not guideline:
         raise HTTPException(status_code=404, detail="Guideline not found")
@@ -153,11 +204,35 @@ def update_guideline(guideline_id: int, payload: GuidelineUpdate, db: Session = 
     return guideline
 
 
-@router.delete("/{guideline_id}", dependencies=[Depends(require_role("admin", "pm"))])
-def delete_guideline(guideline_id: int, db: Session = Depends(get_db)):
+@router.delete("/{guideline_id}")
+def delete_guideline(
+    guideline_id: int,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     guideline = db.query(Guideline).filter(Guideline.id == guideline_id).first()
     if not guideline:
         raise HTTPException(status_code=404, detail="Guideline not found")
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="guideline.deleted",
+        category="Guidelines",
+        action_type="Deleted",
+        entity_type="guideline",
+        entity_id=guideline.id,
+        entity_name=guideline.title,
+        details=audit_service.changes(
+            audit_service.field_diff("File", guideline.file_name, None),
+        ),
+        summary=(
+            f"Deleted guideline '{guideline.title}'"
+            + (" and its uploaded file" if guideline.file_url else "")
+        ),
+        request=http_request,
+    )
 
     if guideline.file_url:
         delete_guideline_file(file_url=guideline.file_url, upload_dir=UPLOAD_DIR)

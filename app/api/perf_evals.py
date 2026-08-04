@@ -278,7 +278,9 @@ def create_eval(
         overall_comment=(payload.overall_comment or None),
         employee_overall_rating=_mean([pv.employee_rating for pv in payload.parameter_values]),
         status="submitted",
-        submitted_by=payload.submitted_by,
+        # From the session, not the payload: this column records who filed the
+        # self-evaluation and must not be settable by the client.
+        submitted_by=current_user.id,
     )
     db.add(ev)
     db.commit()
@@ -290,8 +292,13 @@ def create_eval(
     return ev
 
 
-@router.patch("/{eval_id}/review", response_model=PerfEvalResponse, dependencies=[Depends(require_role("admin", "pm"))])
-def review_eval(eval_id: int, payload: PerfEvalReview, db: Session = Depends(get_db)):
+@router.patch("/{eval_id}/review", response_model=PerfEvalResponse)
+def review_eval(
+    eval_id: int,
+    payload: PerfEvalReview,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     ev = db.query(PerfEvaluation).filter(PerfEvaluation.id == eval_id).first()
     if not ev:
         raise HTTPException(status_code=404, detail="Evaluation not found")
@@ -318,15 +325,21 @@ def review_eval(eval_id: int, payload: PerfEvalReview, db: Session = Depends(get
     ev.bonus_suggested = bool(payload.bonus_suggested)
     ev.bonus_note = (payload.bonus_note.strip() if payload.bonus_note else None)
     ev.status = "reviewed"
-    if payload.reviewed_by is not None:
-        ev.reviewed_by = payload.reviewed_by
+    # Reviewer from the session — payload.reviewed_by is client-supplied and this is
+    # the record of who signed off on someone's performance.
+    ev.reviewed_by = current_user.id
+
     db.commit()
     db.refresh(ev)
     return ev
 
 
-@router.delete("/{eval_id}", dependencies=[Depends(require_role("admin", "pm"))])
-def delete_eval(eval_id: int, db: Session = Depends(get_db)):
+@router.delete("/{eval_id}")
+def delete_eval(
+    eval_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     ev = db.query(PerfEvaluation).filter(PerfEvaluation.id == eval_id).first()
     if not ev:
         raise HTTPException(status_code=404, detail="Evaluation not found")

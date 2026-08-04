@@ -47,6 +47,11 @@ from app.api.employees import router as employees_router
 from app.api.payroll import _classify_year_leaves
 
 
+# The user id the auth override reports. `converted_by` must end up as this, never
+# whatever the request body claims.
+SESSION_USER_ID = 1
+
+
 @pytest.fixture()
 def client_and_db():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -64,7 +69,7 @@ def client_and_db():
     app.include_router(employees_router)
     from app.services.auth_service import get_current_user
     def override_get_current_user():
-        return User(id=1, email="admin@x.com", name="Boss", role="admin", is_active=True)
+        return User(id=SESSION_USER_ID, email="admin@x.com", name="Boss", role="admin", is_active=True)
 
     app.dependency_overrides[database.get_db] = override_get_db
     app.dependency_overrides[get_current_user] = override_get_current_user
@@ -100,6 +105,9 @@ def test_convert_preserves_record_and_audits(client_and_db):
                  start_date=date(2026, 1, 5), end_date=date(2026, 1, 5), status="approved"))
     db.commit()
 
+    # Deliberately claims a different promoter in the body than the authenticated
+    # session, to prove the payload value is ignored.
+    assert admin.id != SESSION_USER_ID
     resp = client.post(f"/api/employees/{emp_id}/convert-to-fulltime", json={"converted_by": admin.id})
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -108,7 +116,9 @@ def test_convert_preserves_record_and_audits(client_and_db):
     assert body["id"] == emp_id
     assert body["employee_type"] == "Full-time"
     assert body["previous_employee_type"] == "Intern"
-    assert body["converted_by"] == admin.id
+    # The promoter is taken from the authenticated session, NOT from the request body —
+    # otherwise any admin could attribute a promotion to a colleague.
+    assert body["converted_by"] == SESSION_USER_ID
     assert body["converted_to_fulltime_at"] is not None
 
     # Linked history preserved (same employee_id).

@@ -40,6 +40,7 @@ from app.services.email_service import (
     try_send_signup_rejected_email,
 )
 from app.services.identity_validator import check_duplicate_identity
+from app.services import audit_service
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/signup-requests", tags=["signup-requests"])
@@ -266,7 +267,11 @@ def check_email_verification(
 
 
 @router.post("", response_model=SignupRequestResponse, status_code=201)
-def submit_signup_request(payload: SignupRequestCreate, db: Session = Depends(get_db)):
+def submit_signup_request(
+    payload: SignupRequestCreate,
+    http_request: Request,
+    db: Session = Depends(get_db),
+):
     """Step 2 — public, but only reachable with a valid verification token.
 
     The email comes from the token, not the body, so the stored address is always
@@ -298,6 +303,30 @@ def submit_signup_request(payload: SignupRequestCreate, db: Session = Depends(ge
         status="pending",
     )
     db.add(req)
+    db.flush()
+
+    # actor=None: this endpoint is public and the submitter has no account yet, so
+    # there is no authenticated identity to attribute. The verified email address on
+    # the entity is the strongest identifier available.
+    audit_service.record(
+        db,
+        actor=None,
+        action="signup_request.submitted",
+        category="Access",
+        action_type="Applied",
+        entity_type="signup_request",
+        entity_id=req.id,
+        entity_name=req.name,
+        subject_name=req.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Email", None, req.email),
+            audit_service.field_diff("Designation", None, req.designation),
+            audit_service.field_diff("Employee type", None, req.employee_type),
+            audit_service.field_diff("Status", None, req.status),
+        ),
+        summary=f"{req.name} ({req.email}) requested portal access",
+        request=http_request,
+    )
     db.commit()
     db.refresh(req)
 
@@ -367,13 +396,19 @@ def list_signup_requests(
     )
 
 
-@router.patch("/{request_id}/approve", dependencies=[Depends(require_role("admin"))])
+@router.patch("/{request_id}/approve")
 def approve_signup_request(
     request_id: int,
-    reviewed_by: int = Query(0),
+    http_request: Request,
+    reviewed_by: int = Query(0, deprecated=True),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Approve a signup request — creates employee + user accounts and emails credentials."""
+    """Approve a signup request — creates employee + user accounts and emails credentials.
+
+    The reviewer is taken from the authenticated session. ``reviewed_by`` is still
+    accepted so existing callers keep working, but it is ignored: a client-supplied
+    reviewer id let any admin attribute an approval to a colleague."""
     req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="Signup request not found")
@@ -444,9 +479,35 @@ def approve_signup_request(
     db.flush()
 
     # Mark request approved
+    previous_status = req.status
     req.status = "approved"
-    req.reviewed_by = reviewed_by
+    req.reviewed_by = current_user.id
     req.reviewed_at = datetime.utcnow()
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="signup_request.approved",
+        category="Access",
+        action_type="Approved",
+        entity_type="signup_request",
+        entity_id=req.id,
+        entity_name=req.name,
+        subject_employee_id=employee.id,
+        subject_name=req.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "approved"),
+            audit_service.field_diff("Employee account", None, f"#{employee.id}"),
+            audit_service.field_diff("User account", None, f"#{user.id}"),
+            audit_service.field_diff("Designation", None, req.designation),
+            audit_service.field_diff("Employee type", None, req.employee_type),
+        ),
+        summary=(
+            f"Approved signup for {req.name} ({req.email}) — employee and login "
+            f"account created"
+        ),
+        request=http_request,
+    )
     db.commit()
 
     logger.info("[signup-request] Approved id=%s → employee id=%s user id=%s", req.id, employee.id, user.id)
@@ -460,9 +521,9 @@ def approve_signup_request(
     )
 
     # In-app notification to the approving admin
-    if reviewed_by:
+    if current_user.id:
         _push_notification(
-            db, reviewed_by,
+            db, current_user.id,
             f"Account created for {req.name}",
             f"Employee account for {req.name} ({req.email}) has been created successfully. Login credentials were sent via email.",
             "signup_approved",
@@ -481,11 +542,13 @@ class UpdateSignupRequest(BaseModel):
     designation: Optional[str] = None
 
 
-@router.patch("/{request_id}", response_model=SignupRequestResponse, dependencies=[Depends(require_role("admin"))])
+@router.patch("/{request_id}", response_model=SignupRequestResponse)
 def update_signup_request(
     request_id: int,
     payload: UpdateSignupRequest,
+    http_request: Request,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
 ):
     """Update editable fields (employee_type, designation) on a pending signup request."""
     req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
@@ -494,10 +557,38 @@ def update_signup_request(
     if req.status != "pending":
         raise HTTPException(status_code=400, detail="Only pending requests can be edited")
 
+    old_type = req.employee_type
+    old_designation = req.designation
+
     if payload.employee_type is not None:
         req.employee_type = payload.employee_type
     if payload.designation is not None:
         req.designation = payload.designation
+
+    details = audit_service.changes(
+        audit_service.field_diff("Employee type", old_type, req.employee_type),
+        audit_service.field_diff("Designation", old_designation, req.designation),
+    )
+    if details:
+        # Designation decides the login role granted at approval time, so editing it
+        # pre-approval is effectively choosing what access this person will get.
+        audit_service.record(
+            db,
+            actor=current_user,
+            action="signup_request.updated",
+            category="Access",
+            action_type="Updated",
+            entity_type="signup_request",
+            entity_id=req.id,
+            entity_name=req.name,
+            subject_name=req.name,
+            details=details,
+            summary=(
+                f"Edited pending signup request for {req.name} — "
+                + ", ".join(d["field"] for d in details)
+            ),
+            request=http_request,
+        )
 
     db.commit()
     db.refresh(req)
@@ -505,24 +596,47 @@ def update_signup_request(
     return _to_response(req)
 
 
-@router.patch("/{request_id}/reject", dependencies=[Depends(require_role("admin"))])
+@router.patch("/{request_id}/reject")
 def reject_signup_request(
     request_id: int,
-    reviewed_by: int = Query(0),
+    http_request: Request,
+    reviewed_by: int = Query(0, deprecated=True),
     body: RejectBody = RejectBody(),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
 ):
-    """Reject a signup request and optionally notify the applicant."""
+    """Reject a signup request and optionally notify the applicant.
+
+    Reviewer comes from the session; ``reviewed_by`` is ignored."""
     req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="Signup request not found")
     if req.status != "pending":
         raise HTTPException(status_code=400, detail=f"Request is already {req.status}")
 
+    previous_status = req.status
     req.status = "rejected"
-    req.reviewed_by = reviewed_by
+    req.reviewed_by = current_user.id
     req.reviewed_at = datetime.utcnow()
     req.rejection_reason = body.reason
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="signup_request.rejected",
+        category="Access",
+        action_type="Rejected",
+        entity_type="signup_request",
+        entity_id=req.id,
+        entity_name=req.name,
+        subject_name=req.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "rejected"),
+            audit_service.field_diff("Reason", None, body.reason),
+        ),
+        summary=f"Rejected signup request from {req.name} ({req.email})",
+        request=http_request,
+    )
     db.commit()
 
     logger.info("[signup-request] Rejected id=%s email=%s reason=%s", req.id, req.email, body.reason)
@@ -533,32 +647,56 @@ def reject_signup_request(
     return {"message": f"Signup request rejected. {req.email} has been notified.", "request_id": request_id}
 
 
-@router.patch("/{request_id}/undo-reject", dependencies=[Depends(require_role("admin"))])
+@router.patch("/{request_id}/undo-reject")
 def undo_reject_signup_request(
     request_id: int,
-    reviewed_by: int = Query(0),
+    http_request: Request,
+    reviewed_by: int = Query(0, deprecated=True),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
 ):
     req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="Signup request not found")
     if req.status != "rejected":
         raise HTTPException(status_code=400, detail=f"Request is not rejected (status: {req.status})")
+    previous_status = req.status
+    previous_reason = req.rejection_reason
     req.status = "pending"
-    req.reviewed_by = reviewed_by
+    req.reviewed_by = current_user.id
     req.reviewed_at = datetime.utcnow()
     req.rejection_reason = None
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="signup_request.reject_undone",
+        category="Access",
+        action_type="Restored",
+        entity_type="signup_request",
+        entity_id=req.id,
+        entity_name=req.name,
+        subject_name=req.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "pending"),
+            audit_service.field_diff("Reason", previous_reason, None),
+        ),
+        summary=f"Reopened rejected signup request from {req.name} ({req.email})",
+        request=http_request,
+    )
     db.commit()
     logger.info("[signup-request] Undo-reject id=%s email=%s", req.id, req.email)
     return {"message": "Signup request reopened.", "request_id": request_id}
 
 
-@router.patch("/{request_id}/undo-approve", dependencies=[Depends(require_role("admin"))])
+@router.patch("/{request_id}/undo-approve")
 def undo_approve_signup_request(
     request_id: int,
-    reviewed_by: int = Query(0),
+    http_request: Request,
+    reviewed_by: int = Query(0, deprecated=True),
     body: RejectBody = RejectBody(),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
 ):
     req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
     if not req:
@@ -571,10 +709,37 @@ def undo_approve_signup_request(
     employee = db.query(Employee).filter(Employee.email == req.email).first()
     if employee:
         employee.status = "inactive"
+    previous_status = req.status
     req.status = "rejected"
-    req.reviewed_by = reviewed_by
+    req.reviewed_by = current_user.id
     req.reviewed_at = datetime.utcnow()
     req.rejection_reason = body.reason
+
+    # This one revokes a live login and deactivates a person's employee record, so
+    # it is the most consequential action in this file — worth the detail.
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="signup_request.approval_revoked",
+        category="Access",
+        action_type="Restored",
+        entity_type="signup_request",
+        entity_id=req.id,
+        entity_name=req.name,
+        subject_employee_id=employee.id if employee else None,
+        subject_name=req.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "rejected"),
+            audit_service.field_diff("Login access", "active", "disabled" if user else None),
+            audit_service.field_diff("Employee status", "active", "inactive" if employee else None),
+            audit_service.field_diff("Reason", None, body.reason),
+        ),
+        summary=(
+            f"Revoked approved signup for {req.name} ({req.email}) — login disabled "
+            f"and employee record deactivated"
+        ),
+        request=http_request,
+    )
     db.commit()
     logger.info("[signup-request] Undo-approve id=%s email=%s — account deactivated", req.id, req.email)
     return {"message": "Approval revoked. Employee account has been deactivated.", "request_id": request_id}

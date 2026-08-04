@@ -2,8 +2,9 @@
 Sub-Projects API — The NEW intermediate hierarchy level.
 Hierarchy: MainProject → SubProject → DailySheet → Allocations
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from app.services.auth_service import get_current_user, require_role
+from app.services import audit_service
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
@@ -12,6 +13,17 @@ from datetime import date, datetime
 from app.db.database import get_db
 from app.models.sub_project import SubProject
 from app.models.parent_project import MainProject
+from app.models.user import User
+
+SUB_PROJECT_FIELD_LABELS = {
+    "name": "Name",
+    "client": "Client",
+    "pm_id": "Project manager",
+    "description": "Description",
+    "start_date": "Start date",
+    "duration_days": "Duration (days)",
+    "status": "Status",
+}
 
 router = APIRouter(prefix="/api/sub-projects-new", tags=["sub-projects-new"], dependencies=[Depends(get_current_user)])
 
@@ -57,8 +69,13 @@ class SubProjectResponse(BaseModel):
 
 # ── Endpoints ───────────────────────────────────────────────────────
 
-@router.post("", response_model=SubProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
-def create_sub_project(payload: SubProjectCreate, db: Session = Depends(get_db)):
+@router.post("", response_model=SubProjectResponse)
+def create_sub_project(
+    payload: SubProjectCreate,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     """Create a new sub-project under a main project."""
     # Verify main project exists
     main = db.query(MainProject).filter(MainProject.id == payload.main_project_id).first()
@@ -72,6 +89,26 @@ def create_sub_project(payload: SubProjectCreate, db: Session = Depends(get_db))
 
     sp = SubProject(**data)
     db.add(sp)
+    db.flush()
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="sub_project.created",
+        category="Projects",
+        action_type="Created",
+        entity_type="sub_project",
+        entity_id=sp.id,
+        entity_name=sp.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Parent project", None, main.name),
+            audit_service.field_diff("Client", None, sp.client),
+            audit_service.field_diff("Status", None, sp.status),
+        ),
+        summary=f"Created sub-project {sp.name} under {main.name}",
+        request=http_request,
+    )
+
     db.commit()
     db.refresh(sp)
     return sp
@@ -97,29 +134,75 @@ def get_sub_project(sub_project_id: int, db: Session = Depends(get_db)):
     return sp
 
 
-@router.put("/{sub_project_id}", response_model=SubProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
+@router.put("/{sub_project_id}", response_model=SubProjectResponse)
 def update_sub_project(
     sub_project_id: int,
     payload: SubProjectUpdate,
+    http_request: Request,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
     sp = db.query(SubProject).filter(SubProject.id == sub_project_id).first()
     if not sp:
         raise HTTPException(status_code=404, detail="Sub-project not found")
 
-    for key, value in payload.dict(exclude_unset=True).items():
+    update_data = payload.dict(exclude_unset=True)
+    before = audit_service.snapshot(sp, update_data.keys())
+
+    for key, value in update_data.items():
         setattr(sp, key, value)
+
+    details = audit_service.diff_all(before, sp, SUB_PROJECT_FIELD_LABELS)
+    if details:
+        audit_service.record(
+            db,
+            actor=current_user,
+            action="sub_project.updated",
+            category="Projects",
+            action_type="Updated",
+            entity_type="sub_project",
+            entity_id=sp.id,
+            entity_name=sp.name,
+            details=details,
+            summary=(
+                f"Updated sub-project {sp.name} — "
+                + ", ".join(d["field"] for d in details[:4])
+            ),
+            request=http_request,
+        )
 
     db.commit()
     db.refresh(sp)
     return sp
 
 
-@router.delete("/{sub_project_id}", dependencies=[Depends(require_role("admin", "pm"))])
-def delete_sub_project(sub_project_id: int, db: Session = Depends(get_db)):
+@router.delete("/{sub_project_id}")
+def delete_sub_project(
+    sub_project_id: int,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     sp = db.query(SubProject).filter(SubProject.id == sub_project_id).first()
     if not sp:
         raise HTTPException(status_code=404, detail="Sub-project not found")
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="sub_project.deleted",
+        category="Projects",
+        action_type="Deleted",
+        entity_type="sub_project",
+        entity_id=sp.id,
+        entity_name=sp.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Client", sp.client, None),
+            audit_service.field_diff("Status at deletion", sp.status, None),
+        ),
+        summary=f"Deleted sub-project {sp.name}",
+        request=http_request,
+    )
 
     db.delete(sp)
     db.commit()

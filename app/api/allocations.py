@@ -1,5 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from app.services.auth_service import get_current_user, require_role
+from app.services import audit_service
 from app.models.user import User
 from sqlalchemy.orm import Session
 from typing import List
@@ -202,8 +203,13 @@ def validate_allocation(
     )
 
 
-@router.post("", response_model=dict, dependencies=[Depends(require_role("admin", "pm"))])
-def create_allocation(data: AllocationCreate, db: Session = Depends(get_db)):
+@router.post("", response_model=dict)
+def create_allocation(
+    data: AllocationCreate,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     """Create a new allocation with validation."""
     # Validate time distribution if provided
     if data.time_distribution:
@@ -258,6 +264,38 @@ def create_allocation(data: AllocationCreate, db: Session = Depends(get_db)):
             Allocation.sub_project_id == data.sub_project_id
         ).count()
         project.allocated_employees = actual_count
+
+    allocated_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
+    allocated_name = allocated_employee.name if allocated_employee else None
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="allocation.created",
+        category="Allocations",
+        action_type="Created",
+        entity_type="allocation",
+        entity_id=allocation.id,
+        entity_name=allocated_name,
+        subject_employee_id=allocation.employee_id,
+        subject_name=allocated_name,
+        details=audit_service.changes(
+            audit_service.field_diff("Project", None, project.name if project else f"#{data.sub_project_id}"),
+            audit_service.field_diff("Daily hours", None, allocation.total_daily_hours),
+            audit_service.field_diff(
+                "Active period", None,
+                f"{allocation.active_start_date} → {allocation.active_end_date}",
+            ),
+            # Worth recording explicitly: an overbooking that was consciously forced
+            # through is exactly the decision someone will later ask about.
+            audit_service.field_diff("Overbooking override", None, True if data.override_flag else None),
+        ),
+        summary=(
+            f"Assigned {allocated_name or 'employee'} to "
+            f"{project.name if project else 'a project'}"
+            + (f" at {allocation.total_daily_hours}h/day" if allocation.total_daily_hours else "")
+        ),
+        request=http_request,
+    )
 
     db.commit()
     db.refresh(allocation)
@@ -369,11 +407,13 @@ def get_allocations_by_employee(
     return [enrich_allocation_response(a, db) for a in allocations]
 
 
-@router.put("/{allocation_id}", response_model=dict, dependencies=[Depends(require_role("admin", "pm"))])
+@router.put("/{allocation_id}", response_model=dict)
 def update_allocation(
     allocation_id: int,
     data: AllocationUpdate,
-    db: Session = Depends(get_db)
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
     """Update an allocation with validation."""
     allocation = db.query(Allocation).filter(Allocation.id == allocation_id).first()
@@ -428,6 +468,13 @@ def update_allocation(
 
     old_sub_project_id = allocation.sub_project_id
 
+    # Snapshot every field the caller is about to overwrite, before overwriting it.
+    # Read after the setattr loop and the "from" side of each diff would already be
+    # the new value.
+    changed_keys = list(data.model_dump(exclude_unset=True).keys())
+    before_values = {key: getattr(allocation, key, None) for key in changed_keys}
+    old_employee_id = allocation.employee_id
+
     for key, value in data.model_dump(exclude_unset=True).items():
         setattr(allocation, key, value)
 
@@ -447,6 +494,56 @@ def update_allocation(
             ).count()
             project.allocated_employees = actual_count
 
+    # Human-readable labels for the fields people actually care about; anything else
+    # falls back to its raw column name rather than being dropped silently.
+    FIELD_LABELS = {
+        "employee_id": "Employee",
+        "sub_project_id": "Project",
+        "total_daily_hours": "Daily hours",
+        "active_start_date": "Start date",
+        "active_end_date": "End date",
+        "time_distribution": "Time split",
+        "override_flag": "Overbooking override",
+    }
+    updated_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
+    updated_name = updated_employee.name if updated_employee else None
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="allocation.updated",
+        category="Allocations",
+        action_type="Updated",
+        entity_type="allocation",
+        entity_id=allocation.id,
+        entity_name=updated_name,
+        subject_employee_id=allocation.employee_id,
+        subject_name=updated_name,
+        details=audit_service.changes(
+            *[
+                audit_service.field_diff(
+                    FIELD_LABELS.get(key, key),
+                    before_values.get(key),
+                    getattr(allocation, key, None),
+                )
+                for key in changed_keys
+            ]
+        ),
+        summary=(
+            f"Updated allocation for {updated_name or 'employee'}"
+            + (
+                " — reassigned to a different project"
+                if allocation.sub_project_id != old_sub_project_id
+                else ""
+            )
+            + (
+                " — moved to a different employee"
+                if allocation.employee_id != old_employee_id
+                else ""
+            )
+        ),
+        request=http_request,
+    )
+
     db.commit()
     db.refresh(allocation)
 
@@ -459,16 +556,47 @@ def update_allocation(
     return response
 
 
-@router.delete("/{allocation_id}", dependencies=[Depends(require_role("admin", "pm"))])
-def delete_allocation(allocation_id: int, db: Session = Depends(get_db)):
+@router.delete("/{allocation_id}")
+def delete_allocation(
+    allocation_id: int,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     """Delete an allocation."""
     allocation = db.query(Allocation).filter(Allocation.id == allocation_id).first()
-    
+
     if not allocation:
         raise HTTPException(status_code=404, detail="Allocation not found")
-    
+
     sub_project_id = allocation.sub_project_id
     project = db.query(Project).filter(Project.id == sub_project_id).first()
+
+    # Captured before the delete — afterwards there is no row left to describe.
+    removed_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
+    removed_name = removed_employee.name if removed_employee else None
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="allocation.removed",
+        category="Allocations",
+        action_type="Deleted",
+        entity_type="allocation",
+        entity_id=allocation.id,
+        entity_name=removed_name,
+        subject_employee_id=allocation.employee_id,
+        subject_name=removed_name,
+        details=audit_service.changes(
+            audit_service.field_diff("Project", project.name if project else f"#{sub_project_id}", None),
+            audit_service.field_diff("Daily hours", allocation.total_daily_hours, None),
+        ),
+        summary=(
+            f"Removed {removed_name or 'employee'} from "
+            f"{project.name if project else 'a project'}"
+        ),
+        request=http_request,
+    )
+
     db.delete(allocation)
     db.flush()
 
