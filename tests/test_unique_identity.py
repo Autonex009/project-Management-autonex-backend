@@ -215,7 +215,7 @@ def test_update_employee_duplicate(client_and_db):
     assert resp_update_phone.status_code == 409
 
 
-def test_auth_signup_duplicate_email(client_and_db):
+def test_signup_request_duplicate_email(client_and_db):
     client, db = client_and_db
     
     # 1. Create Employee A
@@ -225,13 +225,8 @@ def test_auth_signup_duplicate_email(client_and_db):
         "employee_type": "Full-time"
     })
 
-    # 2. Try to sign up via public signup auth endpoint with duplicate email
-    resp = client.post("/api/auth/signup", json={
-        "name": "Register Duplicate",
-        "email": "a@autonex.com",
-        "password": "mypassword123",
-        "role": "employee"
-    })
+    # 2. Try to sign up via signup-requests endpoint with duplicate email
+    resp = submit_signup(client, email="a@autonex.com", name="Register Duplicate", password="mypassword123")
     assert resp.status_code == 409
 
 
