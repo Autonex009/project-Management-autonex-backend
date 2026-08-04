@@ -33,6 +33,7 @@ from app.services import audit_service
 
 # Column → display name for audit diffs. Anything unmapped falls back to a humanised
 # column name, so a new field still shows up rather than being silently dropped.
+# Keys must be real Employee columns — see app/models/employee.py.
 EMPLOYEE_FIELD_LABELS = {
     "name": "Name",
     "email": "Email",
@@ -40,14 +41,14 @@ EMPLOYEE_FIELD_LABELS = {
     "designation": "Designation",
     "employee_type": "Employee type",
     "status": "Status",
-    "work_model": "Work model",
     "working_hours_per_day": "Working hours/day",
     "weekly_availability": "Weekly availability",
     "productivity_baseline": "Productivity baseline",
     "skills": "Skills",
-    "date_of_joining": "Date of joining",
     "encord_id": "Encord ID",
     "razorpay_email": "Razorpay email",
+    "slack_user_id": "Slack user ID",
+    "mentor_id": "Mentor",
 }
 
 
@@ -148,7 +149,6 @@ def create_employee(
             audit_service.field_diff("Designation", None, employee.designation),
             audit_service.field_diff("Employee type", None, employee.employee_type),
             audit_service.field_diff("Email", None, employee.email),
-            audit_service.field_diff("Work model", None, employee.work_model),
             audit_service.field_diff("Login role", None, user.role),
             # Deliberately records only *whether* a salary was set, never the figure —
             # the plaintext lives nowhere and the audit log must not become the one place
