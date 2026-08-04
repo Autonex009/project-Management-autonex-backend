@@ -2,8 +2,9 @@
 import logging
 from datetime import date, timedelta
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from app.services.auth_service import get_current_user, require_role
+from app.services import audit_service
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field, validator
 
@@ -210,6 +211,7 @@ def get_wfh_requests(
 @router.post("", response_model=WFHResponse, status_code=201)
 def create_wfh_request(
     payload: WFHCreate,
+    http_request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -251,6 +253,40 @@ def create_wfh_request(
     db.add(req)
     db.commit()
     db.refresh(req)
+
+    wfh_period = (
+        f"{req.wfh_date} → {req.end_date}"
+        if req.end_date and req.end_date != req.wfh_date
+        else str(req.wfh_date)
+    )
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="wfh.applied",
+        category="WFH",
+        action_type="Applied",
+        entity_type="wfh_request",
+        entity_id=req.id,
+        entity_name=employee.name,
+        subject_employee_id=employee.id,
+        subject_name=employee.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Dates", None, wfh_period),
+            audit_service.field_diff("Reason", None, req.reason),
+            audit_service.field_diff("Status", None, req.status),
+            audit_service.field_diff("Over WFH limit", None, True if is_flagged else None),
+        ),
+        summary=(
+            "Applied for WFH"
+            + (
+                f" on behalf of {employee.name}"
+                if current_user.employee_id != employee.id
+                else ""
+            )
+            + f" ({wfh_period})"
+        ),
+        request=http_request,
+    )
 
     # Notify employee (in-app)
     emp_user = db.query(User).filter(User.employee_id == employee.id).first()
@@ -296,14 +332,16 @@ def create_wfh_request(
     return _build_response(req, db)
 
 
-@router.patch("/{wfh_id}/approve", dependencies=[Depends(require_role("admin", "pm"))])
+@router.patch("/{wfh_id}/approve")
 def approve_wfh(
     wfh_id: int,
-    approved_by: int = Query(0),
+    http_request: Request,
+    approved_by: int = Query(0, deprecated=True),
     body: WFHApproveBody = WFHApproveBody(),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
-    """Approve a WFH request."""
+    """Approve a WFH request. Approver comes from the session; ``approved_by`` is ignored."""
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
@@ -315,12 +353,35 @@ def approve_wfh(
         )
 
     employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
-    approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
-    approver_name = approver.name if approver else "Admin"
+    approver_name = current_user.name or "Admin"
 
+    previous_status = req.status
+    previous_remark = req.remark
     req.status = "approved"
-    req.approved_by = approved_by
+    req.approved_by = current_user.id
     req.remark = body.remark
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="wfh.approved",
+        category="WFH",
+        action_type="Approved",
+        entity_type="wfh_request",
+        entity_id=req.id,
+        entity_name=employee.name if employee else None,
+        subject_employee_id=req.employee_id,
+        subject_name=employee.name if employee else None,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "approved"),
+            audit_service.field_diff("Remark", previous_remark, req.remark),
+        ),
+        summary=(
+            f"Approved WFH for {employee.name if employee else 'employee'} "
+            f"({req.wfh_date}{f' → {req.end_date}' if req.end_date and req.end_date != req.wfh_date else ''})"
+        ),
+        request=http_request,
+    )
     db.commit()
 
     emp_user = db.query(User).filter(User.employee_id == req.employee_id).first()
@@ -333,24 +394,49 @@ def approve_wfh(
     return {"message": "WFH request approved", "wfh_id": wfh_id, "status": "approved"}
 
 
-@router.patch("/{wfh_id}/reject", dependencies=[Depends(require_role("admin", "pm"))])
+@router.patch("/{wfh_id}/reject")
 def reject_wfh(
     wfh_id: int,
-    approved_by: int = Query(0),
+    http_request: Request,
+    approved_by: int = Query(0, deprecated=True),
     body: WFHApproveBody = WFHApproveBody(),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
-    """Reject a WFH request."""
+    """Reject a WFH request. Rejecter comes from the session; ``approved_by`` is ignored."""
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
 
-    approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
-    approver_name = approver.name if approver else "Admin"
+    approver_name = current_user.name or "Admin"
+    employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
 
+    previous_status = req.status
     req.status = "rejected"
-    req.approved_by = approved_by
+    req.approved_by = current_user.id
     req.remark = body.remark
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="wfh.rejected",
+        category="WFH",
+        action_type="Rejected",
+        entity_type="wfh_request",
+        entity_id=req.id,
+        entity_name=employee.name if employee else None,
+        subject_employee_id=req.employee_id,
+        subject_name=employee.name if employee else None,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "rejected"),
+            audit_service.field_diff("Remark", None, req.remark),
+        ),
+        summary=(
+            f"Rejected WFH for {employee.name if employee else 'employee'} "
+            f"({req.wfh_date})"
+        ),
+        request=http_request,
+    )
     db.commit()
 
     emp_user = db.query(User).filter(User.employee_id == req.employee_id).first()
@@ -363,9 +449,15 @@ def reject_wfh(
     return {"message": "WFH request rejected", "wfh_id": wfh_id, "status": "rejected"}
 
 
-@router.patch("/{wfh_id}/undo-reject", dependencies=[Depends(require_role("admin", "pm"))])
-def undo_reject_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Depends(get_db)):
-    """Reopen a rejected WFH request back to pending."""
+@router.patch("/{wfh_id}/undo-reject")
+def undo_reject_wfh(
+    wfh_id: int,
+    http_request: Request,
+    approved_by: int = Query(0, deprecated=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
+    """Reopen a rejected WFH request back to pending. ``approved_by`` is ignored."""
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
@@ -389,8 +481,32 @@ def undo_reject_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Depe
             detail=f"Cannot reopen — it now overlaps another active WFH request ({overlap.wfh_date} – {overlap_end}).",
         )
 
+    previous_status = req.status
     req.status = "pending"
-    req.approved_by = approved_by
+    req.approved_by = current_user.id
+
+    reopened_employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="wfh.reject_undone",
+        category="WFH",
+        action_type="Restored",
+        entity_type="wfh_request",
+        entity_id=req.id,
+        entity_name=reopened_employee.name if reopened_employee else None,
+        subject_employee_id=req.employee_id,
+        subject_name=reopened_employee.name if reopened_employee else None,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "pending"),
+        ),
+        summary=(
+            f"Reopened a rejected WFH request for "
+            f"{reopened_employee.name if reopened_employee else 'employee'} "
+            f"({req.wfh_date}) — back to pending"
+        ),
+        request=http_request,
+    )
     db.commit()
 
     emp_user = db.query(User).filter(User.employee_id == req.employee_id).first()
@@ -403,17 +519,47 @@ def undo_reject_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Depe
     return {"message": "WFH request reopened", "wfh_id": wfh_id, "status": "pending"}
 
 
-@router.patch("/{wfh_id}/undo-approve", dependencies=[Depends(require_role("admin", "pm"))])
-def undo_approve_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Depends(get_db)):
-    """Revoke an approval, reverting the WFH request back to pending."""
+@router.patch("/{wfh_id}/undo-approve")
+def undo_approve_wfh(
+    wfh_id: int,
+    http_request: Request,
+    approved_by: int = Query(0, deprecated=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
+    """Revoke an approval, reverting the WFH request back to pending. ``approved_by`` ignored."""
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
     if req.status != "approved":
         raise HTTPException(status_code=400, detail=f"WFH request is not approved (status: {req.status})")
 
+    previous_status = req.status
     req.status = "pending"
-    req.approved_by = approved_by
+    req.approved_by = current_user.id
+
+    revoked_employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="wfh.approval_revoked",
+        category="WFH",
+        action_type="Restored",
+        entity_type="wfh_request",
+        entity_id=req.id,
+        entity_name=revoked_employee.name if revoked_employee else None,
+        subject_employee_id=req.employee_id,
+        subject_name=revoked_employee.name if revoked_employee else None,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "pending"),
+        ),
+        summary=(
+            f"Revoked WFH approval for "
+            f"{revoked_employee.name if revoked_employee else 'employee'} "
+            f"({req.wfh_date}) — back to pending"
+        ),
+        request=http_request,
+    )
     db.commit()
 
     emp_user = db.query(User).filter(User.employee_id == req.employee_id).first()
@@ -430,6 +576,7 @@ def undo_approve_wfh(wfh_id: int, approved_by: int = Query(0), db: Session = Dep
 def update_wfh_request(
     wfh_id: int,
     payload: WFHCreate,
+    http_request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -468,11 +615,42 @@ def update_wfh_request(
     # Validate WFH limit
     is_flagged = _validate_wfh_limit(db, employee, payload.wfh_date, end_date, exclude_wfh_id=wfh_id)
 
+    before = audit_service.snapshot(req, ["wfh_date", "end_date", "reason", "status", "flagged"])
+
     req.wfh_date = payload.wfh_date
     req.end_date = end_date
     req.reason = payload.reason
     req.status = "pending"  # reset so manager re-reviews
     req.flagged = is_flagged
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="wfh.updated",
+        category="WFH",
+        action_type="Updated",
+        entity_type="wfh_request",
+        entity_id=req.id,
+        entity_name=employee.name,
+        subject_employee_id=req.employee_id,
+        subject_name=employee.name,
+        details=audit_service.diff_all(
+            before,
+            req,
+            {
+                "wfh_date": "Start date",
+                "end_date": "End date",
+                "reason": "Reason",
+                "status": "Status",
+                "flagged": "Over WFH limit",
+            },
+        ),
+        summary=(
+            f"Edited WFH request for {employee.name} ({req.wfh_date}) — "
+            f"reset to pending for re-approval"
+        ),
+        request=http_request,
+    )
     db.commit()
     db.refresh(req)
     return _build_response(req, db)
@@ -481,6 +659,7 @@ def update_wfh_request(
 @router.delete("/{wfh_id}")
 def delete_wfh(
     wfh_id: int,
+    http_request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -490,6 +669,31 @@ def delete_wfh(
     check_wfh_access(req.employee_id, current_user, db)
     if req.wfh_date <= date.today() and current_user.role not in ["admin", "hr"]:
         raise HTTPException(status_code=400, detail="Cannot delete a WFH request on or after its date")
+
+    deleted_employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    deleted_name = deleted_employee.name if deleted_employee else None
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="wfh.deleted",
+        category="WFH",
+        action_type="Deleted",
+        entity_type="wfh_request",
+        entity_id=req.id,
+        entity_name=deleted_name,
+        subject_employee_id=req.employee_id,
+        subject_name=deleted_name,
+        details=audit_service.changes(
+            audit_service.field_diff("Dates", f"{req.wfh_date} → {req.end_date or req.wfh_date}", None),
+            audit_service.field_diff("Status at deletion", req.status, None),
+        ),
+        summary=(
+            f"Deleted WFH request for {deleted_name or 'employee'} "
+            f"({req.wfh_date}), was {req.status}"
+        ),
+        request=http_request,
+    )
+
     db.delete(req)
     db.commit()
     return {"message": "WFH request deleted"}

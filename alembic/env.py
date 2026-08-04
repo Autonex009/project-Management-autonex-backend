@@ -5,7 +5,12 @@ from sqlalchemy import pool
 
 from alembic import context
 
-# Import your Base and models
+# Import your Base and models.
+#
+# This list must stay in sync with the one in app/main.py. Anything missing here is
+# absent from Base.metadata, so `alembic revision --autogenerate` sees its table in
+# the database, finds no model to match, and emits a drop_table() for it. Always read
+# a generated revision before applying it.
 from app.db.database import Base, engine
 from app.models import (
     project,
@@ -24,7 +29,15 @@ from app.models import (
     referral,
     payroll,
     performance_review,
-    onboarding
+    perf_eval,
+    onboarding,
+    company_settings,
+    wifi_network,
+    chat,
+    encord_analytics,
+    encord_activity,
+    vendor,
+    audit_log,
 )
 
 

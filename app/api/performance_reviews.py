@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.models.performance_review import PerformanceReview
+from app.models.user import User
 
 router = APIRouter(prefix="/api/performance-reviews", tags=["Performance Reviews"], dependencies=[Depends(require_role("admin", "pm"))])
 
@@ -91,8 +92,16 @@ def get_review(review_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("", response_model=PerformanceReviewResponse, status_code=201)
-def create_review(payload: PerformanceReviewCreate, db: Session = Depends(get_db)):
-    review = PerformanceReview(**payload.model_dump())
+def create_review(
+    payload: PerformanceReviewCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # reviewer_id comes from the session, not the body — it records who authored this
+    # assessment of someone's performance and must not be settable by the caller.
+    data = payload.model_dump()
+    data["reviewer_id"] = current_user.id
+    review = PerformanceReview(**data)
     db.add(review)
     db.commit()
     db.refresh(review)
@@ -100,19 +109,29 @@ def create_review(payload: PerformanceReviewCreate, db: Session = Depends(get_db
 
 
 @router.put("/{review_id}", response_model=PerformanceReviewResponse)
-def update_review(review_id: int, payload: PerformanceReviewUpdate, db: Session = Depends(get_db)):
+def update_review(
+    review_id: int,
+    payload: PerformanceReviewUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     review = db.query(PerformanceReview).filter(PerformanceReview.id == review_id).first()
     if not review:
         raise HTTPException(status_code=404, detail="Review not found")
+
     for key, value in payload.model_dump(exclude_unset=True).items():
         setattr(review, key, value)
+
     db.commit()
     db.refresh(review)
     return review
 
 
 @router.delete("/{review_id}")
-def delete_review(review_id: int, db: Session = Depends(get_db)):
+def delete_review(
+    review_id: int,
+    db: Session = Depends(get_db),
+):
     review = db.query(PerformanceReview).filter(PerformanceReview.id == review_id).first()
     if not review:
         raise HTTPException(status_code=404, detail="Review not found")

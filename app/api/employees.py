@@ -29,6 +29,29 @@ from app.schemas.employee import (
 from app.services.auth_service import get_current_user, hash_password, require_role
 from app.services.email_service import try_send_email_changed_email
 from app.services.identity_validator import check_duplicate_identity
+from app.services import audit_service
+
+# Column → display name for audit diffs. Anything unmapped falls back to a humanised
+# column name, so a new field still shows up rather than being silently dropped.
+# Keys must be real Employee columns — see app/models/employee.py.
+EMPLOYEE_FIELD_LABELS = {
+    "name": "Name",
+    "email": "Email",
+    "phone": "Phone",
+    "designation": "Designation",
+    "employee_type": "Employee type",
+    "status": "Status",
+    "working_hours_per_day": "Working hours/day",
+    "weekly_availability": "Weekly availability",
+    "productivity_baseline": "Productivity baseline",
+    "skills": "Skills",
+    "encord_id": "Encord ID",
+    "razorpay_email": "Razorpay email",
+    "slack_user_id": "Slack user ID",
+    "mentor_id": "Mentor",
+}
+
+
 from app.services.slack_service import (
     try_get_or_cache_employee_slack_user_id,
     try_lookup_user_avatar_by_email,
@@ -81,10 +104,12 @@ def check_employee_access(employee: Employee, current_user: User):
 
 
 # ✅ CREATE EMPLOYEE
-@router.post("", response_model=EmployeeResponse, dependencies=[Depends(require_role("admin", "pm"))])
+@router.post("", response_model=EmployeeResponse)
 def create_employee(
     payload: EmployeeCreate,
-    db: Session = Depends(get_db)
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
     # Enforce unique physical identity check
     check_duplicate_identity(db, email=payload.email, phone=payload.phone)
@@ -108,6 +133,37 @@ def create_employee(
         is_active=True,
     )
     db.add(user)
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="employee.created",
+        category="Employees",
+        action_type="Created",
+        entity_type="employee",
+        entity_id=employee.id,
+        entity_name=employee.name,
+        subject_employee_id=employee.id,
+        subject_name=employee.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Designation", None, employee.designation),
+            audit_service.field_diff("Employee type", None, employee.employee_type),
+            audit_service.field_diff("Email", None, employee.email),
+            audit_service.field_diff("Login role", None, user.role),
+            # Deliberately records only *whether* a salary was set, never the figure —
+            # the plaintext lives nowhere and the audit log must not become the one place
+            # it does.
+            audit_service.field_diff(
+                "Salary", None, "set" if plain_salary is not None else None
+            ),
+        ),
+        summary=(
+            f"Created employee {employee.name} ({employee.designation or 'no designation'})"
+            f" with a {user.role} login"
+        ),
+        request=http_request,
+    )
+
     db.commit()
     db.refresh(employee)
     return employee
@@ -170,6 +226,7 @@ def get_employee(
 def update_employee(
     employee_id: int,
     payload: EmployeeUpdate,
+    http_request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -206,9 +263,18 @@ def update_employee(
     update_data = payload.dict(exclude_unset=True)
     # Salary is encrypted at rest — divert it to the encrypted column and keep
     # the plaintext column NULL.
-    if "base_salary" in update_data:
+    salary_changed = "base_salary" in update_data
+    if salary_changed:
         employee.base_salary_enc = encrypt_salary(update_data.pop("base_salary"))
         employee.base_salary = None
+
+    # Snapshot before the writes land, so each diff has a real "from" side.
+    before = audit_service.snapshot(employee, update_data.keys())
+    old_role = None
+    linked_user_for_role = db.query(User).filter(User.employee_id == employee.id).first()
+    if linked_user_for_role:
+        old_role = linked_user_for_role.role
+
     for key, value in update_data.items():
         setattr(employee, key, value)
 
@@ -218,7 +284,40 @@ def update_employee(
         linked_user.name = employee.name
         linked_user.role = get_user_role_from_designation(employee.designation)
         linked_user.skills = employee.skills or []
-    
+
+    details = audit_service.diff_all(before, employee, EMPLOYEE_FIELD_LABELS)
+    # A designation change silently rewrites the login role, which is a permissions
+    # change — surface it explicitly rather than leaving it implied by "Designation".
+    if linked_user and old_role != linked_user.role:
+        details += audit_service.changes(
+            audit_service.field_diff("Login role", old_role, linked_user.role)
+        )
+    if salary_changed:
+        details += audit_service.changes(
+            audit_service.field_diff("Salary", "(encrypted)", "changed")
+        )
+
+    if details:
+        audit_service.record(
+            db,
+            actor=current_user,
+            action="employee.updated",
+            category="Employees",
+            action_type="Updated",
+            entity_type="employee",
+            entity_id=employee.id,
+            entity_name=employee.name,
+            subject_employee_id=employee.id,
+            subject_name=employee.name,
+            details=details,
+            summary=(
+                f"Updated {employee.name} — "
+                + ", ".join(d["field"] for d in details[:4])
+                + (f" and {len(details) - 4} more" if len(details) > 4 else "")
+            ),
+            request=http_request,
+        )
+
     db.commit()
     db.refresh(employee)
     return employee
@@ -232,6 +331,7 @@ class ChangeEmailBody(BaseModel):
 def change_employee_email(
     employee_id: int,
     body: ChangeEmailBody,
+    http_request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -279,6 +379,29 @@ def change_employee_email(
     employee.email = new_email
     if linked_user:
         linked_user.email = new_email
+
+    # This moves which address can log in as this person, so it is a credential
+    # change, not a profile edit. Both addresses are recorded.
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="employee.email_changed",
+        category="Employees",
+        action_type="Updated",
+        entity_type="employee",
+        entity_id=employee.id,
+        entity_name=employee.name,
+        subject_employee_id=employee.id,
+        subject_name=employee.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Login email", old_email, new_email),
+        ),
+        summary=(
+            f"Changed login email for {employee.name}: {old_email} → {new_email}"
+            + ("" if current_user.employee_id == employee.id else " (changed by an admin)")
+        ),
+        request=http_request,
+    )
     db.commit()
     db.refresh(employee)
 
@@ -306,11 +429,13 @@ class ConvertToFulltimeBody(BaseModel):
 
 
 # ✅ CONVERT INTERN → FULL-TIME (in place — preserves all linked history)
-@router.post("/{employee_id}/convert-to-fulltime", response_model=EmployeeResponse, dependencies=[Depends(require_role("admin", "pm"))])
+@router.post("/{employee_id}/convert-to-fulltime", response_model=EmployeeResponse)
 def convert_to_fulltime(
     employee_id: int,
+    http_request: Request,
     body: ConvertToFulltimeBody = ConvertToFulltimeBody(),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
     """Promote an intern to a full-time employee WITHOUT creating a new record.
 
@@ -330,15 +455,21 @@ def convert_to_fulltime(
             detail=f"Only interns or contractors can be converted to full-time (current type: {employee.employee_type}).",
         )
 
+    old_type = employee.employee_type
+    old_designation = employee.designation
+
     employee.previous_employee_type = employee.employee_type
     employee.employee_type = "Full-time"
     employee.converted_to_fulltime_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    employee.converted_by = body.converted_by
+    # Promoter comes from the session. body.converted_by is client-supplied and
+    # therefore not trustworthy for a record of who made the decision.
+    employee.converted_by = current_user.id
     if body.designation:
         employee.designation = body.designation
 
     # Keep the linked auth user's role and employment type in sync (designation may have changed).
     linked_user = db.query(User).filter(User.employee_id == employee.id).first()
+    old_login_role = linked_user.role if linked_user else None
     if linked_user:
         linked_user.role = get_user_role_from_designation(employee.designation)
         linked_user.employment_type = "Full-time"
@@ -358,6 +489,31 @@ def convert_to_fulltime(
     salary_record = db.query(Salary).filter(Salary.full_name == employee.name).first()
     if salary_record:
         salary_record.employment_type = "Full-time"
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="employee.promoted_fulltime",
+        category="Employees",
+        action_type="Promoted",
+        entity_type="employee",
+        entity_id=employee.id,
+        entity_name=employee.name,
+        subject_employee_id=employee.id,
+        subject_name=employee.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Employee type", old_type, employee.employee_type),
+            audit_service.field_diff("Designation", old_designation, employee.designation),
+            audit_service.field_diff(
+                "Login role", old_login_role, linked_user.role if linked_user else None
+            ),
+        ),
+        summary=(
+            f"Promoted {employee.name} from {old_type} to Full-time"
+            + (f" as {employee.designation}" if body.designation else "")
+            + " — full-time leave entitlements now apply"
+        ),
+        request=http_request,
+    )
 
     db.commit()
     db.refresh(employee)
@@ -365,19 +521,22 @@ def convert_to_fulltime(
 
 
 # ✅ DELETE EMPLOYEE (SOFT-ARCHIVE)
-@router.delete("/{employee_id}", dependencies=[Depends(require_role("admin", "pm"))])
+@router.delete("/{employee_id}")
 def delete_employee(
     employee_id: int,
+    http_request: Request,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
-    
+
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
-    
+
     try:
+        old_status = employee.status
         employee.status = "archived"
-        
+
         # Deactivate associated user account
         linked_user = db.query(User).filter(User.employee_id == employee.id).first()
         if not linked_user:
@@ -385,9 +544,45 @@ def delete_employee(
         if linked_user:
             linked_user.is_active = False
 
-        # Clear allocations for this employee
+        # Clear allocations for this employee — counted before the delete so the entry
+        # can say how many project assignments this silently removed.
+        removed_allocations = db.query(Allocation).filter(
+            Allocation.employee_id == employee.id
+        ).count()
         db.query(Allocation).filter(Allocation.employee_id == employee.id).delete(synchronize_session=False)
         db.flush()
+
+        audit_service.record(
+            db,
+            actor=current_user,
+            action="employee.archived",
+            category="Employees",
+            action_type="Archived",
+            entity_type="employee",
+            entity_id=employee.id,
+            entity_name=employee.name,
+            subject_employee_id=employee.id,
+            subject_name=employee.name,
+            details=audit_service.changes(
+                audit_service.field_diff("Status", old_status, "archived"),
+                audit_service.field_diff(
+                    "Login access", "active", "disabled" if linked_user else None
+                ),
+                audit_service.field_diff(
+                    "Project allocations removed", None, removed_allocations or None
+                ),
+            ),
+            summary=(
+                f"Archived {employee.name} — login disabled"
+                + (
+                    f" and {removed_allocations} project allocation"
+                    f"{'s' if removed_allocations != 1 else ''} removed"
+                    if removed_allocations
+                    else ""
+                )
+            ),
+            request=http_request,
+        )
 
         db.commit()
         return {"message": "Employee archived successfully"}
@@ -397,25 +592,52 @@ def delete_employee(
 
 
 # ✅ RESTORE ARCHIVED EMPLOYEE
-@router.post("/{employee_id}/restore", response_model=EmployeeResponse, dependencies=[Depends(require_role("admin", "pm"))])
+@router.post("/{employee_id}/restore", response_model=EmployeeResponse)
 def restore_employee(
     employee_id: int,
+    http_request: Request,
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
-    
+
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
-    
+
     try:
+        old_status = employee.status
         employee.status = "active"
-        
+
         # Reactivate associated user account
         linked_user = db.query(User).filter(User.employee_id == employee.id).first()
         if not linked_user:
             linked_user = db.query(User).filter(User.email == employee.email).first()
         if linked_user:
             linked_user.is_active = True
+
+        audit_service.record(
+            db,
+            actor=current_user,
+            action="employee.restored",
+            category="Employees",
+            action_type="Restored",
+            entity_type="employee",
+            entity_id=employee.id,
+            entity_name=employee.name,
+            subject_employee_id=employee.id,
+            subject_name=employee.name,
+            details=audit_service.changes(
+                audit_service.field_diff("Status", old_status, "active"),
+                audit_service.field_diff(
+                    "Login access", "disabled", "active" if linked_user else None
+                ),
+            ),
+            summary=(
+                f"Restored {employee.name} from archived — login re-enabled. "
+                f"Previous project allocations are not restored."
+            ),
+            request=http_request,
+        )
 
         db.commit()
         db.refresh(employee)
@@ -606,6 +828,29 @@ async def upload_employee_avatar(
 
     employee.avatar_url = str(request.base_url).rstrip("/") + f"/uploads/avatars/{stored_name}"
     try:
+        # Deliberately thin — the image URL itself is noise, so only the fact of the
+        # upload is recorded, plus a note when an admin changed someone else's picture.
+        audit_service.record(
+            db,
+            actor=current_user,
+            action="employee.avatar_uploaded",
+            category="Employees",
+            action_type="Updated",
+            entity_type="employee",
+            entity_id=employee.id,
+            entity_name=employee.name,
+            subject_employee_id=employee.id,
+            subject_name=employee.name,
+            summary=(
+                f"Uploaded a new profile picture for {employee.name}"
+                + (
+                    ""
+                    if current_user.employee_id == employee.id
+                    else " (done by an admin)"
+                )
+            ),
+            request=request,
+        )
         db.commit()
         db.refresh(employee)
         return employee
