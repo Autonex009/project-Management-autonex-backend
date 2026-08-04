@@ -402,6 +402,8 @@ def get_all_leaves(
             is_emergency=leave.is_emergency or False,
             is_half_day=leave.is_half_day or False,
             half_day_slot=leave.half_day_slot,
+            created_at=str(leave.created_at) if leave.created_at else None,
+            updated_at=str(leave.updated_at) if leave.updated_at else None,
         )
         for leave in leaves
     ]
@@ -498,6 +500,8 @@ def get_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
     )
 
 
@@ -798,6 +802,8 @@ def create_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
     )
 
 
@@ -1011,6 +1017,8 @@ def update_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
     )
 
 
