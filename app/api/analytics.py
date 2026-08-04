@@ -15,12 +15,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.services.auth_service import require_role
+from app.services.auth_service import require_role, get_current_user
 from app.models.project import DailySheet
 from app.models.parent_project import MainProject
+from app.models.sub_project import SubProject
+from app.models.allocation import Allocation
 from app.models.encord_analytics import EncordDailyTimeSpent
 from app.models.encord_activity import EncordDailyActivity
 from app.models.employee import Employee
+from app.models.user import User
 
 router = APIRouter(prefix="/api/analytics", tags=["Analytics"], dependencies=[Depends(require_role("admin", "pm"))])
 
@@ -30,6 +33,66 @@ ACTIVE_THRESHOLD_SECONDS = 3600
 
 # Autonex employees use Encord accounts ending in this suffix.
 AUTONEX_EMAIL_SUFFIX = "_theta@encord.ai"
+
+
+def _get_pm_associated_sub_project_ids(db: Session, current_user: User) -> Optional[set[int]]:
+    """Return set of sub-project (DailySheet) IDs accessible to the current user.
+
+    Admins see everything (returns None).
+    PMs (and HR) see projects where:
+    - Their employee_id is in DailySheet.assigned_employee_ids
+    - Or they are allocated to the sub-project in allocations
+    - Or sub-project has no project-level PMs, but belongs to a parent MainProject
+      where they are a program manager (program_manager_ids or program_manager_id).
+    """
+    if current_user.role == "admin":
+        return None
+
+    emp_id = current_user.employee_id
+    if not emp_id and current_user.email:
+        emp = db.query(Employee).filter(Employee.email == current_user.email).first()
+        if emp:
+            emp_id = emp.id
+
+    if not emp_id:
+        return set()
+
+    # 1. Main projects managed by this PM
+    all_parents = db.query(MainProject).all()
+    managed_parent_ids = set()
+    for mp in all_parents:
+        pm_ids = set(mp.program_manager_ids or [])
+        if mp.program_manager_id:
+            pm_ids.add(mp.program_manager_id)
+        if emp_id in pm_ids:
+            managed_parent_ids.add(mp.id)
+
+    # 2. Allocations for this PM
+    allocated_sub_ids = {
+        a.sub_project_id for a in db.query(Allocation.sub_project_id).filter(Allocation.employee_id == emp_id).all()
+        if a.sub_project_id
+    }
+
+    # 3. SubProject (intermediate level) pm_id
+    sub_projects = db.query(SubProject).filter(SubProject.pm_id == emp_id).all()
+    sub_project_intermediate_ids = {sp.id for sp in sub_projects}
+
+    # 4. Filter DailySheet rows
+    daily_sheets = db.query(DailySheet).all()
+    allowed_ids = set()
+    for ds in daily_sheets:
+        project_pms = list(ds.assigned_employee_ids or [])
+        directly_assigned = emp_id in project_pms
+        directly_allocated = ds.id in allocated_sub_ids
+        intermediate_match = ds.sub_project_id in sub_project_intermediate_ids if ds.sub_project_id else False
+
+        has_project_pm = len(project_pms) > 0
+        org_fallback = (not has_project_pm) and bool(ds.main_project_id) and (ds.main_project_id in managed_parent_ids)
+
+        if directly_assigned or directly_allocated or intermediate_match or org_fallback:
+            allowed_ids.add(ds.id)
+
+    return allowed_ids
 
 
 def is_autonex_email(email: str | None) -> bool:
@@ -107,7 +170,12 @@ def project_analytics(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
+    allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
+    if allowed_ids is not None and sub_project_id not in allowed_ids:
+        raise HTTPException(status_code=403, detail="Access denied to this project's analytics")
+
     sp = db.query(DailySheet).filter(DailySheet.id == sub_project_id).first()
     if not sp:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -253,18 +321,25 @@ def project_analytics(
 
 
 @router.get("/summary")
-def summary(range: Optional[str] = None, db: Session = Depends(get_db)):
+def summary(
+    range: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     today = date.today()
     # Window follows the dashboard range toggle (1|7|30 days). Falls back to
     # month-to-date when no range is given, preserving the old default.
     start = _range_start(range, today) if range else _month_start(today)
 
-    projects = (
+    allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
+    query = (
         db.query(DailySheet)
         .filter(DailySheet.encord_project_hash.isnot(None))
         .filter(DailySheet.encord_project_hash != "")
-        .all()
     )
+    if allowed_ids is not None:
+        query = query.filter(DailySheet.id.in_(allowed_ids))
+    projects = query.all()
 
     out = []
     for sp in projects:
@@ -340,7 +415,7 @@ def summary(range: Optional[str] = None, db: Session = Depends(get_db)):
 
 
 # ── Autonex-only KPI helpers ─────────────────────────────────────────────────
-def _autonex_kpis(db: Session, *, start: date, end: date, project_hash: str | None = None) -> dict:
+def _autonex_kpis(db: Session, *, start: date, end: date, project_hash: str | None = None, allowed_hashes: set[str] | None = None) -> dict:
     """Compute the 6 Autonex-only KPIs + a daily time series for a date range.
 
     If project_hash is given, scope to that Encord project; otherwise global.
@@ -356,6 +431,9 @@ def _autonex_kpis(db: Session, *, start: date, end: date, project_hash: str | No
     if project_hash:
         time_q = time_q.filter(EncordDailyTimeSpent.encord_project_hash == project_hash)
         act_q = act_q.filter(EncordDailyActivity.encord_project_hash == project_hash)
+    elif allowed_hashes is not None:
+        time_q = time_q.filter(EncordDailyTimeSpent.encord_project_hash.in_(allowed_hashes))
+        act_q = act_q.filter(EncordDailyActivity.encord_project_hash.in_(allowed_hashes))
 
     total_seconds = 0
     annotation_seconds = 0
@@ -438,8 +516,13 @@ def autonex_project_kpis(
     sub_project_id: int,
     range: Optional[str] = None,
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """6 Autonex-only KPIs + daily time graph for one project, over the given range."""
+    allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
+    if allowed_ids is not None and sub_project_id not in allowed_ids:
+        raise HTTPException(status_code=403, detail="Access denied to this project's analytics")
+
     sp = db.query(DailySheet).filter(DailySheet.id == sub_project_id).first()
     if not sp:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -452,18 +535,40 @@ def autonex_project_kpis(
 
 
 @router.get("/autonex/kpis")
-def autonex_global_kpis(range: Optional[str] = None, db: Session = Depends(get_db)):
+def autonex_global_kpis(
+    range: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """6 Autonex-only KPIs + daily time graph across ALL mapped projects, over the range."""
     today = date.today()
     start = _range_start(range, today)
-    return _autonex_kpis(db, start=start, end=today, project_hash=None)
+    allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
+    allowed_hashes = None
+    if allowed_ids is not None:
+        hashes = [
+            h[0] for h in db.query(DailySheet.encord_project_hash).filter(DailySheet.id.in_(allowed_ids)).all() if h[0]
+        ]
+        allowed_hashes = set(hashes)
+    return _autonex_kpis(db, start=start, end=today, project_hash=None, allowed_hashes=allowed_hashes)
 
 
 @router.get("/autonex/overview")
-def autonex_overview(db: Session = Depends(get_db)):
+def autonex_overview(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Dashboard: most active Autonex user and most active project (by time), this month."""
     today = date.today()
     start = _month_start(today)
+
+    allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
+    allowed_hashes = None
+    if allowed_ids is not None:
+        hashes = [
+            h[0] for h in db.query(DailySheet.encord_project_hash).filter(DailySheet.id.in_(allowed_ids)).all() if h[0]
+        ]
+        allowed_hashes = set(hashes)
 
     rows = db.query(EncordDailyTimeSpent).filter(
         EncordDailyTimeSpent.metric_date >= start,
@@ -476,6 +581,8 @@ def autonex_overview(db: Session = Depends(get_db)):
     rev_day: dict = defaultdict(int)   # (date, user) -> reviewer-role secs that day
     for r in rows:
         if not is_autonex_email(r.user_email):
+            continue
+        if allowed_hashes is not None and r.encord_project_hash not in allowed_hashes:
             continue
         secs = r.time_spent_seconds or 0
         user_seconds[r.user_email] += secs
