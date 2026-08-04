@@ -36,14 +36,6 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 # ── Schemas ─────────────────────────────────────────────────────────
-class SignupRequest(BaseModel):
-    name: str
-    email: EmailStr
-    password: str
-    skills: Optional[List[str]] = None
-    role: Optional[str] = "employee"       # admin, pm, employee
-
-
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
@@ -151,67 +143,6 @@ def _dev_mode() -> bool:
 
 
 # ── Endpoints ───────────────────────────────────────────────────────
-
-@router.post("/signup", response_model=LoginResponse, status_code=status.HTTP_201_CREATED)
-def signup(body: SignupRequest, db: Session = Depends(get_db)):
-    """Register a new user. Defaults to 'employee' role."""
-    logger.info("[signup] Attempt: email=%s role=%s", body.email, body.role)
-
-    check_duplicate_identity(db, email=body.email)
-
-    # Only allow 'employee' or 'pm' via signup; admin is seed-only
-    role = body.role if body.role in ("employee", "pm") else "employee"
-
-    employee = Employee(
-        name=body.name,
-        email=body.email,
-        employee_type="Full-time",
-        designation="Program Manager" if role == "pm" else "Annotator/ Reviewer",
-        skills=body.skills or [],
-        status="active",
-    )
-    db.add(employee)
-    db.flush()
-
-    user = User(
-        name=body.name,
-        email=body.email,
-        password_hash=hash_password(body.password),
-        role=role,
-        employee_id=employee.id,
-        skills=body.skills or [],
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
-    logger.info("[signup] Created user id=%s email=%s role=%s", user.id, user.email, role)
-    response_user = build_user_response(user, db)
-    token = create_access_token({
-        "sub": str(user.id),
-        "role": response_user.role,
-        "designation": response_user.designation,
-        "employee_id": user.employee_id,
-    })
-
-    # Return JSONResponse to include both cookie and JSON body
-    response = JSONResponse(content={
-        "token": token,
-        "user": response_user.model_dump(),
-    }, status_code=status.HTTP_201_CREATED)
-
-    is_prod = os.getenv("ENVIRONMENT", "development") != "development"
-    response.set_cookie(
-        key="access_token",
-        value=token,
-        httponly=True,
-        secure=is_prod,
-        samesite="lax",
-        max_age=60 * 60 * 24,  # 24 hours
-        path="/",
-    )
-    return response
-
 
 @router.post("/login", response_model=LoginResponse)
 def login(body: LoginRequest, db: Session = Depends(get_db)):

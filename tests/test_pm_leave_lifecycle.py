@@ -56,6 +56,7 @@ from app.models.user import User
 from app.models.notification import Notification
 from app.api.leaves import router as leave_router
 from app.api.wfh import router as wfh_router
+from app.constants.leave_types import is_fixed_holiday
 
 
 @pytest.fixture()
@@ -115,7 +116,13 @@ def _seed(db):
 
 
 def _next_weekday(d):
-    while d.weekday() >= 5:
+    """Advance to the next day that counts as a working day.
+
+    Fixed public holidays are skipped as well as weekends: leave creation rejects
+    a range with no working days in it, so a date that happens to land on e.g.
+    Ganesh Chaturthi would fail the request for reasons the test isn't about.
+    """
+    while d.weekday() >= 5 or is_fixed_holiday(d):
         d += timedelta(days=1)
     return d
 
@@ -345,14 +352,16 @@ def test_wfh_limits_fulltime(client_and_db):
     })
     assert resp.status_code == 201, resp.text
 
-    # Second request in the same week: should fail (limit 1/week)
+    # Second request in the same week: accepted but flagged (limit 1/week).
+    # Over-limit WFH is no longer rejected outright — it goes through flagged so
+    # an approver has to justify it with a remark.
     resp = client.post("/api/wfh", json={
         "employee_id": emp.id,
         "wfh_date": wfh_date2.isoformat(),
         "reason": "Reason 2",
     })
-    assert resp.status_code == 400, resp.text
-    assert "limited to 1 WFH day per week" in resp.json()["detail"]
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["flagged"] is True
 
 
 def test_wfh_limits_intern_and_contractor(client_and_db):
@@ -400,14 +409,14 @@ def test_wfh_limits_intern_and_contractor(client_and_db):
     })
     assert resp.status_code == 201, resp.text
 
-    # Third WFH (should fail - limit 2/month)
+    # Third WFH: accepted but flagged (limit 2/month)
     resp = client.post("/api/wfh", json={
         "employee_id": intern.id,
         "wfh_date": wfh_dates[2].isoformat(),
         "reason": "Reason 3",
     })
-    assert resp.status_code == 400, resp.text
-    assert "limited to 2 WFH days per calendar month" in resp.json()["detail"]
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["flagged"] is True
 
     # Test Contractor
     contractor = Employee(name="Contractor Employee", email="contractor@x.com", status="active",
@@ -432,12 +441,12 @@ def test_wfh_limits_intern_and_contractor(client_and_db):
     })
     assert resp.status_code == 201, resp.text
 
-    # Third WFH (should fail)
+    # Third WFH: accepted but flagged (limit 2/month)
     resp = client.post("/api/wfh", json={
         "employee_id": contractor.id,
         "wfh_date": wfh_dates[2].isoformat(),
         "reason": "Reason 3",
     })
-    assert resp.status_code == 400, resp.text
-    assert "limited to 2 WFH days per calendar month" in resp.json()["detail"]
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["flagged"] is True
 

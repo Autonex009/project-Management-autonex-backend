@@ -55,6 +55,7 @@ class WFHResponse(BaseModel):
     remark: Optional[str] = None
     employee_name: Optional[str] = None
     created_at: Optional[str] = None
+    flagged: Optional[bool] = False
 
     class Config:
         from_attributes = True
@@ -110,10 +111,7 @@ def _validate_wfh_limit(db: Session, employee: Employee, start_date: date, end_d
             key = (d.year, d.month)
             new_count = month_counts.get(key, 0) + 1
             if new_count > 2:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Interns and contractors are limited to 2 WFH days per calendar month. This request would exceed that limit in {d.strftime('%B %Y')}."
-                )
+                return True
             month_counts[key] = new_count
     else:
         # Limit: 1 WFH per week (Mon-Sun)
@@ -126,11 +124,9 @@ def _validate_wfh_limit(db: Session, employee: Employee, start_date: date, end_d
             monday = d - timedelta(days=d.weekday())
             new_count = week_counts.get(monday, 0) + 1
             if new_count > 1:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Full-time employees are limited to 1 WFH day per week. This request would exceed that limit in the week of {monday.strftime('%Y-%m-%d')}."
-                )
+                return True
             week_counts[monday] = new_count
+    return False
 
 
 def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
@@ -146,6 +142,7 @@ def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
         remark=req.remark,
         employee_name=employee.name if employee else None,
         created_at=req.created_at.isoformat() if req.created_at else None,
+        flagged=getattr(req, "flagged", False),
     )
 
 
@@ -205,6 +202,7 @@ def get_wfh_requests(
             remark=req.remark,
             employee_name=emp.name if emp else None,
             created_at=req.created_at.isoformat() if req.created_at else None,
+            flagged=getattr(req, "flagged", False),
         ))
     return result
 
@@ -240,7 +238,7 @@ def create_wfh_request(
         )
 
     # Validate WFH limit
-    _validate_wfh_limit(db, employee, payload.wfh_date, end_date)
+    is_flagged = _validate_wfh_limit(db, employee, payload.wfh_date, end_date)
 
     req = WFHRequest(
         employee_id=payload.employee_id,
@@ -248,6 +246,7 @@ def create_wfh_request(
         end_date=end_date,
         reason=payload.reason,
         status="pending",
+        flagged=is_flagged,
     )
     db.add(req)
     db.commit()
@@ -308,6 +307,12 @@ def approve_wfh(
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
+
+    if getattr(req, "flagged", False) and not (body.remark and body.remark.strip()):
+        raise HTTPException(
+            status_code=400,
+            detail="Flagged WFH requests (exceeding limits) require a remark to be approved."
+        )
 
     employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
     approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
@@ -461,12 +466,13 @@ def update_wfh_request(
         raise HTTPException(status_code=404, detail="Employee not found")
 
     # Validate WFH limit
-    _validate_wfh_limit(db, employee, payload.wfh_date, end_date, exclude_wfh_id=wfh_id)
+    is_flagged = _validate_wfh_limit(db, employee, payload.wfh_date, end_date, exclude_wfh_id=wfh_id)
 
     req.wfh_date = payload.wfh_date
     req.end_date = end_date
     req.reason = payload.reason
     req.status = "pending"  # reset so manager re-reviews
+    req.flagged = is_flagged
     db.commit()
     db.refresh(req)
     return _build_response(req, db)
@@ -482,7 +488,7 @@ def delete_wfh(
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
     check_wfh_access(req.employee_id, current_user, db)
-    if req.wfh_date <= date.today():
+    if req.wfh_date <= date.today() and current_user.role not in ["admin", "hr"]:
         raise HTTPException(status_code=400, detail="Cannot delete a WFH request on or after its date")
     db.delete(req)
     db.commit()

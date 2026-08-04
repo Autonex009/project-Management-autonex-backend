@@ -14,6 +14,7 @@ class WFHRequest(Base):
     status = Column(String(20), nullable=False, default="pending")  # pending, approved, rejected
     approved_by = Column(Integer, nullable=True)
     remark = Column(Text, nullable=True)
+    flagged = Column(Boolean, default=False, nullable=False)
 
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())

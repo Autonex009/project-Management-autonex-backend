@@ -20,6 +20,7 @@ from app.models.notification import Notification
 from app.models.side_project import SideProject
 from app.models.user import User
 from app.models.wfh import WFHRequest
+from app.models.payroll import Salary
 from app.schemas.employee import (
     EmployeeCreate,
     EmployeeUpdate,
@@ -336,10 +337,11 @@ def convert_to_fulltime(
     if body.designation:
         employee.designation = body.designation
 
-    # Keep the linked auth user's role in sync (designation may have changed).
+    # Keep the linked auth user's role and employment type in sync (designation may have changed).
     linked_user = db.query(User).filter(User.employee_id == employee.id).first()
     if linked_user:
         linked_user.role = get_user_role_from_designation(employee.designation)
+        linked_user.employment_type = "Full-time"
         # In-app audit/notification for the employee.
         db.add(Notification(
             user_id=linked_user.id,
@@ -351,6 +353,11 @@ def convert_to_fulltime(
             ),
             type="employee_converted",
         ))
+
+    # Keep corresponding salary record in sync
+    salary_record = db.query(Salary).filter(Salary.full_name == employee.name).first()
+    if salary_record:
+        salary_record.employment_type = "Full-time"
 
     db.commit()
     db.refresh(employee)

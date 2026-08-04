@@ -504,20 +504,22 @@ sync_payroll_run_audit_schema()
 
 
 
-def sync_wfh_end_date_schema() -> None:
-    """Add end_date column to wfh_requests and backfill existing rows."""
+def sync_wfh_schema() -> None:
+    """Add end_date and flagged columns to wfh_requests and backfill existing rows."""
     inspector = inspect(engine)
     try:
         columns = {column["name"] for column in inspector.get_columns("wfh_requests")}
     except Exception:
         return
-    if "end_date" not in columns:
-        with engine.begin() as connection:
+    with engine.begin() as connection:
+        if "end_date" not in columns:
             connection.execute(text("ALTER TABLE wfh_requests ADD COLUMN end_date DATE"))
             connection.execute(text("UPDATE wfh_requests SET end_date = wfh_date WHERE end_date IS NULL"))
+        if "flagged" not in columns:
+            connection.execute(text("ALTER TABLE wfh_requests ADD COLUMN flagged BOOLEAN DEFAULT FALSE"))
 
 
-sync_wfh_end_date_schema()
+sync_wfh_schema()
 
 
 def sync_daily_sheets_end_date_nullable() -> None:
