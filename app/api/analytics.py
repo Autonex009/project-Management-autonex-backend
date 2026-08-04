@@ -730,3 +730,114 @@ def my_encord_activity(
         "total_hours": _hours(sum(mine_by_day.values())),
         "daily": daily,
     }
+
+
+@router.get("/leaderboard")
+def get_leaderboard(
+    range: Optional[str] = "month",
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
+):
+    """Admin leaderboard: rank Autonex team members by platform hours over preset windows or custom dates."""
+    today = date.today()
+    if range == "custom" and date_from:
+        start = _parse_date(date_from, _month_start(today))
+        end = _parse_date(date_to, today)
+    elif range == "day":
+        start = today
+        end = today
+    elif range == "week":
+        start = today - timedelta(days=6)
+        end = today
+    else:  # "month" or default
+        start = _month_start(today)
+        end = today
+
+    time_rows = db.query(EncordDailyTimeSpent).filter(
+        EncordDailyTimeSpent.metric_date >= start,
+        EncordDailyTimeSpent.metric_date <= end,
+    ).all()
+
+    act_rows = db.query(EncordDailyActivity).filter(
+        EncordDailyActivity.metric_date >= start,
+        EncordDailyActivity.metric_date <= end,
+    ).all()
+
+    user_seconds: dict = defaultdict(int)
+    annotation_seconds: dict = defaultdict(int)
+    review_seconds: dict = defaultdict(int)
+    tasks_submitted_by_user: dict = defaultdict(int)
+    labels_created_by_user: dict = defaultdict(int)
+
+    for r in time_rows:
+        if not is_autonex_email(r.user_email):
+            continue
+        secs = r.time_spent_seconds or 0
+        u = r.user_email
+        user_seconds[u] += secs
+        if _is_annotation_stage(r.workflow_stage):
+            annotation_seconds[u] += secs
+        if _is_review_stage(r.workflow_stage):
+            review_seconds[u] += secs
+
+    for a in act_rows:
+        if not is_autonex_email(a.user_email):
+            continue
+        u = a.user_email
+        tasks_submitted_by_user[u] += a.tasks_submitted or 0
+        labels_created_by_user[u] += a.labels_created or 0
+
+    total_team_seconds = sum(user_seconds.values())
+    name_by_email = _names_for(db, user_seconds.keys())
+
+    emails = [e for e in user_seconds.keys() if e]
+    emp_rows = db.query(Employee.encord_id, Employee.email, Employee.designation, Employee.id).filter(
+        (Employee.encord_id.in_(emails)) | (Employee.email.in_(emails))
+    ).all() if emails else []
+
+    emp_map = {}
+    for enc_id, email, desig, emp_id in emp_rows:
+        if enc_id:
+            emp_map[enc_id] = (desig, emp_id)
+        if email:
+            emp_map[email] = (desig, emp_id)
+
+    leaderboard = []
+    sorted_users = sorted(user_seconds.items(), key=lambda kv: kv[1], reverse=True)
+    for rank, (u, secs) in enumerate(sorted_users, 1):
+        hrs = _hours(secs)
+        ann_hrs = _hours(annotation_seconds[u])
+        rev_hrs = _hours(review_seconds[u])
+        desig, emp_id = emp_map.get(u, (None, None))
+        pct = round((secs / total_team_seconds) * 100, 1) if total_team_seconds else 0.0
+        leaderboard.append({
+            "rank": rank,
+            "user_email": u,
+            "employee_name": name_by_email.get(u),
+            "employee_id": emp_id,
+            "designation": desig or "Annotator / Reviewer",
+            "total_hours": hrs,
+            "annotation_hours": ann_hrs,
+            "review_hours": rev_hrs,
+            "tasks_submitted": tasks_submitted_by_user[u],
+            "labels_created": labels_created_by_user[u],
+            "share_percentage": pct,
+        })
+
+    top_performer = leaderboard[0] if leaderboard else None
+
+    return {
+        "range": {"from": start.isoformat(), "to": end.isoformat()},
+        "team_summary": {
+            "total_hours": _hours(total_team_seconds),
+            "active_users": len(user_seconds),
+            "total_tasks": sum(tasks_submitted_by_user.values()),
+            "top_performer": {
+                "name": (top_performer["employee_name"] or top_performer["user_email"]) if top_performer else "—",
+                "hours": top_performer["total_hours"] if top_performer else 0.0,
+            } if top_performer else None,
+        },
+        "leaderboard": leaderboard,
+    }
