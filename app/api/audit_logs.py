@@ -69,7 +69,7 @@ def _serialize(entry: AuditLog, avatar_url: Optional[str]) -> dict:
     """
     return {
         "id": entry.id,
-        "created_at": entry.created_at.isoformat() if entry.created_at else None,
+        "created_at": (entry.created_at.isoformat() + "Z") if entry.created_at and not entry.created_at.tzinfo else (entry.created_at.isoformat() if entry.created_at else None),
         "action": entry.action,
         "action_type": entry.action_type,
         "category": entry.category,
