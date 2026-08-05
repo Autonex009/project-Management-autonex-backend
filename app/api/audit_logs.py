@@ -16,6 +16,7 @@ from app.db.database import get_db
 from app.models.audit_log import AuditLog
 from app.models.employee import Employee
 from app.models.user import User
+from app.services.audit_service import RETENTION_DAYS, prune_expired_logs
 from app.services.auth_service import get_current_user
 
 router = APIRouter(prefix="/api/audit-logs", tags=["Audit Logs"])
@@ -139,7 +140,13 @@ def list_audit_logs(
         )
     page_size = min(page_size, MAX_PAGE_SIZE)
 
-    query = db.query(AuditLog)
+    # Automatically prune entries older than 20 days
+    prune_expired_logs(db)
+
+    # 20-day retention cutoff
+    retention_cutoff = date_type.today() - timedelta(days=RETENTION_DAYS)
+
+    query = db.query(AuditLog).filter(AuditLog.created_at >= retention_cutoff)
 
     if category and category.lower() != "all":
         query = query.filter(AuditLog.category == category)
@@ -156,7 +163,8 @@ def list_audit_logs(
     if entity_type:
         query = query.filter(AuditLog.entity_type == entity_type)
     if date_from:
-        query = query.filter(AuditLog.created_at >= date_from)
+        effective_date_from = max(date_from, retention_cutoff)
+        query = query.filter(AuditLog.created_at >= effective_date_from)
     if date_to:
         # date_to is inclusive: a timestamp on that day is still "<= end of day".
         query = query.filter(AuditLog.created_at < date_to + timedelta(days=1))
@@ -205,8 +213,9 @@ def audit_log_stats(
     """
     today = date_type.today()
     week_ago = today - timedelta(days=7)
+    retention_cutoff = today - timedelta(days=RETENTION_DAYS)
 
-    total = db.query(func.count(AuditLog.id)).scalar() or 0
+    total = db.query(func.count(AuditLog.id)).filter(AuditLog.created_at >= retention_cutoff).scalar() or 0
     today_count = (
         db.query(func.count(AuditLog.id))
         .filter(AuditLog.created_at >= today)
@@ -238,6 +247,7 @@ def audit_log_stats(
 
     by_category = dict(
         db.query(AuditLog.category, func.count(AuditLog.id))
+        .filter(AuditLog.created_at >= retention_cutoff)
         .group_by(AuditLog.category)
         .all()
     )
@@ -245,7 +255,7 @@ def audit_log_stats(
     # tabs match what the ``actor_role`` filter above actually selects.
     by_actor_role = dict(
         db.query(func.lower(AuditLog.actor_role), func.count(AuditLog.id))
-        .filter(AuditLog.actor_role.isnot(None))
+        .filter(AuditLog.created_at >= retention_cutoff, AuditLog.actor_role.isnot(None))
         .group_by(func.lower(AuditLog.actor_role))
         .all()
     )
@@ -267,12 +277,14 @@ def audit_log_filters(
     _admin: User = Depends(require_admin_only),
 ):
     """Distinct values for the filter controls, so the UI offers only real options."""
+    retention_cutoff = date_type.today() - timedelta(days=RETENTION_DAYS)
     categories = [
-        c for (c,) in db.query(AuditLog.category).distinct().order_by(AuditLog.category)
+        c for (c,) in db.query(AuditLog.category).filter(AuditLog.created_at >= retention_cutoff).distinct().order_by(AuditLog.category)
     ]
     action_types = [
         a
         for (a,) in db.query(AuditLog.action_type)
+        .filter(AuditLog.created_at >= retention_cutoff)
         .distinct()
         .order_by(AuditLog.action_type)
     ]
@@ -280,7 +292,7 @@ def audit_log_filters(
         {"id": actor_id, "name": name, "role": role}
         for actor_id, name, role in (
             db.query(AuditLog.actor_id, AuditLog.actor_name, AuditLog.actor_role)
-            .filter(AuditLog.actor_id.isnot(None))
+            .filter(AuditLog.created_at >= retention_cutoff, AuditLog.actor_id.isnot(None))
             .distinct()
             .order_by(AuditLog.actor_name)
             .all()
