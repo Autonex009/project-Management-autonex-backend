@@ -70,6 +70,12 @@ from app.services.slack_service import (
 )
 
 from app.services.auth_service import get_current_user, require_role
+from app.services import audit_service
+
+# NOTE: ``Request`` at the top of this module is urllib's, used for the Razorpay
+# calls. FastAPI's request object is aliased so the two never get confused — a bare
+# ``Request`` annotation here would silently break request parsing.
+from fastapi import Request as HTTPRequest
 
 router = APIRouter(prefix="/api/leaves", tags=["Leaves"], dependencies=[Depends(get_current_user)])
 
@@ -347,6 +353,27 @@ def _get_admin_notification_targets(db: Session) -> list[dict]:
     return targets
 
 
+def _leave_to_schema(leave: Leave) -> LeaveSchema:
+    return LeaveSchema(
+        leave_id=leave.id,
+        employee_id=leave.employee_id,
+        start_date=leave.start_date,
+        end_date=leave.end_date,
+        leave_type=leave.leave_type,
+        reason=leave.reason,
+        status=leave.status or "pending",
+        approved_by=leave.approved_by,
+        razorpay_applied=leave.razorpay_applied or False,
+        flagged=leave.flagged or False,
+        approval_remark=leave.approval_remark,
+        is_emergency=leave.is_emergency or False,
+        is_half_day=leave.is_half_day or False,
+        half_day_slot=leave.half_day_slot,
+        created_at=leave.created_at.isoformat() if leave.created_at else None,
+        updated_at=leave.updated_at.isoformat() if leave.updated_at else None,
+    )
+
+
 @router.get("", response_model=List[LeaveSchema])
 def get_all_leaves(
     employee_id: Optional[int] = None,
@@ -396,6 +423,8 @@ def get_all_leaves(
             is_emergency=leave.is_emergency or False,
             is_half_day=leave.is_half_day or False,
             half_day_slot=leave.half_day_slot,
+            created_at=str(leave.created_at) if leave.created_at else None,
+            updated_at=str(leave.updated_at) if leave.updated_at else None,
         )
         for leave in leaves
     ]
@@ -492,6 +521,8 @@ def get_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
     )
 
 
@@ -566,6 +597,7 @@ def validate_consecutive_leaves(
 @router.post("", response_model=LeaveSchema, status_code=201)
 def create_leave(
     payload: LeaveCreate,
+    http_request: HTTPRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -573,6 +605,16 @@ def create_leave(
     employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    if (
+        current_user.role not in ["admin", "hr"]
+        and not payload.is_emergency
+        and payload.start_date < date_type.today()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Employees and PMs cannot apply for leaves on past dates unless marked as Emergency Leave."
+        )
 
     if payload.is_half_day:
         validate_half_day_timing(payload.start_date, payload.half_day_slot)
@@ -669,6 +711,45 @@ def create_leave(
     db.commit()
     db.refresh(leave)
 
+    # Recorded after the refresh because leave.id only exists once the insert lands.
+    # Actor and subject genuinely differ here: an admin can file a leave on someone
+    # else's behalf, and the log needs to show both people.
+    duration = (
+        f"{leave.start_date} → {leave.end_date}"
+        if leave.start_date != leave.end_date
+        else str(leave.start_date)
+    )
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="leave.applied",
+        category="Leaves",
+        action_type="Applied",
+        entity_type="leave",
+        entity_id=leave.id,
+        entity_name=employee.name,
+        subject_employee_id=employee.id,
+        subject_name=employee.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Leave type", None, get_leave_type_label(leave.leave_type)),
+            audit_service.field_diff("Dates", None, duration),
+            audit_service.field_diff("Half day", None, leave.half_day_slot if leave.is_half_day else None),
+            audit_service.field_diff("Reason", None, leave.reason),
+            audit_service.field_diff("Status", None, leave.status),
+            audit_service.field_diff("Over monthly limit", None, True if leave.flagged else None),
+        ),
+        summary=(
+            f"Applied for {get_leave_type_label(leave.leave_type)} leave"
+            + (
+                f" on behalf of {employee.name}"
+                if current_user.employee_id != employee.id
+                else ""
+            )
+            + f" ({duration})"
+        ),
+        request=http_request,
+    )
+
     # In-app notification: employee who applied
     emp_user = db.query(User).filter(User.employee_id == employee.id).first()
     if emp_user:
@@ -736,6 +817,7 @@ def create_leave(
                     "leave_applied",
                 )
     db.commit()
+    db.refresh(leave)
 
     return LeaveSchema(
         leave_id=leave.id,
@@ -752,6 +834,8 @@ def create_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
     )
 
 
@@ -759,8 +843,13 @@ class ApproveBody(BaseModel):
     remark: Optional[str] = None
 
 
-@router.post("/{leave_id}/apply-to-razorpay", dependencies=[Depends(require_role("admin", "pm"))])
-def apply_leave_to_razorpay(leave_id: int, db: Session = Depends(get_db)):
+@router.post("/{leave_id}/apply-to-razorpay")
+def apply_leave_to_razorpay(
+    leave_id: int,
+    http_request: HTTPRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
@@ -779,6 +868,31 @@ def apply_leave_to_razorpay(leave_id: int, db: Session = Depends(get_db)):
 
     sync_leave_to_razorpay(employee, leave)
     leave.razorpay_applied = True
+
+    # This pushes attendance into the external payroll system, so it affects what the
+    # person is actually paid — worth recording as its own action, not just a flag flip.
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="leave.razorpay_synced",
+        category="Leaves",
+        action_type="Updated",
+        entity_type="leave",
+        entity_id=leave.id,
+        entity_name=employee.name,
+        subject_employee_id=employee.id,
+        subject_name=employee.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Razorpay applied", False, True),
+            audit_service.field_diff("Dates", None, f"{leave.start_date} → {leave.end_date}"),
+        ),
+        summary=(
+            f"Pushed {get_leave_type_label(leave.leave_type)} leave for "
+            f"{employee.name} ({leave.start_date} → {leave.end_date}) to Razorpay payroll"
+        ),
+        request=http_request,
+    )
+
     db.commit()
     return {"message": "Leave submitted to Razorpay", "leave_id": leave_id}
 
@@ -787,6 +901,7 @@ def apply_leave_to_razorpay(leave_id: int, db: Session = Depends(get_db)):
 def update_leave(
     leave_id: int,
     payload: LeaveCreate,
+    http_request: HTTPRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -795,8 +910,18 @@ def update_leave(
         raise HTTPException(status_code=404, detail="Leave not found")
     check_leave_access(leave.employee_id, current_user, db)
     check_leave_access(payload.employee_id, current_user, db)
-    if leave.start_date <= date_type.today():
+    if current_user.role not in ["admin", "hr"] and leave.start_date <= date_type.today():
         raise HTTPException(status_code=400, detail="Cannot edit a leave that has already started")
+
+    if (
+        current_user.role not in ["admin", "hr"]
+        and not payload.is_emergency
+        and payload.start_date < date_type.today()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Employees and PMs cannot update leaves to past dates unless marked as Emergency Leave."
+        )
 
     if payload.is_half_day:
         validate_half_day_timing(payload.start_date, payload.half_day_slot)
@@ -866,6 +991,14 @@ def update_leave(
         unsync_leave_from_razorpay(employee, leave)  # uses the current (pre-edit) dates
         leave.razorpay_applied = False
 
+    before = audit_service.snapshot(
+        leave,
+        [
+            "start_date", "end_date", "leave_type", "reason",
+            "is_emergency", "status", "is_half_day", "half_day_slot",
+        ],
+    )
+
     leave.start_date = payload.start_date
     leave.end_date = payload.end_date
     leave.leave_type = payload.leave_type
@@ -874,6 +1007,41 @@ def update_leave(
     leave.status = "pending"  # reset to pending so PM re-reviews the edited request
     leave.is_half_day = payload.is_half_day or False
     leave.half_day_slot = payload.half_day_slot
+
+    edited_employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="leave.updated",
+        category="Leaves",
+        action_type="Updated",
+        entity_type="leave",
+        entity_id=leave.id,
+        entity_name=edited_employee.name if edited_employee else None,
+        subject_employee_id=leave.employee_id,
+        subject_name=edited_employee.name if edited_employee else None,
+        details=audit_service.diff_all(
+            before,
+            leave,
+            {
+                "start_date": "Start date",
+                "end_date": "End date",
+                "leave_type": "Leave type",
+                "reason": "Reason",
+                "is_emergency": "Emergency",
+                "status": "Status",
+                "is_half_day": "Half day",
+                "half_day_slot": "Half-day slot",
+            },
+        ),
+        summary=(
+            f"Edited {get_leave_type_label(leave.leave_type)} leave for "
+            f"{edited_employee.name if edited_employee else 'employee'} — "
+            f"reset to pending for re-approval"
+        ),
+        request=http_request,
+    )
+
     db.commit()
     db.refresh(leave)
     return LeaveSchema(
@@ -891,20 +1059,27 @@ def update_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
     )
 
 
 # ── Approve / Reject ───────────────────────────────────────────────
 
-@router.patch("/{leave_id}/approve", dependencies=[Depends(require_role("admin", "pm"))])
+@router.patch("/{leave_id}/approve")
 def approve_leave(
     leave_id: int,
-    approved_by: int = Query(default=0),
+    http_request: HTTPRequest,
+    approved_by: int = Query(default=0, deprecated=True),
     body: ApproveBody = Body(default=ApproveBody()),
     db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
-    """Approve a leave request. Pass approved_by as query param (user_id).
-    Flagged leaves (exceeding monthly limit) require a remark in the request body."""
+    """Approve a leave request. The approver is taken from the authenticated session.
+    Flagged leaves (exceeding monthly limit) require a remark in the request body.
+
+    ``approved_by`` is still accepted so existing callers keep working, but it is
+    ignored — trusting it let any approver attribute a decision to someone else."""
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
@@ -919,9 +1094,14 @@ def approve_leave(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
+    # Snapshot the old values before mutating — otherwise the audit diff would
+    # compare the new value against itself.
+    previous_status = leave.status
+    previous_remark = leave.approval_remark
+
     # Approve the leave first — always succeeds regardless of Razorpay
     leave.status = "approved"
-    leave.approved_by = approved_by
+    leave.approved_by = current_user.id
     if body.remark:
         leave.approval_remark = body.remark.strip()
 
@@ -936,11 +1116,33 @@ def approve_leave(
         except Exception as exc:
             sync_warning = str(exc)
 
+    leave_label = get_leave_type_label(leave.leave_type)
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="leave.approved",
+        category="Leaves",
+        action_type="Approved",
+        entity_type="leave",
+        entity_id=leave.id,
+        entity_name=employee.name,
+        subject_employee_id=employee.id,
+        subject_name=employee.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "approved"),
+            audit_service.field_diff("Remark", previous_remark, leave.approval_remark),
+        ),
+        summary=(
+            f"Approved {leave_label} leave for {employee.name} "
+            f"({leave.start_date} → {leave.end_date})"
+        ),
+        request=http_request,
+    )
+
     db.commit()
     employee.slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
 
-    approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
-    pm_name = approver.name if approver and approver.name else "your PM"
+    pm_name = current_user.name or "your PM"
 
     # In-app notification: employee
     emp_user = db.query(User).filter(User.employee_id == employee.id).first()
@@ -981,9 +1183,15 @@ def approve_leave(
     return result
 
 
-@router.patch("/{leave_id}/reject", dependencies=[Depends(require_role("admin", "pm"))])
-def reject_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_db)):
-    """Reject a leave request."""
+@router.patch("/{leave_id}/reject")
+def reject_leave(
+    leave_id: int,
+    http_request: HTTPRequest,
+    approved_by: int = Query(default=0, deprecated=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
+    """Reject a leave request. Rejecter comes from the session; ``approved_by`` is ignored."""
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
@@ -998,13 +1206,35 @@ def reject_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_
         unsync_leave_from_razorpay(employee, leave)
         leave.razorpay_applied = False
 
+    previous_status = leave.status
     leave.status = "rejected"
-    leave.approved_by = approved_by
+    leave.approved_by = current_user.id
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="leave.rejected",
+        category="Leaves",
+        action_type="Rejected",
+        entity_type="leave",
+        entity_id=leave.id,
+        entity_name=employee.name,
+        subject_employee_id=employee.id,
+        subject_name=employee.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "rejected"),
+        ),
+        summary=(
+            f"Rejected {get_leave_type_label(leave.leave_type)} leave for "
+            f"{employee.name} ({leave.start_date} → {leave.end_date})"
+        ),
+        request=http_request,
+    )
+
     db.commit()
     employee.slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
 
-    approver = db.query(User).filter(User.id == approved_by).first() if approved_by else None
-    pm_name = approver.name if approver and approver.name else "your PM"
+    pm_name = current_user.name or "your PM"
 
     # In-app notification: employee
     emp_user = db.query(User).filter(User.employee_id == employee.id).first()
@@ -1029,9 +1259,15 @@ def reject_leave(leave_id: int, approved_by: int = 0, db: Session = Depends(get_
     return {"message": "Leave rejected", "leave_id": leave_id, "status": "rejected"}
 
 
-@router.patch("/{leave_id}/undo-reject", dependencies=[Depends(require_role("admin", "pm"))])
-def undo_reject_leave(leave_id: int, approved_by: int = Query(default=0), db: Session = Depends(get_db)):
-    """Reopen a rejected leave back to pending."""
+@router.patch("/{leave_id}/undo-reject")
+def undo_reject_leave(
+    leave_id: int,
+    http_request: HTTPRequest,
+    approved_by: int = Query(default=0, deprecated=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
+    """Reopen a rejected leave back to pending. ``approved_by`` is ignored."""
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
@@ -1062,8 +1298,33 @@ def undo_reject_leave(leave_id: int, approved_by: int = Query(default=0), db: Se
         exclude_leave_id=leave_id, is_half_day=getattr(leave, "is_half_day", False),
     )
 
+    previous_status = leave.status
     leave.status = "pending"
-    leave.approved_by = approved_by
+    leave.approved_by = current_user.id
+
+    reopened_employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="leave.reject_undone",
+        category="Leaves",
+        action_type="Restored",
+        entity_type="leave",
+        entity_id=leave.id,
+        entity_name=reopened_employee.name if reopened_employee else None,
+        subject_employee_id=leave.employee_id,
+        subject_name=reopened_employee.name if reopened_employee else None,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "pending"),
+        ),
+        summary=(
+            f"Reopened a rejected {get_leave_type_label(leave.leave_type)} leave for "
+            f"{reopened_employee.name if reopened_employee else 'employee'} "
+            f"({leave.start_date} → {leave.end_date}) — back to pending"
+        ),
+        request=http_request,
+    )
+
     db.commit()
 
     emp_user = db.query(User).filter(User.employee_id == leave.employee_id).first()
@@ -1079,10 +1340,17 @@ def undo_reject_leave(leave_id: int, approved_by: int = Query(default=0), db: Se
     return {"message": "Leave reopened", "leave_id": leave_id, "status": "pending"}
 
 
-@router.patch("/{leave_id}/undo-approve", dependencies=[Depends(require_role("admin", "pm"))])
-def undo_approve_leave(leave_id: int, approved_by: int = Query(default=0), db: Session = Depends(get_db)):
+@router.patch("/{leave_id}/undo-approve")
+def undo_approve_leave(
+    leave_id: int,
+    http_request: HTTPRequest,
+    approved_by: int = Query(default=0, deprecated=True),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     """Revoke an approval, reverting the leave back to pending. Reverses the Razorpay
-    sync first (if applied) so the two systems never drift out of sync."""
+    sync first (if applied) so the two systems never drift out of sync.
+    ``approved_by`` is ignored — the revoker comes from the session."""
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
@@ -1096,9 +1364,36 @@ def undo_approve_leave(leave_id: int, approved_by: int = Query(default=0), db: S
         unsync_leave_from_razorpay(employee, leave)
         leave.razorpay_applied = False
 
+    previous_status = leave.status
+    previous_remark = leave.approval_remark
     leave.status = "pending"
-    leave.approved_by = approved_by
+    leave.approved_by = current_user.id
     leave.approval_remark = None
+
+    revoked_employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="leave.approval_revoked",
+        category="Leaves",
+        action_type="Restored",
+        entity_type="leave",
+        entity_id=leave.id,
+        entity_name=revoked_employee.name if revoked_employee else None,
+        subject_employee_id=leave.employee_id,
+        subject_name=revoked_employee.name if revoked_employee else None,
+        details=audit_service.changes(
+            audit_service.field_diff("Status", previous_status, "pending"),
+            audit_service.field_diff("Remark", previous_remark, None),
+        ),
+        summary=(
+            f"Revoked approval of {get_leave_type_label(leave.leave_type)} leave for "
+            f"{revoked_employee.name if revoked_employee else 'employee'} "
+            f"({leave.start_date} → {leave.end_date}) — back to pending"
+        ),
+        request=http_request,
+    )
+
     db.commit()
 
     emp_user = db.query(User).filter(User.employee_id == leave.employee_id).first()
@@ -1117,6 +1412,7 @@ def undo_approve_leave(leave_id: int, approved_by: int = Query(default=0), db: S
 @router.delete("/{leave_id}")
 def delete_leave(
     leave_id: int,
+    http_request: HTTPRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1134,6 +1430,35 @@ def delete_leave(
         if not employee:
             raise HTTPException(status_code=404, detail="Employee not found")
         unsync_leave_from_razorpay(employee, leave)
+
+    # Everything worth keeping is copied out before the delete — once the row is gone
+    # there is nothing left to describe it, and a deletion with no detail is the least
+    # useful entry an audit log can hold.
+    deleted_employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+    deleted_name = deleted_employee.name if deleted_employee else None
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="leave.deleted",
+        category="Leaves",
+        action_type="Deleted",
+        entity_type="leave",
+        entity_id=leave.id,
+        entity_name=deleted_name,
+        subject_employee_id=leave.employee_id,
+        subject_name=deleted_name,
+        details=audit_service.changes(
+            audit_service.field_diff("Leave type", get_leave_type_label(leave.leave_type), None),
+            audit_service.field_diff("Dates", f"{leave.start_date} → {leave.end_date}", None),
+            audit_service.field_diff("Status at deletion", leave.status, None),
+        ),
+        summary=(
+            f"Deleted {get_leave_type_label(leave.leave_type)} leave for "
+            f"{deleted_name or 'employee'} ({leave.start_date} → {leave.end_date}), "
+            f"was {leave.status}"
+        ),
+        request=http_request,
+    )
 
     db.delete(leave)
     db.commit()

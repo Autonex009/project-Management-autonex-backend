@@ -1,5 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from app.services.auth_service import get_current_user, require_role
+from app.services import audit_service
+from app.models.user import User
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 from typing import List
@@ -139,7 +141,9 @@ def get_all_parent_projects(db: Session = Depends(get_db)):
 @router.post("", response_model=ParentProjectResponse, status_code=status.HTTP_201_CREATED, dependencies=[Depends(require_role("admin", "pm"))])
 def create_parent_project(
     parent_project: ParentProjectCreate,
-    db: Session = Depends(get_db)
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
     """Create a new organization. Only the name is required; a PM is optional
     (attached automatically when a PM creates it)."""
@@ -148,9 +152,33 @@ def create_parent_project(
 
     db_parent_project = ParentProject(**data)
     db.add(db_parent_project)
+    db.flush()
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="organization.created",
+        category="Projects",
+        action_type="Created",
+        entity_type="main_project",
+        entity_id=db_parent_project.id,
+        entity_name=db_parent_project.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Client", None, db_parent_project.client),
+            audit_service.field_diff("Project type", None, db_parent_project.project_type),
+            audit_service.field_diff("Status", None, db_parent_project.status),
+            audit_service.field_diff(
+                "Program managers", None,
+                len(get_pm_ids(db_parent_project) or []) or None,
+            ),
+        ),
+        summary=f"Created organization {db_parent_project.name}",
+        request=http_request,
+    )
+
     db.commit()
     db.refresh(db_parent_project)
-    
+
     all_pm_ids = get_pm_ids(db_parent_project)
     return ParentProjectResponse(
         id=db_parent_project.id,
@@ -222,7 +250,9 @@ def get_parent_project(parent_project_id: int, db: Session = Depends(get_db)):
 def update_parent_project(
     parent_project_id: int,
     update_data: ParentProjectUpdate,
-    db: Session = Depends(get_db)
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
 ):
     """Update a parent project."""
     pp = db.query(ParentProject).filter(ParentProject.id == parent_project_id).first()
@@ -246,12 +276,62 @@ def update_parent_project(
         update_dict["program_manager_ids"] = pm_data["program_manager_ids"]
 
     previous_project_type = pp.project_type
+    before = audit_service.snapshot(pp, update_dict.keys())
     for key, value in update_dict.items():
         setattr(pp, key, value)
 
-    if update_dict.get("project_type") == "POC Rejected" and previous_project_type != "POC Rejected":
+    poc_rejected = (
+        update_dict.get("project_type") == "POC Rejected"
+        and previous_project_type != "POC Rejected"
+    )
+    if poc_rejected:
         release_project_allocations(db, pp.id)
-    
+
+    details = audit_service.diff_all(
+        before,
+        pp,
+        {
+            "name": "Name",
+            "client": "Client",
+            "project_type": "Project type",
+            "status": "Status",
+            "program_manager_id": "Primary PM",
+            "program_manager_ids": "Program managers",
+            "description": "Description",
+            "global_start_date": "Start date",
+            "tentative_duration_months": "Duration (months)",
+        },
+    )
+    # Marking a POC rejected releases every allocation underneath it — a much bigger
+    # deal than a field edit, so it is called out rather than left implicit.
+    if poc_rejected:
+        details += audit_service.changes(
+            audit_service.field_diff("Allocations", "released", "all removed")
+        )
+
+    if details:
+        audit_service.record(
+            db,
+            actor=current_user,
+            action="organization.updated",
+            category="Projects",
+            action_type="Updated",
+            entity_type="main_project",
+            entity_id=pp.id,
+            entity_name=pp.name,
+            details=details,
+            summary=(
+                f"Updated organization {pp.name} — "
+                + ", ".join(d["field"] for d in details[:4])
+                + (
+                    "; marked POC Rejected, which released all allocations"
+                    if poc_rejected
+                    else ""
+                )
+            ),
+            request=http_request,
+        )
+
     db.commit()
     db.refresh(pp)
     
@@ -279,8 +359,13 @@ def update_parent_project(
     )
 
 
-@router.delete("/{parent_project_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_role("admin", "pm"))])
-def delete_parent_project(parent_project_id: int, db: Session = Depends(get_db)):
+@router.delete("/{parent_project_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_parent_project(
+    parent_project_id: int,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm")),
+):
     """
     Delete a project and everything under it:
     its sub-project groups and daily-sheets, plus the daily-sheets' allocations
@@ -307,6 +392,44 @@ def delete_parent_project(parent_project_id: int, db: Session = Depends(get_db))
     sheet_ids = [
         d.id for d in db.query(Project).filter(or_(*sheet_filter)).all()
     ]
+
+    # This is the most destructive endpoint in the app — it cascades through project
+    # groups, daily sheets, allocations and performance evaluations. Everything is
+    # counted first so the entry records the true blast radius, not just the name.
+    lost_allocations = 0
+    lost_evals = 0
+    if sheet_ids:
+        lost_allocations = db.query(Allocation).filter(
+            Allocation.sub_project_id.in_(sheet_ids)
+        ).count()
+        lost_evals = db.query(PerfEvaluation).filter(
+            PerfEvaluation.project_id.in_(sheet_ids)
+        ).count()
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="organization.deleted",
+        category="Projects",
+        action_type="Deleted",
+        entity_type="main_project",
+        entity_id=pp.id,
+        entity_name=pp.name,
+        details=audit_service.changes(
+            audit_service.field_diff("Client", pp.client, None),
+            audit_service.field_diff("Status at deletion", pp.status, None),
+            audit_service.field_diff("Project groups destroyed", len(group_ids) or None, None),
+            audit_service.field_diff("Daily sheets destroyed", len(sheet_ids) or None, None),
+            audit_service.field_diff("Allocations destroyed", lost_allocations or None, None),
+            audit_service.field_diff("Performance evaluations destroyed", lost_evals or None, None),
+        ),
+        summary=(
+            f"Deleted organization {pp.name} and everything under it — "
+            f"{len(group_ids)} group(s), {len(sheet_ids)} daily sheet(s), "
+            f"{lost_allocations} allocation(s), {lost_evals} performance evaluation(s)"
+        ),
+        request=http_request,
+    )
 
     if sheet_ids:
         db.query(Allocation).filter(Allocation.sub_project_id.in_(sheet_ids)).delete(synchronize_session=False)

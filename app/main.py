@@ -10,7 +10,7 @@ from arq import create_pool
 from arq.connections import RedisSettings
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -39,7 +39,8 @@ from app.api.wifi_networks import router as wifi_networks_router
 from app.api.hiring_sync import router as hiring_sync_router
 from app.api.chat import router as chat_router
 from app.api.encord_sync import router as encord_sync_router
-from app.api.analytics import router as analytics_router
+from app.api.analytics import router as analytics_router, me_router as analytics_me_router
+from app.api.audit_logs import router as audit_logs_router
 from app.seed_skills import seed_skills
 from app.services.scheduler_service import start_scheduler, shutdown_scheduler
 
@@ -776,4 +777,6 @@ app.include_router(hiring_sync_router)
 app.include_router(chat_router)
 app.include_router(encord_sync_router)
 app.include_router(analytics_router)
+app.include_router(analytics_me_router)
+app.include_router(audit_logs_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
