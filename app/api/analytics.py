@@ -819,16 +819,17 @@ def get_leaderboard(
     name_by_email = _names_for(db, user_seconds.keys())
 
     emails = [e for e in user_seconds.keys() if e]
-    emp_rows = db.query(Employee.encord_id, Employee.email, Employee.designation, Employee.id).filter(
+    emp_rows = db.query(Employee.encord_id, Employee.email, Employee.designation, Employee.id, Employee.avatar_url).filter(
         (Employee.encord_id.in_(emails)) | (Employee.email.in_(emails))
     ).all() if emails else []
 
     emp_map = {}
-    for enc_id, email, desig, emp_id in emp_rows:
+    for enc_id, email, desig, emp_id, avatar in emp_rows:
+        info = (desig, emp_id, avatar)
         if enc_id:
-            emp_map[enc_id] = (desig, emp_id)
+            emp_map[enc_id] = info
         if email:
-            emp_map[email] = (desig, emp_id)
+            emp_map[email] = info
 
     leaderboard = []
     sorted_users = sorted(user_seconds.items(), key=lambda kv: kv[1], reverse=True)
@@ -836,13 +837,14 @@ def get_leaderboard(
         hrs = _hours(secs)
         ann_hrs = _hours(annotation_seconds[u])
         rev_hrs = _hours(review_seconds[u])
-        desig, emp_id = emp_map.get(u, (None, None))
+        desig, emp_id, avatar_url = emp_map.get(u, (None, None, None))
         pct = round((secs / total_team_seconds) * 100, 1) if total_team_seconds else 0.0
         leaderboard.append({
             "rank": rank,
             "user_email": u,
             "employee_name": name_by_email.get(u),
             "employee_id": emp_id,
+            "avatar_url": avatar_url,
             "designation": desig or "Annotator / Reviewer",
             "total_hours": hrs,
             "annotation_hours": ann_hrs,
