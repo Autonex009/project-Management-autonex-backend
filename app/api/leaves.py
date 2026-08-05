@@ -353,6 +353,27 @@ def _get_admin_notification_targets(db: Session) -> list[dict]:
     return targets
 
 
+def _leave_to_schema(leave: Leave) -> LeaveSchema:
+    return LeaveSchema(
+        leave_id=leave.id,
+        employee_id=leave.employee_id,
+        start_date=leave.start_date,
+        end_date=leave.end_date,
+        leave_type=leave.leave_type,
+        reason=leave.reason,
+        status=leave.status or "pending",
+        approved_by=leave.approved_by,
+        razorpay_applied=leave.razorpay_applied or False,
+        flagged=leave.flagged or False,
+        approval_remark=leave.approval_remark,
+        is_emergency=leave.is_emergency or False,
+        is_half_day=leave.is_half_day or False,
+        half_day_slot=leave.half_day_slot,
+        created_at=leave.created_at.isoformat() if leave.created_at else None,
+        updated_at=leave.updated_at.isoformat() if leave.updated_at else None,
+    )
+
+
 @router.get("", response_model=List[LeaveSchema])
 def get_all_leaves(
     employee_id: Optional[int] = None,
@@ -402,6 +423,8 @@ def get_all_leaves(
             is_emergency=leave.is_emergency or False,
             is_half_day=leave.is_half_day or False,
             half_day_slot=leave.half_day_slot,
+            created_at=str(leave.created_at) if leave.created_at else None,
+            updated_at=str(leave.updated_at) if leave.updated_at else None,
         )
         for leave in leaves
     ]
@@ -498,6 +521,8 @@ def get_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
     )
 
 
@@ -580,6 +605,16 @@ def create_leave(
     employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    if (
+        current_user.role not in ["admin", "hr"]
+        and not payload.is_emergency
+        and payload.start_date < date_type.today()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Employees and PMs cannot apply for leaves on past dates unless marked as Emergency Leave."
+        )
 
     if payload.is_half_day:
         validate_half_day_timing(payload.start_date, payload.half_day_slot)
@@ -782,6 +817,7 @@ def create_leave(
                     "leave_applied",
                 )
     db.commit()
+    db.refresh(leave)
 
     return LeaveSchema(
         leave_id=leave.id,
@@ -798,6 +834,8 @@ def create_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
     )
 
 
@@ -872,8 +910,18 @@ def update_leave(
         raise HTTPException(status_code=404, detail="Leave not found")
     check_leave_access(leave.employee_id, current_user, db)
     check_leave_access(payload.employee_id, current_user, db)
-    if leave.start_date <= date_type.today():
+    if current_user.role not in ["admin", "hr"] and leave.start_date <= date_type.today():
         raise HTTPException(status_code=400, detail="Cannot edit a leave that has already started")
+
+    if (
+        current_user.role not in ["admin", "hr"]
+        and not payload.is_emergency
+        and payload.start_date < date_type.today()
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Employees and PMs cannot update leaves to past dates unless marked as Emergency Leave."
+        )
 
     if payload.is_half_day:
         validate_half_day_timing(payload.start_date, payload.half_day_slot)
@@ -1011,6 +1059,8 @@ def update_leave(
         is_emergency=leave.is_emergency or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
     )
 
 

@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -26,6 +27,11 @@ from app.models.employee import Employee
 from app.models.user import User
 
 router = APIRouter(prefix="/api/analytics", tags=["Analytics"], dependencies=[Depends(require_role("admin", "pm"))])
+
+# Self-service router: any authenticated user, but every endpoint here is strictly
+# scoped to the caller's OWN Encord activity (resolved from their employee record).
+# It carries no admin/pm dependency so employees can see their own dashboard chart.
+me_router = APIRouter(prefix="/api/analytics", tags=["Analytics"])
 
 ANNOTATOR_ROLES = {"ANNOTATOR", "ANNOTATOR_REVIEWER"}
 REVIEWER_ROLES = {"REVIEWER", "ANNOTATOR_REVIEWER"}
@@ -112,10 +118,29 @@ def _is_review_stage(stage: str | None) -> bool:
     return "review" in (stage or "").lower()
 
 
+def _range_dates(
+    range_key: str | None,
+    today: date,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> tuple[date, date]:
+    """Map a range key (1|7|30|custom) to an inclusive (start_date, end_date) pair."""
+    key = str(range_key or "7")
+    if key == "custom" and date_from:
+        start = _parse_date(date_from, _month_start(today))
+        end = _parse_date(date_to, today)
+        return start, end
+    if key == "1":
+        yesterday = today - timedelta(days=1)
+        return yesterday, yesterday
+    days = {"7": 7, "30": 30}.get(key, 7)
+    return today - timedelta(days=days - 1), today
+
+
 def _range_start(range_key: str | None, today: date) -> date:
     """Map a range key (1|7|30) to an inclusive start date."""
-    days = {"1": 1, "7": 7, "30": 30}.get(str(range_key or "7"), 7)
-    return today - timedelta(days=days - 1)
+    start, _ = _range_dates(range_key, today)
+    return start
 
 
 def _hours(seconds: int) -> float:
@@ -323,13 +348,15 @@ def project_analytics(
 @router.get("/summary")
 def summary(
     range: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     today = date.today()
-    # Window follows the dashboard range toggle (1|7|30 days). Falls back to
+    # Window follows the dashboard range toggle (1|7|30 days|custom). Falls back to
     # month-to-date when no range is given, preserving the old default.
-    start = _range_start(range, today) if range else _month_start(today)
+    start, end = _range_dates(range, today, date_from, date_to) if range else (_month_start(today), today)
 
     allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
     query = (
@@ -343,7 +370,7 @@ def summary(
 
     out = []
     for sp in projects:
-        rows = _rows_for(db, sp, start, today)
+        rows = _rows_for(db, sp, start, end)
         total_seconds = 0
         du_seconds: dict = defaultdict(int)
         du_role: dict = {}
@@ -515,6 +542,8 @@ def _autonex_kpis(db: Session, *, start: date, end: date, project_hash: str | No
 def autonex_project_kpis(
     sub_project_id: int,
     range: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -527,8 +556,8 @@ def autonex_project_kpis(
     if not sp:
         raise HTTPException(status_code=404, detail="Project not found")
     today = date.today()
-    start = _range_start(range, today)
-    result = _autonex_kpis(db, start=start, end=today, project_hash=sp.encord_project_hash)
+    start, end = _range_dates(range, today, date_from, date_to) if range else (_month_start(today), today)
+    result = _autonex_kpis(db, start=start, end=end, project_hash=sp.encord_project_hash)
     result["project_id"] = sp.id
     result["name"] = sp.name
     return result
@@ -537,12 +566,14 @@ def autonex_project_kpis(
 @router.get("/autonex/kpis")
 def autonex_global_kpis(
     range: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """6 Autonex-only KPIs + daily time graph across ALL mapped projects, over the range."""
     today = date.today()
-    start = _range_start(range, today)
+    start, end = _range_dates(range, today, date_from, date_to) if range else (_month_start(today), today)
     allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
     allowed_hashes = None
     if allowed_ids is not None:
@@ -550,7 +581,7 @@ def autonex_global_kpis(
             h[0] for h in db.query(DailySheet.encord_project_hash).filter(DailySheet.id.in_(allowed_ids)).all() if h[0]
         ]
         allowed_hashes = set(hashes)
-    return _autonex_kpis(db, start=start, end=today, project_hash=None, allowed_hashes=allowed_hashes)
+    return _autonex_kpis(db, start=start, end=end, project_hash=None, allowed_hashes=allowed_hashes)
 
 
 @router.get("/autonex/overview")
@@ -623,4 +654,218 @@ def autonex_overview(
         "autonex_people": len(user_seconds),
         "top_users": top_users,
         "top_projects": top_projects,
+    }
+
+
+def _resolve_employee(db: Session, current_user: User) -> Employee | None:
+    """Find the Employee record for the signed-in user (by employee_id, else email)."""
+    emp = None
+    if current_user.employee_id:
+        emp = db.query(Employee).filter(Employee.id == current_user.employee_id).first()
+    if not emp and current_user.email:
+        emp = db.query(Employee).filter(Employee.email == current_user.email).first()
+    return emp
+
+
+@me_router.get("/me/encord-activity")
+def my_encord_activity(
+    days: int = 7,
+    sub_project_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """The signed-in user's OWN Encord platform hours per day (last `days` days).
+
+    Resolves the caller's Encord account via employees.encord_id, then reads their
+    daily time from `encord_daily_time_spent`. Optionally scoped to one sub-project
+    (the employee's current project) — which also yields a per-day team average so
+    the dashboard can compare the individual against their project's teammates.
+
+    Returns `{ total_hours, daily: [{date, employee_hours, team_avg_hours}], ... }`.
+    An unmapped employee (no encord_id) returns an empty, `mapped: false` payload
+    rather than an error, so the dashboard renders cleanly.
+    """
+    days = max(1, min(int(days or 7), 90))
+
+    emp = _resolve_employee(db, current_user)
+    encord_id = (emp.encord_id or "").strip() if emp else ""
+
+    # Window: the last `days` days ending on the latest synced date (the sync runs
+    # once a day, ~11:30pm, so "today" may not be in yet — anchoring to the latest
+    # available date guarantees the chart shows the most recent complete data).
+    latest = db.query(func.max(EncordDailyTimeSpent.metric_date)).scalar()
+    end = latest or date.today()
+    start = end - timedelta(days=days - 1)
+
+    empty = {
+        "mapped": bool(encord_id),
+        "encord_id": encord_id or None,
+        "range": {"from": start.isoformat(), "to": end.isoformat(), "days": days},
+        "total_hours": 0.0,
+        "daily": [],
+    }
+    if not encord_id:
+        return empty
+
+    # Optional project scoping. Prefer the Encord hash (rows are keyed by hash);
+    # fall back to the sub_project_id.
+    sp = db.query(DailySheet).filter(DailySheet.id == sub_project_id).first() if sub_project_id else None
+    project_hash = sp.encord_project_hash if sp else None
+
+    base = db.query(EncordDailyTimeSpent).filter(
+        EncordDailyTimeSpent.metric_date >= start,
+        EncordDailyTimeSpent.metric_date <= end,
+    )
+    if sp is not None:
+        base = base.filter(
+            EncordDailyTimeSpent.encord_project_hash == project_hash
+        ) if project_hash else base.filter(EncordDailyTimeSpent.sub_project_id == sp.id)
+
+    rows = base.all()
+
+    # Per-day: this employee's seconds, and per-day team totals for the average.
+    mine_by_day: dict[date, int] = defaultdict(int)
+    team_secs_by_day: dict[date, int] = defaultdict(int)
+    team_users_by_day: dict[date, set] = defaultdict(set)
+    for r in rows:
+        d = r.metric_date
+        secs = int(r.time_spent_seconds or 0)
+        if r.user_email == encord_id:
+            mine_by_day[d] += secs
+        # Team average is over Autonex teammates (billing cohort), including self.
+        if is_autonex_email(r.user_email):
+            team_secs_by_day[d] += secs
+            team_users_by_day[d].add(r.user_email)
+
+    daily = []
+    for i in range(days):
+        d = start + timedelta(days=i)
+        team_n = len(team_users_by_day.get(d, ()))
+        team_avg = _hours(team_secs_by_day.get(d, 0) / team_n) if team_n else 0.0
+        daily.append({
+            "date": d.isoformat(),
+            "employee_hours": _hours(mine_by_day.get(d, 0)),
+            "team_avg_hours": team_avg,
+        })
+
+    return {
+        "mapped": True,
+        "encord_id": encord_id,
+        "range": {"from": start.isoformat(), "to": end.isoformat(), "days": days},
+        "total_hours": _hours(sum(mine_by_day.values())),
+        "daily": daily,
+    }
+
+
+@router.get("/leaderboard")
+def get_leaderboard(
+    range: Optional[str] = "month",
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin")),
+):
+    """Admin leaderboard: rank Autonex team members by platform hours over preset windows or custom dates."""
+    today = date.today()
+    if range == "custom" and date_from:
+        start = _parse_date(date_from, _month_start(today))
+        end = _parse_date(date_to, today)
+    elif range == "day":
+        yesterday = today - timedelta(days=1)
+        start = yesterday
+        end = yesterday
+    elif range == "week":
+        start = today - timedelta(days=6)
+        end = today
+    else:  # "month" or default
+        start = _month_start(today)
+        end = today
+
+    time_rows = db.query(EncordDailyTimeSpent).filter(
+        EncordDailyTimeSpent.metric_date >= start,
+        EncordDailyTimeSpent.metric_date <= end,
+    ).all()
+
+    act_rows = db.query(EncordDailyActivity).filter(
+        EncordDailyActivity.metric_date >= start,
+        EncordDailyActivity.metric_date <= end,
+    ).all()
+
+    user_seconds: dict = defaultdict(int)
+    annotation_seconds: dict = defaultdict(int)
+    review_seconds: dict = defaultdict(int)
+    tasks_submitted_by_user: dict = defaultdict(int)
+    labels_created_by_user: dict = defaultdict(int)
+
+    for r in time_rows:
+        if not is_autonex_email(r.user_email):
+            continue
+        secs = r.time_spent_seconds or 0
+        u = r.user_email
+        user_seconds[u] += secs
+        if _is_annotation_stage(r.workflow_stage):
+            annotation_seconds[u] += secs
+        if _is_review_stage(r.workflow_stage):
+            review_seconds[u] += secs
+
+    for a in act_rows:
+        if not is_autonex_email(a.user_email):
+            continue
+        u = a.user_email
+        tasks_submitted_by_user[u] += a.tasks_submitted or 0
+        labels_created_by_user[u] += a.labels_created or 0
+
+    total_team_seconds = sum(user_seconds.values())
+    name_by_email = _names_for(db, user_seconds.keys())
+
+    emails = [e for e in user_seconds.keys() if e]
+    emp_rows = db.query(Employee.encord_id, Employee.email, Employee.designation, Employee.id, Employee.avatar_url).filter(
+        (Employee.encord_id.in_(emails)) | (Employee.email.in_(emails))
+    ).all() if emails else []
+
+    emp_map = {}
+    for enc_id, email, desig, emp_id, avatar in emp_rows:
+        info = (desig, emp_id, avatar)
+        if enc_id:
+            emp_map[enc_id] = info
+        if email:
+            emp_map[email] = info
+
+    leaderboard = []
+    sorted_users = sorted(user_seconds.items(), key=lambda kv: kv[1], reverse=True)
+    for rank, (u, secs) in enumerate(sorted_users, 1):
+        hrs = _hours(secs)
+        ann_hrs = _hours(annotation_seconds[u])
+        rev_hrs = _hours(review_seconds[u])
+        desig, emp_id, avatar_url = emp_map.get(u, (None, None, None))
+        pct = round((secs / total_team_seconds) * 100, 1) if total_team_seconds else 0.0
+        leaderboard.append({
+            "rank": rank,
+            "user_email": u,
+            "employee_name": name_by_email.get(u),
+            "employee_id": emp_id,
+            "avatar_url": avatar_url,
+            "designation": desig or "Annotator / Reviewer",
+            "total_hours": hrs,
+            "annotation_hours": ann_hrs,
+            "review_hours": rev_hrs,
+            "tasks_submitted": tasks_submitted_by_user[u],
+            "labels_created": labels_created_by_user[u],
+            "share_percentage": pct,
+        })
+
+    top_performer = leaderboard[0] if leaderboard else None
+
+    return {
+        "range": {"from": start.isoformat(), "to": end.isoformat()},
+        "team_summary": {
+            "total_hours": _hours(total_team_seconds),
+            "active_users": len(user_seconds),
+            "total_tasks": sum(tasks_submitted_by_user.values()),
+            "top_performer": {
+                "name": (top_performer["employee_name"] or top_performer["user_email"]) if top_performer else "—",
+                "hours": top_performer["total_hours"] if top_performer else 0.0,
+            } if top_performer else None,
+        },
+        "leaderboard": leaderboard,
     }
