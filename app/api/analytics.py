@@ -118,10 +118,29 @@ def _is_review_stage(stage: str | None) -> bool:
     return "review" in (stage or "").lower()
 
 
+def _range_dates(
+    range_key: str | None,
+    today: date,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> tuple[date, date]:
+    """Map a range key (1|7|30|custom) to an inclusive (start_date, end_date) pair."""
+    key = str(range_key or "7")
+    if key == "custom" and date_from:
+        start = _parse_date(date_from, _month_start(today))
+        end = _parse_date(date_to, today)
+        return start, end
+    if key == "1":
+        yesterday = today - timedelta(days=1)
+        return yesterday, yesterday
+    days = {"7": 7, "30": 30}.get(key, 7)
+    return today - timedelta(days=days - 1), today
+
+
 def _range_start(range_key: str | None, today: date) -> date:
     """Map a range key (1|7|30) to an inclusive start date."""
-    days = {"1": 1, "7": 7, "30": 30}.get(str(range_key or "7"), 7)
-    return today - timedelta(days=days - 1)
+    start, _ = _range_dates(range_key, today)
+    return start
 
 
 def _hours(seconds: int) -> float:
@@ -329,13 +348,15 @@ def project_analytics(
 @router.get("/summary")
 def summary(
     range: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     today = date.today()
-    # Window follows the dashboard range toggle (1|7|30 days). Falls back to
+    # Window follows the dashboard range toggle (1|7|30 days|custom). Falls back to
     # month-to-date when no range is given, preserving the old default.
-    start = _range_start(range, today) if range else _month_start(today)
+    start, end = _range_dates(range, today, date_from, date_to) if range else (_month_start(today), today)
 
     allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
     query = (
@@ -349,7 +370,7 @@ def summary(
 
     out = []
     for sp in projects:
-        rows = _rows_for(db, sp, start, today)
+        rows = _rows_for(db, sp, start, end)
         total_seconds = 0
         du_seconds: dict = defaultdict(int)
         du_role: dict = {}
@@ -521,6 +542,8 @@ def _autonex_kpis(db: Session, *, start: date, end: date, project_hash: str | No
 def autonex_project_kpis(
     sub_project_id: int,
     range: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -533,8 +556,8 @@ def autonex_project_kpis(
     if not sp:
         raise HTTPException(status_code=404, detail="Project not found")
     today = date.today()
-    start = _range_start(range, today)
-    result = _autonex_kpis(db, start=start, end=today, project_hash=sp.encord_project_hash)
+    start, end = _range_dates(range, today, date_from, date_to) if range else (_month_start(today), today)
+    result = _autonex_kpis(db, start=start, end=end, project_hash=sp.encord_project_hash)
     result["project_id"] = sp.id
     result["name"] = sp.name
     return result
@@ -543,12 +566,14 @@ def autonex_project_kpis(
 @router.get("/autonex/kpis")
 def autonex_global_kpis(
     range: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """6 Autonex-only KPIs + daily time graph across ALL mapped projects, over the range."""
     today = date.today()
-    start = _range_start(range, today)
+    start, end = _range_dates(range, today, date_from, date_to) if range else (_month_start(today), today)
     allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
     allowed_hashes = None
     if allowed_ids is not None:
@@ -556,7 +581,7 @@ def autonex_global_kpis(
             h[0] for h in db.query(DailySheet.encord_project_hash).filter(DailySheet.id.in_(allowed_ids)).all() if h[0]
         ]
         allowed_hashes = set(hashes)
-    return _autonex_kpis(db, start=start, end=today, project_hash=None, allowed_hashes=allowed_hashes)
+    return _autonex_kpis(db, start=start, end=end, project_hash=None, allowed_hashes=allowed_hashes)
 
 
 @router.get("/autonex/overview")
@@ -746,8 +771,9 @@ def get_leaderboard(
         start = _parse_date(date_from, _month_start(today))
         end = _parse_date(date_to, today)
     elif range == "day":
-        start = today
-        end = today
+        yesterday = today - timedelta(days=1)
+        start = yesterday
+        end = yesterday
     elif range == "week":
         start = today - timedelta(days=6)
         end = today
