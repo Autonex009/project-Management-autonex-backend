@@ -407,7 +407,27 @@ def get_all_leaves(
         query = query.filter(Leave.start_date <= end_date)
 
     leaves = query.order_by(Leave.id.desc()).all()
-    return [_leave_to_schema(leave) for leave in leaves]
+    return [
+        LeaveSchema(
+            leave_id=leave.id,
+            employee_id=leave.employee_id,
+            start_date=leave.start_date,
+            end_date=leave.end_date,
+            leave_type=leave.leave_type,
+            reason=leave.reason,
+            status=leave.status or "pending",
+            approved_by=leave.approved_by,
+            razorpay_applied=leave.razorpay_applied or False,
+            flagged=leave.flagged or False,
+            approval_remark=leave.approval_remark,
+            is_emergency=leave.is_emergency or False,
+            is_half_day=leave.is_half_day or False,
+            half_day_slot=leave.half_day_slot,
+            created_at=str(leave.created_at) if leave.created_at else None,
+            updated_at=str(leave.updated_at) if leave.updated_at else None,
+        )
+        for leave in leaves
+    ]
 
 
 @router.get("/calendar", response_model=dict)
@@ -488,7 +508,22 @@ def get_leave(
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
     check_leave_access(leave.employee_id, current_user, db)
-    return _leave_to_schema(leave)
+    return LeaveSchema(
+        leave_id=leave.id,
+        employee_id=leave.employee_id,
+        start_date=leave.start_date,
+        end_date=leave.end_date,
+        leave_type=leave.leave_type,
+        reason=leave.reason,
+        status=leave.status or "pending",
+        approved_by=leave.approved_by,
+        razorpay_applied=leave.razorpay_applied or False,
+        is_emergency=leave.is_emergency or False,
+        is_half_day=leave.is_half_day or False,
+        half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
+    )
 
 
 def validate_consecutive_leaves(
@@ -774,7 +809,24 @@ def create_leave(
     db.commit()
     db.refresh(leave)
 
-    return _leave_to_schema(leave)
+    return LeaveSchema(
+        leave_id=leave.id,
+        employee_id=leave.employee_id,
+        start_date=leave.start_date,
+        end_date=leave.end_date,
+        leave_type=leave.leave_type,
+        reason=leave.reason,
+        status=leave.status or "pending",
+        approved_by=leave.approved_by,
+        razorpay_applied=leave.razorpay_applied or False,
+        flagged=leave.flagged or False,
+        approval_remark=leave.approval_remark,
+        is_emergency=leave.is_emergency or False,
+        is_half_day=leave.is_half_day or False,
+        half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
+    )
 
 
 class ApproveBody(BaseModel):
@@ -972,7 +1024,24 @@ def update_leave(
 
     db.commit()
     db.refresh(leave)
-    return _leave_to_schema(leave)
+    return LeaveSchema(
+        leave_id=leave.id,
+        employee_id=leave.employee_id,
+        start_date=leave.start_date,
+        end_date=leave.end_date,
+        leave_type=leave.leave_type,
+        reason=leave.reason,
+        status=leave.status or "pending",
+        approved_by=leave.approved_by,
+        razorpay_applied=leave.razorpay_applied or False,
+        flagged=leave.flagged or False,
+        approval_remark=leave.approval_remark,
+        is_emergency=leave.is_emergency or False,
+        is_half_day=leave.is_half_day or False,
+        half_day_slot=leave.half_day_slot,
+        created_at=str(leave.created_at) if leave.created_at else None,
+        updated_at=str(leave.updated_at) if leave.updated_at else None,
+    )
 
 
 # ── Approve / Reject ───────────────────────────────────────────────

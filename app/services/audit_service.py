@@ -28,10 +28,32 @@ from typing import Any, Optional, Sequence
 from fastapi import Request
 from sqlalchemy.orm import Session
 
+from datetime import datetime, timedelta
+
 from app.models.audit_log import AuditLog
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
+
+RETENTION_DAYS = 20
+
+
+def prune_expired_logs(db: Session, retention_days: int = RETENTION_DAYS) -> int:
+    """Delete audit log entries older than retention_days (20 days)."""
+    try:
+        cutoff = datetime.utcnow() - timedelta(days=retention_days)
+        deleted = (
+            db.query(AuditLog)
+            .filter(AuditLog.created_at < cutoff)
+            .delete(synchronize_session=False)
+        )
+        if deleted:
+            db.commit()
+            logger.info("Pruned %d expired audit log entries older than %d days", deleted, retention_days)
+        return deleted
+    except Exception:
+        logger.exception("Failed to prune expired audit log entries")
+        return 0
 
 
 def field_diff(label: str, before: Any, after: Any) -> Optional[dict]:
