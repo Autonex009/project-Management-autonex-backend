@@ -78,6 +78,10 @@ class Leave(LeaveBase):
     leave_id: int
     status: Optional[str] = "pending"
     approved_by: Optional[int] = None
+    # Display name for ``approved_by``, resolved server-side. Any PM of a project the
+    # employee is on may decide, so "who actually did this" is not inferable from the
+    # employee — and ``approved_by`` is a users.id, which the client cannot resolve.
+    approved_by_name: Optional[str] = None
     razorpay_applied: Optional[bool] = False
     flagged: Optional[bool] = False
     approval_remark: Optional[str] = None

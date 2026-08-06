@@ -113,6 +113,25 @@ def get_current_user(
 
     return user
 
+# Roles that read the whole team's records rather than only their own.
+#
+# These endpoints answer "may I see other people's leave/WFH/allocations?", which is a
+# different question from "may I approve them" — a team lead sees everything a PM sees and
+# approves nothing. Kept as one list because the alternative is repeating the literal in
+# every list endpoint, and a site that misses a role fails in a confusing way: the request
+# succeeds but silently narrows to the caller's own records, so the page renders empty
+# rather than erroring.
+#
+# Do NOT use this for writes. Ownership checks (assigning a project's manager, editing
+# admin-only employee fields, submitting an evaluation for someone else) must name their
+# roles explicitly, and per-project action rights live in services/project_scope.py.
+TEAM_READ_ROLES = ("admin", "pm", "hr", "team_lead")
+
+
+def has_team_read(user: Optional[User]) -> bool:
+    return user is not None and user.role in TEAM_READ_ROLES
+
+
 def require_role(*roles):
     """
     Returns a dependency that checks the user's role.
@@ -124,6 +143,15 @@ def require_role(*roles):
         # HR has combined Admin + PM access: it passes any check that permits
         # either an admin or a pm.
         if user.role == "hr" and ("admin" in roles or "pm" in roles):
+            return user
+        # A team lead reads everything a PM reads — same portal, same pages — so it
+        # passes every pm-gated check here. What it must NOT do is *act*, and that is
+        # deliberately not enforced at this layer: role tells you nothing about which
+        # project a request touches. Mutating endpoints additionally call
+        # app.services.project_scope, which allows an action only for the PM of the
+        # project in question. Adding a pm-gated MUTATION without that call grants it
+        # to every team lead.
+        if user.role == "team_lead" and "pm" in roles:
             return user
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
