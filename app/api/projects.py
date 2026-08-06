@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
 from app.services.auth_service import get_current_user, require_role
-from app.services import audit_service
+from app.services import audit_service, project_scope
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -41,18 +41,81 @@ def normalize_project_payload(data: dict, db: Session | None = None) -> dict:
 
 
 def _autonex_headcount(source) -> int:
-    """required_manpower = Autonex Annotators + Autonex Reviewers + QC."""
+    """required_manpower = Autonex Annotators + Autonex Reviewers.
+
+    QC is no longer part of a project's team composition and is excluded. The column
+    remains so historical rows keep their value, but nothing adds to it.
+
+    The project's managers and team leads are deliberately *not* counted here: they are
+    added when the ratio is displayed (``totalRequiredManpower`` on the frontend), because
+    resolving them needs the allocations and the organisation fallback.
+    """
     def g(name):
         if isinstance(source, dict):
             return source.get(name) or 0
         return getattr(source, name, 0) or 0
-    return int(g("autonex_annotators")) + int(g("autonex_reviewers")) + int(g("qc_count"))
+    return int(g("autonex_annotators")) + int(g("autonex_reviewers"))
 
 router = APIRouter(
     prefix="/api/sub-projects",
     tags=["sub-projects"],
     dependencies=[Depends(get_current_user)],
 )
+
+# Mirrors TEAM_LEAD_TAG in frontend/src/utils/roleAccess.js, and the values
+# project_scope.TEAM_LEAD_TAGS matches.
+TEAM_LEAD_ROLE_TAG = "Team Lead"
+
+
+def _allocate_project_creator(db: Session, project: Project, current_user: User) -> None:
+    """Allocate whoever just created ``project`` to it.
+
+    An admin is skipped: they create projects on other people's behalf and are not staff on
+    them, so an allocation would put them in the manpower count and the avatar strip.
+
+    A team lead's row is tagged, which is what records them as this project's lead — it is
+    the per-project marker, unlike ``assigned_employee_ids`` which would give them a
+    manager's rank over the project's other leads.
+
+    Overridden on purpose: the capacity guard exists to stop someone being booked past their
+    working day, and it would refuse anyone who already runs a project. Creating a project
+    should never fail for that reason, and the recorded reason keeps it auditable.
+    """
+    if not current_user or current_user.role == "admin":
+        return
+    employee_id = getattr(current_user, "employee_id", None)
+    if not employee_id:
+        return
+
+    already_on = (
+        db.query(Allocation)
+        .filter(
+            Allocation.employee_id == employee_id,
+            Allocation.sub_project_id == project.id,
+        )
+        .first()
+    )
+    if already_on:
+        return
+
+    is_lead = project_scope.escalates_to_pm(db, employee_id)
+    db.add(
+        Allocation(
+            employee_id=employee_id,
+            sub_project_id=project.id,
+            total_daily_hours=8,
+            role_tags=[TEAM_LEAD_ROLE_TAG] if is_lead else [],
+            time_distribution={},
+            active_start_date=project.start_date,
+            active_end_date=project.end_date,
+            override_flag=True,
+            override_reason="Created this project",
+        )
+    )
+    # Denormalised count the cards read; kept in step with the row just added.
+    project.allocated_employees = (
+        db.query(Allocation).filter(Allocation.sub_project_id == project.id).count() + 1
+    )
 
 
 # ✅ CREATE PROJECT
@@ -64,12 +127,16 @@ def create_project(
     current_user: User = Depends(get_current_user),
 ):
     data = normalize_project_payload(payload.model_dump(), db)
-    data["required_manpower"] = _autonex_headcount(data)  # auto: Autonex annotators + reviewers + QC
+    data["required_manpower"] = _autonex_headcount(data)  # Autonex annotators + reviewers
     # A PM (or HR) who creates a project owns it. Guarantee they're recorded as a
     # project-level PM using their authoritative token identity, so the project is
     # always visible to them — even if the client omitted the assignment (e.g. a
     # cached session whose user object had no employee_id). Admin-created projects
     # are left as-is (admins see everything anyway).
+    #
+    # A team lead is deliberately NOT added here: a seat in assigned_employee_ids is the
+    # manager's, and holding it would let them decide the project's other leads' requests.
+    # They are put on the project as its lead instead — see the allocation below.
     if current_user.role in ("pm", "hr") and current_user.employee_id:
         ids = list(data.get("assigned_employee_ids") or [])
         if current_user.employee_id not in ids:
@@ -78,6 +145,12 @@ def create_project(
     project = Project(**data)
     db.add(project)
     db.flush()
+
+    # Put the creator on their own project straight away. Being the recorded manager is not
+    # enough on its own: the Allocations page and the manpower avatar strip are built from
+    # allocation rows, so without one the person who just created the project is missing
+    # from both. Done here rather than in the client so it cannot be skipped or half-applied.
+    _allocate_project_creator(db, project, current_user)
 
     audit_service.record(
         db,
@@ -126,6 +199,10 @@ def update_project(
 
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    project_scope.require_project_scope(
+        db, current_user, project, action="edit this project"
+    )
 
     update_data = normalize_project_payload(payload.model_dump(exclude_unset=True), db)
     old_status = project.project_status
@@ -228,6 +305,10 @@ def delete_project(
 
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+
+    project_scope.require_project_scope(
+        db, current_user, project, action="delete this project"
+    )
 
     # Counted before deletion — this endpoint quietly destroys allocations and
     # performance history alongside the project, and the entry should say how much.

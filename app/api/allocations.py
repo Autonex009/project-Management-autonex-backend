@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from app.services.auth_service import get_current_user, require_role
-from app.services import audit_service
+from app.services.auth_service import get_current_user, has_team_read, require_role
+from app.services import audit_service, project_scope
 from app.models.user import User
 from sqlalchemy.orm import Session
 from typing import List
@@ -211,6 +211,15 @@ def create_allocation(
     current_user: User = Depends(require_role("admin", "pm")),
 ):
     """Create a new allocation with validation."""
+    # Staffing a project is the PM's call, so scope on the target project rather than on
+    # the employee: the person being added is by definition not on it yet.
+    project_scope.require_project_scope(
+        db,
+        current_user,
+        db.query(Project).filter(Project.id == data.sub_project_id).first(),
+        action="allocate people to this project",
+    )
+
     # Validate time distribution if provided
     if data.time_distribution:
         time_check = validate_time_distribution(
@@ -395,7 +404,7 @@ def get_allocations_by_employee(
     current_user: User = Depends(get_current_user)
 ):
     """Get all allocations for a specific employee."""
-    if current_user.role not in ["admin", "pm", "hr"]:
+    if not has_team_read(current_user):
         is_self = current_user.employee_id == employee_id
         if not is_self:
             employee = db.query(Employee).filter(Employee.id == employee_id).first()
@@ -420,7 +429,24 @@ def update_allocation(
     
     if not allocation:
         raise HTTPException(status_code=404, detail="Allocation not found")
-    
+
+    # Scope on the project the allocation is on now...
+    project_scope.require_project_scope(
+        db,
+        current_user,
+        db.query(Project).filter(Project.id == allocation.sub_project_id).first(),
+        action="change allocations on this project",
+    )
+    # ...and, when the allocation is being moved, on the destination too. Checking only
+    # the source would let a PM push someone onto a project they do not manage.
+    if data.sub_project_id and data.sub_project_id != allocation.sub_project_id:
+        project_scope.require_project_scope(
+            db,
+            current_user,
+            db.query(Project).filter(Project.id == data.sub_project_id).first(),
+            action="move allocations onto this project",
+        )
+
     # Validate time distribution if being updated
     new_hours = data.total_daily_hours or allocation.total_daily_hours or 8
     new_distribution = data.time_distribution if data.time_distribution is not None else allocation.time_distribution
@@ -571,6 +597,10 @@ def delete_allocation(
 
     sub_project_id = allocation.sub_project_id
     project = db.query(Project).filter(Project.id == sub_project_id).first()
+
+    project_scope.require_project_scope(
+        db, current_user, project, action="remove allocations from this project"
+    )
 
     # Captured before the delete — afterwards there is no row left to describe.
     removed_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()

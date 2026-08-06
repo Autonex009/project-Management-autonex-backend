@@ -5,8 +5,9 @@ from uuid import uuid4
 import logging
 import os
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, EmailStr
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -26,7 +27,12 @@ from app.schemas.employee import (
     EmployeeUpdate,
     EmployeeResponse,
 )
-from app.services.auth_service import get_current_user, hash_password, require_role
+from app.services.auth_service import (
+    get_current_user,
+    has_team_read,
+    hash_password,
+    require_role,
+)
 from app.services.email_service import try_send_email_changed_email
 from app.services.identity_validator import check_duplicate_identity
 from app.services import audit_service
@@ -83,6 +89,12 @@ DESIGNATION_ROLE_MAP = {
     "Admin": "admin",
     "HR": "hr",   # combined Admin + PM access
     "Program Manager": "pm",
+    # Reads everything a PM reads, approves nothing — see services/project_scope.py.
+    # Must stay in step with DESIGNATION_ACCESS in api/auth.py: that map decides the
+    # token role at login, this one decides the stored users.role. Because the role is
+    # re-derived from the designation on every employee update (below), omitting this
+    # entry would demote a team lead to "employee" on an unrelated profile edit.
+    "Team Lead": "team_lead",
     "Annotator/ Reviewer": "employee",
     "Annotator/Reviewer": "employee",
     "Annotator": "employee",
@@ -96,7 +108,7 @@ def get_user_role_from_designation(designation: str | None) -> str:
 
 
 def check_employee_access(employee: Employee, current_user: User):
-    if current_user.role in ["admin", "pm", "hr"]:
+    if has_team_read(current_user):
         return
     is_self = (current_user.employee_id == employee.id) or (current_user.email == employee.email)
     if not is_self:
@@ -174,6 +186,11 @@ def create_employee(
 def list_employees(
     status: str = None,
     include_archived: bool = False,
+    search: Optional[str] = Query(
+        default=None,
+        max_length=200,
+        description="Substring match on name, email or Encord ID (case-insensitive).",
+    ),
     db: Session = Depends(get_db)
 ):
     query = db.query(Employee)
@@ -184,6 +201,20 @@ def list_employees(
         query = query.filter(Employee.status == status)
     elif not include_archived:
         query = query.filter(Employee.status != "archived")
+    if search and search.strip():
+        # Encord IDs (annotator247_theta@encord.ai) are the reason this filter exists
+        # server-side: they are only worth typing in full, and a chunk of the roster
+        # has none, so the client cannot reliably answer "who owns this ID?".
+        # ``trim`` on the column because some stored IDs carry leading whitespace
+        # from the sheet they were imported from — without it those never match.
+        term = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                Employee.name.ilike(term),
+                Employee.email.ilike(term),
+                func.trim(Employee.encord_id).ilike(term),
+            )
+        )
     return query.all()
 
 
@@ -237,6 +268,9 @@ def update_employee(
     
     check_employee_access(employee, current_user)
     
+    # Deliberately NOT has_team_read: this restricts *writing*, and a team lead reads
+    # everything without being allowed to change designations, salary or status. Adding
+    # "team_lead" here would let a view-only role rewrite these fields.
     if current_user.role not in ["admin", "pm", "hr"]:
         # `email` is here so the company-domain rule on PATCH /{id}/email can't be
         # sidestepped by patching the field directly — self-service email changes

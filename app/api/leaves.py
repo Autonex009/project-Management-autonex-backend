@@ -69,8 +69,8 @@ from app.services.slack_service import (
     try_send_leave_status_message,
 )
 
-from app.services.auth_service import get_current_user, require_role
-from app.services import audit_service
+from app.services.auth_service import get_current_user, has_team_read, require_role
+from app.services import audit_service, project_scope
 
 # NOTE: ``Request`` at the top of this module is urllib's, used for the Razorpay
 # calls. FastAPI's request object is aliased so the two never get confused — a bare
@@ -81,7 +81,7 @@ router = APIRouter(prefix="/api/leaves", tags=["Leaves"], dependencies=[Depends(
 
 
 def check_leave_access(leave_employee_id: int, current_user: User, db: Session):
-    if current_user.role not in ["admin", "pm", "hr"]:
+    if not has_team_read(current_user):
         is_self = current_user.employee_id == leave_employee_id
         if not is_self:
             emp = db.query(Employee).filter(Employee.id == leave_employee_id).first()
@@ -276,7 +276,17 @@ def _get_pm_notification_targets(db: Session, employee: Employee, leave: Leave) 
 
         sub_project = sub_project_map.get(project.sub_project_id) if project.sub_project_id else None
         main_project = main_project_map.get(project.main_project_id) if project.main_project_id else None
-        pm_ids = {
+        # Whoever may decide this request on this project. A lead has a manager's powers, so
+        # they are notified about their members — but a *lead's own* request goes only to the
+        # program manager, never to a peer lead who could not action it anyway.
+        if project_scope.escalates_to_pm(db, employee.id):
+            pm_ids = set(project_scope.project_pm_ids(db, project))
+        else:
+            pm_ids = set(project_scope.project_actor_ids(db, project))
+        # Union with the legacy scalar columns rather than replacing them: project_scope
+        # resolves assigned_employee_ids → program_manager_ids → program_manager_id, but not
+        # sub_projects.pm_id, and losing a recipient is worse than one extra.
+        pm_ids |= {
             pm_id
             for pm_id in (
                 getattr(sub_project, "pm_id", None),
@@ -284,6 +294,8 @@ def _get_pm_notification_targets(db: Session, employee: Employee, leave: Leave) 
             )
             if pm_id
         }
+        # Nobody is told to approve their own request.
+        pm_ids.discard(employee.id)
         if not pm_ids:
             continue
 
@@ -374,6 +386,19 @@ def _leave_to_schema(leave: Leave) -> LeaveSchema:
     )
 
 
+def _approver_names(db: Session, leaves) -> dict:
+    """Map ``approved_by`` -> approver name for a batch of leaves.
+
+    ``approved_by`` holds a **users.id**, not an employees.id, so it resolves against the
+    User table. Batched into one query because this feeds a full table of rows.
+    """
+    ids = {leave.approved_by for leave in leaves if leave.approved_by}
+    if not ids:
+        return {}
+    rows = db.query(User.id, User.name).filter(User.id.in_(ids)).all()
+    return {row[0]: row[1] for row in rows}
+
+
 @router.get("", response_model=List[LeaveSchema])
 def get_all_leaves(
     employee_id: Optional[int] = None,
@@ -383,7 +408,7 @@ def get_all_leaves(
     current_user: User = Depends(get_current_user)
 ):
     """Get all leaves, optionally filtered by employee_id, start_date, or end_date"""
-    if current_user.role not in ["admin", "pm", "hr"]:
+    if not has_team_read(current_user):
         if employee_id is None:
             employee_id = current_user.employee_id
             if employee_id is None:
@@ -407,6 +432,7 @@ def get_all_leaves(
         query = query.filter(Leave.start_date <= end_date)
 
     leaves = query.order_by(Leave.id.desc()).all()
+    approver_names = _approver_names(db, leaves)
     return [
         LeaveSchema(
             leave_id=leave.id,
@@ -417,6 +443,7 @@ def get_all_leaves(
             reason=leave.reason,
             status=leave.status or "pending",
             approved_by=leave.approved_by,
+            approved_by_name=approver_names.get(leave.approved_by),
             razorpay_applied=leave.razorpay_applied or False,
             flagged=leave.flagged or False,
             approval_remark=leave.approval_remark,
@@ -772,11 +799,27 @@ def create_leave(
     )
 
     duration_days = 0.5 if leave.is_half_day else (leave.end_date - leave.start_date).days + 1
-    # PMs route their own leave requests straight to Admin for approval. Everyone
-    # else routes to the PM(s) of their allocated projects, falling back to Admin.
-    is_pm_applicant = emp_user is not None and emp_user.role == "pm"
-    pm_targets = [] if is_pm_applicant else _get_pm_notification_targets(db, employee, leave)
-    notification_targets = pm_targets if pm_targets else _get_admin_notification_targets(db)
+    # Who is asked to decide, by the applicant's tier (see services/project_scope.py):
+    #
+    #   manager (PM / project manager / HR) → Admin only; no peer approves a peer
+    #   team lead                           → their project's PM *and* Admin
+    #   everyone else                       → the PM(s) and lead(s) of their projects,
+    #                                         falling back to Admin when none resolve
+    #
+    # Decided by designation rather than users.role so notification and approval agree on
+    # one definition, and so a program manager lent to another project as a temporary lead
+    # still escalates to Admin rather than to that project's PM.
+    escalates_to_admin = project_scope.escalates_to_admin(db, employee.id)
+    escalates_to_pm = project_scope.escalates_to_pm(db, employee.id)
+    pm_targets = (
+        [] if escalates_to_admin else _get_pm_notification_targets(db, employee, leave)
+    )
+    if escalates_to_admin or not pm_targets:
+        notification_targets = _get_admin_notification_targets(db)
+    elif escalates_to_pm:
+        notification_targets = pm_targets + _get_admin_notification_targets(db)
+    else:
+        notification_targets = pm_targets
     notified_user_ids: set[int] = set()
     for target in notification_targets:
         try_send_pm_leave_request_message(
@@ -853,6 +896,10 @@ def apply_leave_to_razorpay(
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
+
+    project_scope.require_employee_scope(
+        db, current_user, leave.employee_id, action="sync leave to Razorpay"
+    )
 
     if getattr(leave, "is_half_day", False):
         raise HTTPException(status_code=400, detail="Half-day leaves do not sync to Razorpay")
@@ -1084,6 +1131,12 @@ def approve_leave(
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
 
+    # Authorise before validating: a caller who may not touch this leave should get 403,
+    # not a 422 that tells them a remark would have worked.
+    project_scope.require_employee_scope(
+        db, current_user, leave.employee_id, action="approve leave"
+    )
+
     if leave.flagged and not (body.remark and body.remark.strip()):
         raise HTTPException(
             status_code=422,
@@ -1196,6 +1249,10 @@ def reject_leave(
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
 
+    project_scope.require_employee_scope(
+        db, current_user, leave.employee_id, action="reject leave"
+    )
+
     employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
@@ -1271,6 +1328,11 @@ def undo_reject_leave(
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
+
+    project_scope.require_employee_scope(
+        db, current_user, leave.employee_id, action="reopen a rejected leave"
+    )
+
     if leave.status != "rejected":
         raise HTTPException(status_code=400, detail=f"Leave is not rejected (status: {leave.status})")
 
@@ -1354,6 +1416,11 @@ def undo_approve_leave(
     leave = db.query(Leave).filter(Leave.id == leave_id).first()
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
+
+    project_scope.require_employee_scope(
+        db, current_user, leave.employee_id, action="revoke a leave approval"
+    )
+
     if leave.status != "approved":
         raise HTTPException(status_code=400, detail=f"Leave is not approved (status: {leave.status})")
 

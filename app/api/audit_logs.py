@@ -5,7 +5,7 @@ written only by ``app.services.audit_service.record`` from inside the endpoint t
 performed the action, and are never modified afterwards. An audit trail the
 application can edit is not an audit trail.
 """
-from datetime import date as date_type, timedelta
+from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -20,6 +20,52 @@ from app.services.audit_service import RETENTION_DAYS, prune_expired_logs
 from app.services.auth_service import get_current_user
 
 router = APIRouter(prefix="/api/audit-logs", tags=["Audit Logs"])
+
+# ``audit_logs.created_at`` is TIMESTAMP WITHOUT TIME ZONE, filled by Postgres now()
+# with the database in UTC — so every stored value is a naive UTC instant. The team
+# works in IST, which matters in two places below: rendering, and day boundaries.
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def _iso_utc(dt: Optional[datetime]) -> Optional[str]:
+    """Serialise a stored timestamp with an explicit UTC offset.
+
+    Without the offset, ``isoformat()`` yields "2026-08-04T11:24:17" and the browser's
+    ``new Date(...)`` parses a bare date-time as *local* time — so an IST viewer sees
+    every entry shifted 5h30m into the past and a just-now action reads as "5h ago".
+    Emitting "+00:00" lets the client convert to whatever zone the viewer is in.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _ist_date_to_utc(d: date_type, next_day: bool = False) -> datetime:
+    """Convert a date the admin picked (an IST calendar day) to a naive-UTC instant.
+
+    Pass ``next_day=True`` for an inclusive upper bound — the start of the following
+    IST day. Comparing the raw date against the column would use UTC midnight, which
+    is 05:30 IST, so a day filter would silently miss the first 5½ hours of it.
+    """
+    ist = datetime(d.year, d.month, d.day, tzinfo=IST)
+    if next_day:
+        ist += timedelta(days=1)
+    return ist.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _ist_day_start_utc(days_ago: int = 0) -> datetime:
+    """The naive-UTC instant matching midnight IST, ``days_ago`` days back.
+
+    "Today" has to mean the IST calendar day, not the UTC one. Comparing against a
+    UTC midnight would bucket anything done between 00:00 and 05:30 IST into the
+    previous day, so the "Today's Activity" card would under-report every morning.
+    """
+    ist_midnight = (datetime.now(IST) - timedelta(days=days_ago)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    return ist_midnight.astimezone(timezone.utc).replace(tzinfo=None)
 
 # Actions that walk back an earlier decision. Surfaced as their own stat and
 # highlighted in the UI, because "who reversed this?" is the question an audit log
@@ -70,7 +116,7 @@ def _serialize(entry: AuditLog, avatar_url: Optional[str]) -> dict:
     """
     return {
         "id": entry.id,
-        "created_at": (entry.created_at.isoformat() + "Z") if entry.created_at and not entry.created_at.tzinfo else (entry.created_at.isoformat() if entry.created_at else None),
+        "created_at": _iso_utc(entry.created_at),
         "action": entry.action,
         "action_type": entry.action_type,
         "category": entry.category,
@@ -163,11 +209,17 @@ def list_audit_logs(
     if entity_type:
         query = query.filter(AuditLog.entity_type == entity_type)
     if date_from:
+        # Clamp to the retention window first — asking for older than we keep can only
+        # mislead — then convert that IST calendar day to the UTC instant we store.
         effective_date_from = max(date_from, retention_cutoff)
-        query = query.filter(AuditLog.created_at >= effective_date_from)
+        query = query.filter(
+            AuditLog.created_at >= _ist_date_to_utc(effective_date_from)
+        )
     if date_to:
-        # date_to is inclusive: a timestamp on that day is still "<= end of day".
-        query = query.filter(AuditLog.created_at < date_to + timedelta(days=1))
+        # Inclusive: everything up to the end of that IST day.
+        query = query.filter(
+            AuditLog.created_at < _ist_date_to_utc(date_to, next_day=True)
+        )
     if search and search.strip():
         term = f"%{search.strip()}%"
         query = query.filter(
@@ -211,9 +263,10 @@ def audit_log_stats(
     Computed in SQL rather than in the browser: the page only ever holds one page of
     rows, so counting client-side would report the page size, not the truth.
     """
-    today = date_type.today()
-    week_ago = today - timedelta(days=7)
-    retention_cutoff = today - timedelta(days=RETENTION_DAYS)
+    retention_cutoff = date_type.today() - timedelta(days=RETENTION_DAYS)
+    # IST day boundaries, expressed as the UTC instants actually stored in the column.
+    today = _ist_day_start_utc(0)
+    week_ago = _ist_day_start_utc(7)
 
     total = db.query(func.count(AuditLog.id)).filter(AuditLog.created_at >= retention_cutoff).scalar() or 0
     today_count = (

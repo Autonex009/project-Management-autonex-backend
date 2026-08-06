@@ -16,6 +16,26 @@ EMPLOYEE_TYPE_ALIASES = {
 }
 
 
+def normalize_encord_id(value: Optional[str]) -> Optional[str]:
+    """Strip an Encord id before it is stored, and treat blank as unlinked.
+
+    Analytics matches this against `encord_daily_time_spent.user_email`. Values
+    imported from the onboarding spreadsheet arrived padded with whitespace, and a
+    padded id silently resolves to no employee — the charts then label that person
+    with their raw Encord email instead of their name. Normalizing on the way in
+    keeps new edits and re-imports from reintroducing it.
+
+    Removes ALL whitespace, not just the edges: an id is an email address, so inner
+    whitespace is always a paste artefact, and this has to agree exactly with
+    api\\analytics.py's `_norm_encord` — which cannot rely on SQL ``trim`` (spaces
+    only) and so strips the lot.
+    """
+    if value is None:
+        return None
+    cleaned = "".join(value.split())
+    return cleaned or None
+
+
 def normalize_employee_type(value: Optional[str]) -> Optional[str]:
     if value is None:
         return value
@@ -51,6 +71,11 @@ class EmployeeBase(BaseModel):
     def validate_employee_type(cls, value: str) -> str:
         return normalize_employee_type(value)
 
+    @field_validator("encord_id", mode="before")
+    @classmethod
+    def validate_encord_id(cls, value: Optional[str]) -> Optional[str]:
+        return normalize_encord_id(value)
+
 
 class EmployeeCreate(EmployeeBase):
     # Write-only: accepted on input, encrypted at rest, and never echoed back
@@ -82,6 +107,11 @@ class EmployeeUpdate(BaseModel):
     @classmethod
     def validate_employee_type(cls, value: Optional[str]) -> Optional[str]:
         return normalize_employee_type(value)
+
+    @field_validator("encord_id", mode="before")
+    @classmethod
+    def validate_encord_id(cls, value: Optional[str]) -> Optional[str]:
+        return normalize_encord_id(value)
 
 
 class EmployeeResponse(EmployeeBase):
