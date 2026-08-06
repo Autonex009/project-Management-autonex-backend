@@ -757,13 +757,13 @@ def my_encord_activity(
     }
 
 
-@router.get("/leaderboard")
+@me_router.get("/leaderboard")
 def get_leaderboard(
     range: Optional[str] = "month",
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(get_current_user),
 ):
     """Admin leaderboard: rank Autonex team members by platform hours over preset windows or custom dates."""
     today = date.today()
