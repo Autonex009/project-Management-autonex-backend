@@ -63,12 +63,27 @@ from app.services.slack_service import (
     try_lookup_user_avatar_by_email,
 )
 
-# Avatar uploads live alongside the other static uploads served at /uploads.
-_avatar_base = Path("/tmp/uploads") if os.environ.get("VERCEL") else Path(__file__).resolve().parents[2] / "uploads"
-AVATAR_DIR = _avatar_base / "avatars"
-AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+# Avatars live in Supabase Storage, never on disk. The host filesystem is
+# ephemeral on both Railway and Vercel, so a locally-written file is gone by the
+# next deploy while employees.avatar_url still points at it — the picture then
+# 404s and the UI silently falls back to initials, which reads as data loss.
+from app.services.storage_service import (
+    AVATAR_BUCKET,
+    delete_from_bucket,
+    is_supabase_configured,
+    upload_to_bucket,
+)
 
-ALLOWED_AVATAR_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+# Extension -> the Content-Type Supabase should serve the object with. Doubles as
+# the allowlist, so the two can never disagree.
+AVATAR_CONTENT_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+ALLOWED_AVATAR_EXTENSIONS = set(AVATAR_CONTENT_TYPES)
 MAX_AVATAR_BYTES = 5 * 1024 * 1024  # 5 MB
 
 logger = logging.getLogger(__name__)
@@ -843,6 +858,15 @@ async def upload_employee_avatar(
             detail="Unsupported image type. Use JPG, PNG, GIF or WEBP.",
         )
 
+    if not is_supabase_configured():
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Image storage is not configured. Set SUPABASE_URL and "
+                "SUPABASE_SERVICE_ROLE_KEY on the server."
+            ),
+        )
+
     file_bytes = await file.read()
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
@@ -850,17 +874,20 @@ async def upload_employee_avatar(
         raise HTTPException(status_code=400, detail="Image is too large (max 5 MB)")
 
     stored_name = f"{uuid4().hex}{suffix}"
-    destination = AVATAR_DIR / stored_name
-    destination.write_bytes(file_bytes)
+    try:
+        public_url = upload_to_bucket(
+            AVATAR_BUCKET, file_bytes, stored_name, AVATAR_CONTENT_TYPES[suffix]
+        )
+    except RuntimeError as exc:
+        logger.warning("Avatar upload failed for employee %s: %s", employee_id, exc)
+        raise HTTPException(
+            status_code=502, detail="Could not store the image. Please try again."
+        ) from exc
 
-    # Remove the previous locally-stored avatar to avoid orphan files.
+    # Cleared only once the new URL is safely committed — losing the old picture
+    # on a failed save would leave the employee with no avatar at all.
     old_url = employee.avatar_url or ""
-    if "/uploads/avatars/" in old_url:
-        old_file = AVATAR_DIR / old_url.rsplit("/", 1)[-1]
-        if old_file.exists():
-            old_file.unlink()
-
-    employee.avatar_url = str(request.base_url).rstrip("/") + f"/uploads/avatars/{stored_name}"
+    employee.avatar_url = public_url
     try:
         # Deliberately thin — the image URL itself is noise, so only the fact of the
         # upload is recorded, plus a note when an admin changed someone else's picture.
@@ -875,8 +902,11 @@ async def upload_employee_avatar(
             entity_name=employee.name,
             subject_employee_id=employee.id,
             subject_name=employee.name,
+            # "via computer" distinguishes this from the Slack import below. The
+            # two are indistinguishable afterwards — both leave a URL on the row —
+            # so where a picture came from only survives if the log says so.
             summary=(
-                f"Uploaded a new profile picture for {employee.name}"
+                f"Uploaded a new profile picture via computer for {employee.name}"
                 + (
                     ""
                     if current_user.employee_id == employee.id
@@ -887,17 +917,23 @@ async def upload_employee_avatar(
         )
         db.commit()
         db.refresh(employee)
-        return employee
     except SQLAlchemyError as exc:
         db.rollback()
-        if destination.exists():
-            destination.unlink()
+        # The row never took the new URL, so the object we just pushed is an
+        # orphan. Drop it rather than leave it billing storage forever.
+        delete_from_bucket(AVATAR_BUCKET, public_url)
         raise HTTPException(status_code=500, detail="Failed to save avatar") from exc
+
+    # Best-effort, and after the commit: a failure here costs a stray object, not
+    # the employee's picture. Legacy /uploads/avatars/ URLs simply do not match.
+    delete_from_bucket(AVATAR_BUCKET, old_url)
+    return employee
 
 
 @router.post("/{employee_id}/avatar/from-slack", response_model=EmployeeResponse)
 def set_employee_avatar_from_slack(
     employee_id: int,
+    request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -916,6 +952,30 @@ def set_employee_avatar_from_slack(
         )
 
     employee.avatar_url = avatar_url
+    # Recorded like the upload above, and worded to say where the picture came
+    # from. This path used to write silently, so the log showed a picture arriving
+    # by upload and nothing at all when one was pulled from Slack.
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="employee.avatar_from_slack",
+        category="Employees",
+        action_type="Updated",
+        entity_type="employee",
+        entity_id=employee.id,
+        entity_name=employee.name,
+        subject_employee_id=employee.id,
+        subject_name=employee.name,
+        summary=(
+            f"Uploaded a new profile picture via Slack for {employee.name}"
+            + (
+                ""
+                if current_user.employee_id == employee.id
+                else " (done by an admin)"
+            )
+        ),
+        request=request,
+    )
     db.commit()
     db.refresh(employee)
     return employee
@@ -935,12 +995,11 @@ def delete_employee_avatar(
     check_employee_access(employee, current_user)
 
     old_url = employee.avatar_url or ""
-    if "/uploads/avatars/" in old_url:
-        old_file = AVATAR_DIR / old_url.rsplit("/", 1)[-1]
-        if old_file.exists():
-            old_file.unlink()
-
     employee.avatar_url = None
     db.commit()
     db.refresh(employee)
+    # After the commit: the row is what the UI reads, so clearing it is the part
+    # that must succeed. A Slack URL or a legacy /uploads/ one is not ours to
+    # delete and is skipped.
+    delete_from_bucket(AVATAR_BUCKET, old_url)
     return employee

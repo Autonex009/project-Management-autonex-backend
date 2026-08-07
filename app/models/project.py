@@ -66,6 +66,14 @@ class DailySheet(Base):
     workforce_vendors = Column(JSON, nullable=True, default=list)   # list of vendor names
     autonex_annotators = Column(Integer, default=0)
     autonex_reviewers = Column(Integer, default=0)
+    # Development projects staff engineers rather than annotators/reviewers.
+    developers_count = Column(Integer, default=0)
+    # The rest of the requirement. Leads and managers are typed here rather than
+    # counted from allocations: the requirement is what the project ASKS for, which
+    # exists before anyone is assigned.
+    team_lead_count = Column(Integer, default=0)
+    team_manager_count = Column(Integer, default=0)
+    others_count = Column(Integer, default=0)
     workforce_reviewers = Column(Integer, default=0)
     qc_count = Column(Integer, default=0)
 

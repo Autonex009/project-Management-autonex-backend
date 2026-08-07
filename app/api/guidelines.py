@@ -135,12 +135,10 @@ async def upload_guideline(
 
     stored_name = f"{uuid4().hex}{Path(original_name).suffix}"
     try:
-        file_url, destination = upload_guideline_file(
+        file_url = upload_guideline_file(
             file_bytes=file_bytes,
             stored_name=stored_name,
             content_type=file.content_type or "application/octet-stream",
-            base_url=str(request.base_url),
-            upload_dir=UPLOAD_DIR,
         )
     except RuntimeError as err:
         raise HTTPException(status_code=500, detail=str(err)) from err
@@ -179,8 +177,8 @@ async def upload_guideline(
         return guideline
     except SQLAlchemyError as exc:
         db.rollback()
-        if destination and destination.exists():
-            destination.unlink()
+        # The object is already in the bucket, so remove it — otherwise a failed insert
+        # leaves an orphan no row will ever reference or clean up.
         delete_guideline_file(file_url=file_url, upload_dir=UPLOAD_DIR)
         raise HTTPException(status_code=500, detail=f"Failed to save guideline upload: {exc.__class__.__name__}") from exc
 

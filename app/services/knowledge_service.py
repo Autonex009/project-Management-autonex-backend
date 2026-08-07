@@ -12,13 +12,13 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from google import genai
+import openai
 
 logger = logging.getLogger(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────
 KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
-EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_MODEL = "deepseek-embedding"  # Or use another model if deepseek releases one or it is different
 CHUNK_SIZE = 500  # characters per chunk
 CHUNK_OVERLAP = 100
 TOP_K = 5
@@ -28,12 +28,16 @@ _chunks: list[dict] = []  # [{text, source, section, embedding}]
 _initialized = False
 
 
-def _get_client() -> genai.Client:
-    """Lazily create a Gemini client."""
-    api_key = os.getenv("GEMINI_API_KEY")
+def _get_client() -> openai.Client:
+    """Lazily create the embedding client.
+
+    Configured to use the DeepSeek API key via the OpenAI client, since DeepSeek
+    speaks the OpenAI wire format.
+    """
+    api_key = os.getenv("EMBEDDING_API_KEY")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set in environment")
-    return genai.Client(api_key=api_key)
+        raise RuntimeError("EMBEDDING_API_KEY not set in environment")
+    return openai.Client(api_key=api_key, base_url="https://api.deepseek.com")
 
 
 def _split_into_chunks(text: str, source: str) -> list[dict]:
@@ -149,12 +153,12 @@ def initialize_knowledge_base():
 
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
-            result = client.models.embed_content(
+            result = client.embeddings.create(
                 model=EMBEDDING_MODEL,
-                contents=batch,
+                input=batch,
             )
-            for embedding in result.embeddings:
-                all_embeddings.append(np.array(embedding.values, dtype=np.float32))
+            for item in result.data:
+                all_embeddings.append(np.array(item.embedding, dtype=np.float32))
 
         for chunk, embedding in zip(all_chunks, all_embeddings):
             chunk["embedding"] = embedding
@@ -190,11 +194,11 @@ def search_policy(query: str, top_k: int = TOP_K) -> list[dict]:
     if has_embeddings:
         try:
             client = _get_client()
-            query_result = client.models.embed_content(
+            query_result = client.embeddings.create(
                 model=EMBEDDING_MODEL,
-                contents=[query],
+                input=[query],
             )
-            query_embedding = np.array(query_result.embeddings[0].values, dtype=np.float32)
+            query_embedding = np.array(query_result.data[0].embedding, dtype=np.float32)
 
             for chunk in _chunks:
                 # Hybrid score: 70% embedding similarity + 30% keyword
