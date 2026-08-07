@@ -41,20 +41,38 @@ def normalize_project_payload(data: dict, db: Session | None = None) -> dict:
 
 
 def _autonex_headcount(source) -> int:
-    """required_manpower = Autonex Annotators + Autonex Reviewers.
+    """Every role the project asks for, summed into ``required_manpower``.
 
-    QC is no longer part of a project's team composition and is excluded. The column
-    remains so historical rows keep their value, but nothing adds to it.
+    Annotators + reviewers + others + team leads + team managers + developers.
 
-    The project's managers and team leads are deliberately *not* counted here: they are
-    added when the ratio is displayed (``totalRequiredManpower`` on the frontend), because
-    resolving them needs the allocations and the organisation fallback.
+    Team leads and managers ARE counted here — the client derives those two from the
+    people picked in the Team Lead and Program Manager fields rather than accepting a
+    typed number, so the headcount cannot contradict the roster on the same screen. That
+    also means the displayed ratio uses this figure as-is and must not add them again.
+
+    QC is excluded: it is no longer part of a project's composition. The column remains so
+    historical rows keep their value, but nothing adds to it.
+
+    "Total Annotators" is deliberately absent — it counts the vendor's people as well as
+    ours, so it is informational rather than a headcount we staff.
     """
     def g(name):
         if isinstance(source, dict):
             return source.get(name) or 0
         return getattr(source, name, 0) or 0
-    return int(g("autonex_annotators")) + int(g("autonex_reviewers"))
+    return sum(
+        int(g(field))
+        for field in (
+            "autonex_annotators",
+            "autonex_reviewers",
+            "others_count",
+            "team_lead_count",
+            "team_manager_count",
+            # Development projects staff engineers, so they ARE the team: a project
+            # asking for 3 of them must read 0/3, not 0/0. Zero everywhere else.
+            "developers_count",
+        )
+    )
 
 router = APIRouter(
     prefix="/api/sub-projects",

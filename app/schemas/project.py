@@ -115,6 +115,10 @@ class ProjectBase(BaseModel):
     autonex_reviewers: Optional[int] = 0
     workforce_reviewers: Optional[int] = 0
     qc_count: Optional[int] = 0
+    developers_count: Optional[int] = 0   # development projects staff engineers
+    team_lead_count: Optional[int] = 0
+    team_manager_count: Optional[int] = 0
+    others_count: Optional[int] = 0
 
 
 class ProjectCreate(ProjectBase):
@@ -163,6 +167,10 @@ class ProjectUpdate(BaseModel):
     autonex_reviewers: Optional[int] = None
     workforce_reviewers: Optional[int] = None
     qc_count: Optional[int] = None
+    developers_count: Optional[int] = None
+    team_lead_count: Optional[int] = None
+    team_manager_count: Optional[int] = None
+    others_count: Optional[int] = None
 
 
 class ProjectResponse(ProjectBase):

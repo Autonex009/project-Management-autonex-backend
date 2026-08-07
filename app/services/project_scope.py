@@ -97,12 +97,26 @@ def _main_project_pm_ids(main_project: Optional[MainProject]) -> set[int]:
     return _as_int_set([getattr(main_project, "program_manager_id", None)])
 
 
-def project_pm_ids(db: Session, project: Optional[DailySheet]) -> set[int]:
-    """The ``employees.id`` set that manages ``project``.
+def _normalise(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
 
-    Project-level assignment wins; an organisation's PMs apply only to projects that
-    name no PM of their own. That ordering is what lets several PMs share one client
-    while each owning distinct projects under it.
+
+def _designations(db: Session, ids: set[int]) -> dict[int, str]:
+    """employee id -> normalised designation, in one query."""
+    if not ids:
+        return {}
+    return {
+        employee.id: _normalise(employee.designation)
+        for employee in db.query(Employee).filter(Employee.id.in_(ids)).all()
+    }
+
+
+def _assigned_manager_ids(db: Session, project: Optional[DailySheet]) -> set[int]:
+    """Whoever occupies ``project``'s manager slot, before designation is considered.
+
+    Project-level assignment wins; an organisation's PMs apply only to projects that name
+    no PM of their own. That ordering is what lets several PMs share one client while each
+    owns distinct projects under it.
     """
     if project is None:
         return set()
@@ -116,8 +130,32 @@ def project_pm_ids(db: Session, project: Optional[DailySheet]) -> set[int]:
     return _main_project_pm_ids(main_project)
 
 
-def _normalise(value: Optional[str]) -> str:
-    return (value or "").strip().lower()
+def _demoted_to_lead(db: Session, project: Optional[DailySheet]) -> set[int]:
+    """Manager-slot occupants whose designation now says Team Lead.
+
+    People converted from Program Manager to Team Lead keep their seat in
+    ``assigned_employee_ids`` until someone edits the project, so the stored data still
+    calls them managers. Designation is the newer, deliberate statement of rank, so it
+    wins: they are shown and treated as this project's lead without waiting for a manual
+    cleanup pass over every project.
+    """
+    ids = _assigned_manager_ids(db, project)
+    designations = _designations(db, ids)
+    return {i for i in ids if designations.get(i) in TEAM_LEAD_TAGS}
+
+
+def project_pm_ids(db: Session, project: Optional[DailySheet]) -> set[int]:
+    """The ``employees.id`` set that manages ``project``.
+
+    Excludes anyone the roster now designates a Team Lead — see :func:`_demoted_to_lead`.
+    A project whose entire manager slot has been converted therefore resolves to no PM,
+    which is accurate: it has leads and no manager, and a lead's own request there
+    escalates to an admin.
+    """
+    ids = _assigned_manager_ids(db, project)
+    if not ids:
+        return set()
+    return ids - _demoted_to_lead(db, project)
 
 
 def project_lead_ids(db: Session, project: Optional[DailySheet]) -> set[int]:
@@ -128,8 +166,10 @@ def project_lead_ids(db: Session, project: Optional[DailySheet]) -> set[int]:
     by the tag or by the designation covers both what the picker writes and allocations made
     outside it.
 
-    Never ``assigned_employee_ids``: that column is the PM set, and a lead placed there
-    would also inherit decisions over the project's other leads.
+    Also includes anyone sitting in the manager slot whose designation now says Team Lead,
+    so a conversion takes effect immediately instead of waiting for the project to be
+    edited. Nothing is *written* to ``assigned_employee_ids`` here — that column stays the
+    manager slot, and a lead placed there deliberately would still be read as a lead.
     """
     if project is None:
         return set()
@@ -138,13 +178,12 @@ def project_lead_ids(db: Session, project: Optional[DailySheet]) -> set[int]:
         .filter(Allocation.sub_project_id == project.id)
         .all()
     )
+    # No allocations does not mean no leads: a converted manager still occupies the manager
+    # slot without necessarily holding an allocation row.
     if not rows:
-        return set()
+        return _demoted_to_lead(db, project)
     employee_ids = {row[0] for row in rows if row[0] is not None}
-    designations = {
-        employee.id: _normalise(employee.designation)
-        for employee in db.query(Employee).filter(Employee.id.in_(employee_ids)).all()
-    }
+    designations = _designations(db, employee_ids)
     leads: set[int] = set()
     for employee_id, role_tags in rows:
         if employee_id is None:
@@ -154,7 +193,7 @@ def project_lead_ids(db: Session, project: Optional[DailySheet]) -> set[int]:
         )
         if tagged or designations.get(employee_id) in TEAM_LEAD_TAGS:
             leads.add(int(employee_id))
-    return leads
+    return leads | _demoted_to_lead(db, project)
 
 
 def project_actor_ids(db: Session, project: Optional[DailySheet]) -> set[int]:
