@@ -102,7 +102,10 @@ def _get_pm_associated_sub_project_ids(db: Session, current_user: User) -> Optio
 
 
 def is_autonex_email(email: str | None) -> bool:
-    return bool(email) and email.lower().endswith(AUTONEX_EMAIL_SUFFIX)
+    # Stripped before the suffix test: a padded user_email would otherwise fail it
+    # and drop the row out of the Autonex cohort entirely — not just mislabelled,
+    # but missing from the leaderboard, the Autonex tab and the team averages.
+    return bool(email) and email.strip().lower().endswith(AUTONEX_EMAIL_SUFFIX)
 
 
 # Annotator / reviewer HEAD-COUNTS are classified by the Encord workflow stage the
@@ -160,9 +163,54 @@ def _month_start(d: date) -> date:
     return d.replace(day=1)
 
 
+# Whitespace an Encord id can pick up from a spreadsheet cell or a paste. Removed
+# wholesale rather than trimmed at the edges: SQL ``trim`` strips spaces ONLY (in
+# Postgres *and* SQLite), so a trailing \r\n from a copied cell survives it, and an
+# id is an email address — it can never legitimately contain any of these anyway.
+_ENCORD_WHITESPACE = (" ", "\t", "\n", "\r", "\v", "\f", " ")
+
+
+def _norm_encord(value: Optional[str]) -> str:
+    """Canonical form of an Encord account id, for comparing ours against theirs.
+
+    A chunk of `employees.encord_id` was imported from a spreadsheet and carries
+    stray whitespace (see the ``trim`` in api\\employees.py's search). An exact
+    `encord_id == user_email` match silently misses those rows, and every caller
+    here degrades the same way — it falls back to printing the raw Encord email,
+    so a correctly-linked employee looks unlinked in the charts.
+    """
+    normalized = value or ""
+    for ch in _ENCORD_WHITESPACE:
+        normalized = normalized.replace(ch, "")
+    return normalized.lower()
+
+
+def _sql_norm_encord(column):
+    """`_norm_encord` expressed in SQL, so the two sides agree exactly.
+
+    Nested ``replace`` + ``lower``: the only whitespace-stripping shape portable to
+    both Postgres and the SQLite fallback engine (regexp_replace exists in neither
+    pair, and two-arg trim has no common signature). The characters ride along as
+    bound parameters, so no dialect-specific char()/chr() either.
+    """
+    expr = column
+    for ch in _ENCORD_WHITESPACE:
+        expr = func.replace(expr, ch, "")
+    return func.lower(expr)
+
+
+def _encord_id_matches(emails):
+    """SQL predicate: employees.encord_id equals any of `emails`, ignoring whitespace and case."""
+    return _sql_norm_encord(Employee.encord_id).in_(
+        sorted({_norm_encord(e) for e in emails if e})
+    )
+
+
 def _names_for(db: Session, emails) -> dict:
     """Map Encord account emails -> employee display name via employees.encord_id.
 
+    Keyed by the email as the caller passed it (i.e. as stored in
+    `encord_daily_time_spent`), so callers can look up with their own value.
     Falls back to the email itself for any Encord user not linked to an employee.
     """
     emails = {e for e in emails if e}
@@ -170,10 +218,15 @@ def _names_for(db: Session, emails) -> dict:
         return {}
     rows = (
         db.query(Employee.encord_id, Employee.name)
-        .filter(Employee.encord_id.in_(emails))
+        .filter(_encord_id_matches(emails))
         .all()
     )
-    return {encord_id: name for encord_id, name in rows if encord_id}
+    name_by_norm = {_norm_encord(enc): name for enc, name in rows if enc and name}
+    return {
+        email: name_by_norm[_norm_encord(email)]
+        for email in emails
+        if _norm_encord(email) in name_by_norm
+    }
 
 
 def _rows_for(db: Session, sp: DailySheet, start: date, end: date):
@@ -730,7 +783,7 @@ def my_encord_activity(
     for r in rows:
         d = r.metric_date
         secs = int(r.time_spent_seconds or 0)
-        if r.user_email == encord_id:
+        if _norm_encord(r.user_email) == _norm_encord(encord_id):
             mine_by_day[d] += secs
         # Team average is over Autonex teammates (billing cohort), including self.
         if is_autonex_email(r.user_email):
@@ -819,17 +872,20 @@ def get_leaderboard(
     name_by_email = _names_for(db, user_seconds.keys())
 
     emails = [e for e in user_seconds.keys() if e]
+    # Normalized on both sides, like _names_for — otherwise a whitespace-padded
+    # encord_id costs the row its avatar and designation as well as its name.
     emp_rows = db.query(Employee.encord_id, Employee.email, Employee.designation, Employee.id, Employee.avatar_url).filter(
-        (Employee.encord_id.in_(emails)) | (Employee.email.in_(emails))
+        _encord_id_matches(emails)
+        | _sql_norm_encord(Employee.email).in_(sorted({_norm_encord(e) for e in emails}))
     ).all() if emails else []
 
     emp_map = {}
     for enc_id, email, desig, emp_id, avatar in emp_rows:
         info = (desig, emp_id, avatar)
         if enc_id:
-            emp_map[enc_id] = info
+            emp_map[_norm_encord(enc_id)] = info
         if email:
-            emp_map[email] = info
+            emp_map.setdefault(_norm_encord(email), info)
 
     leaderboard = []
     sorted_users = sorted(user_seconds.items(), key=lambda kv: kv[1], reverse=True)
@@ -837,7 +893,7 @@ def get_leaderboard(
         hrs = _hours(secs)
         ann_hrs = _hours(annotation_seconds[u])
         rev_hrs = _hours(review_seconds[u])
-        desig, emp_id, avatar_url = emp_map.get(u, (None, None, None))
+        desig, emp_id, avatar_url = emp_map.get(_norm_encord(u), (None, None, None))
         pct = round((secs / total_team_seconds) * 100, 1) if total_team_seconds else 0.0
         leaderboard.append({
             "rank": rank,

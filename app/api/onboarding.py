@@ -1230,7 +1230,10 @@ def get_mentees(
             "department": employee.designation if employee else "Annotator",
             "isActive": m.is_active,
             "completedModulesCount": completed_modules_count,
-            "quizScorePercent": score
+            "quizScorePercent": score,
+            # Profile picture for the mentorship table; the employee row is already
+            # loaded above, so this costs no extra query.
+            "avatarUrl": employee.avatar_url if employee else None,
         })
 
     return results

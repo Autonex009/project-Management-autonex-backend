@@ -3,8 +3,8 @@ import logging
 from datetime import date, timedelta
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from app.services.auth_service import get_current_user, require_role
-from app.services import audit_service
+from app.services.auth_service import get_current_user, has_team_read, require_role
+from app.services import audit_service, project_scope
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field, validator
 
@@ -22,7 +22,7 @@ router = APIRouter(prefix="/api/wfh", tags=["wfh"], dependencies=[Depends(get_cu
 
 
 def check_wfh_access(wfh_employee_id: int, current_user: User, db: Session):
-    if current_user.role not in ["admin", "pm", "hr"]:
+    if not has_team_read(current_user):
         is_self = current_user.employee_id == wfh_employee_id
         if not is_self:
             emp = db.query(Employee).filter(Employee.id == wfh_employee_id).first()
@@ -53,6 +53,10 @@ class WFHResponse(BaseModel):
     reason: Optional[str] = None
     status: str
     approved_by: Optional[int] = None
+    # Display name for ``approved_by``, resolved server-side. Any manager or lead of a
+    # project the employee is on may decide, so who did it is not inferable from the
+    # employee — and ``approved_by`` is a users.id the client cannot resolve.
+    approved_by_name: Optional[str] = None
     remark: Optional[str] = None
     employee_name: Optional[str] = None
     created_at: Optional[str] = None
@@ -130,8 +134,26 @@ def _validate_wfh_limit(db: Session, employee: Employee, start_date: date, end_d
     return False
 
 
+def _approver_names(db: Session, requests) -> dict:
+    """Map ``approved_by`` -> approver name for a batch of requests.
+
+    ``approved_by`` holds a **users.id**, not an employees.id, so it resolves against the
+    User table. Batched into one query because this feeds a full table of rows.
+    """
+    ids = {req.approved_by for req in requests if req.approved_by}
+    if not ids:
+        return {}
+    rows = db.query(User.id, User.name).filter(User.id.in_(ids)).all()
+    return {row[0]: row[1] for row in rows}
+
+
 def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
     employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    approver = (
+        db.query(User.name).filter(User.id == req.approved_by).scalar()
+        if req.approved_by
+        else None
+    )
     return WFHResponse(
         id=req.id,
         employee_id=req.employee_id,
@@ -140,6 +162,7 @@ def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
         reason=req.reason,
         status=req.status,
         approved_by=req.approved_by,
+        approved_by_name=approver,
         remark=req.remark,
         employee_name=employee.name if employee else None,
         created_at=req.created_at.isoformat() if req.created_at else None,
@@ -157,7 +180,7 @@ def get_wfh_requests(
     current_user: User = Depends(get_current_user)
 ):
     """Get WFH requests. Filter by employee_id and/or month (YYYY-MM)."""
-    if current_user.role not in ["admin", "pm", "hr"]:
+    if not has_team_read(current_user):
         if employee_id is None:
             employee_id = current_user.employee_id
             if employee_id is None:
@@ -189,6 +212,9 @@ def get_wfh_requests(
     requests = q.order_by(WFHRequest.wfh_date.desc()).all()
     emp_ids = list({r.employee_id for r in requests})
     employees = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
+    # Batched rather than per-row: this builds a whole table, and _build_response's
+    # single lookup would become one query per request.
+    approver_names = _approver_names(db, requests)
     result = []
     for req in requests:
         emp = employees.get(req.employee_id)
@@ -200,6 +226,7 @@ def get_wfh_requests(
             reason=req.reason,
             status=req.status,
             approved_by=req.approved_by,
+            approved_by_name=approver_names.get(req.approved_by),
             remark=req.remark,
             employee_name=emp.name if emp else None,
             created_at=req.created_at.isoformat() if req.created_at else None,
@@ -304,9 +331,17 @@ def create_wfh_request(
 
     # WFH PM & Admin Notification Routing:
     dummy_leave = SimpleNamespace(start_date=req.wfh_date, end_date=end_date)
-    is_pm_applicant = emp_user is not None and emp_user.role == "pm"
-    pm_targets = [] if is_pm_applicant else _get_pm_notification_targets(db, employee, dummy_leave)
-    
+    # Tiers as on the leave path (see services/project_scope.py): a manager's own request
+    # goes to Admin alone, a team lead's goes to their PM *and* Admin, everyone else's goes
+    # to the PM(s) and lead(s) of their projects with Admin as the fallback.
+    escalates_to_admin = project_scope.escalates_to_admin(db, employee.id)
+    escalates_to_pm = project_scope.escalates_to_pm(db, employee.id)
+    pm_targets = (
+        [] if escalates_to_admin
+        else _get_pm_notification_targets(db, employee, dummy_leave)
+    )
+    notify_admins = escalates_to_admin or escalates_to_pm or not pm_targets
+
     notified_user_ids: set[int] = set()
     for target in pm_targets:
         # In-app notification for PM
@@ -322,8 +357,9 @@ def create_wfh_request(
                     "wfh_applied",
                 )
 
-    # Admin fallback: notify each admin exactly once if no PM is assigned
-    if not pm_targets:
+    # Admins: as a fallback when nobody else resolved, and additionally for a team lead's
+    # own request, which is theirs to countersign alongside the program manager.
+    if notify_admins:
         for admin_user in db.query(User).filter(User.role == "admin", User.is_active == True).all():
             if admin_user.id not in notified_user_ids:
                 notified_user_ids.add(admin_user.id)
@@ -351,6 +387,12 @@ def approve_wfh(
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
+
+    # Authorise before validating, so a caller outside this employee's projects gets a
+    # 403 rather than a hint that supplying a remark would have worked.
+    project_scope.require_employee_scope(
+        db, current_user, req.employee_id, action="approve WFH"
+    )
 
     if getattr(req, "flagged", False) and not (body.remark and body.remark.strip()):
         raise HTTPException(
@@ -414,6 +456,10 @@ def reject_wfh(
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
 
+    project_scope.require_employee_scope(
+        db, current_user, req.employee_id, action="reject WFH"
+    )
+
     approver_name = current_user.name or "Admin"
     employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
 
@@ -467,6 +513,11 @@ def undo_reject_wfh(
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
+
+    project_scope.require_employee_scope(
+        db, current_user, req.employee_id, action="reopen a rejected WFH request"
+    )
+
     if req.status != "rejected":
         raise HTTPException(status_code=400, detail=f"WFH request is not rejected (status: {req.status})")
 
@@ -537,6 +588,11 @@ def undo_approve_wfh(
     req = db.query(WFHRequest).filter(WFHRequest.id == wfh_id).first()
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
+
+    project_scope.require_employee_scope(
+        db, current_user, req.employee_id, action="revoke a WFH approval"
+    )
+
     if req.status != "approved":
         raise HTTPException(status_code=400, detail=f"WFH request is not approved (status: {req.status})")
 
