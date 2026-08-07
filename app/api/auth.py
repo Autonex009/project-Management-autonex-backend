@@ -81,6 +81,11 @@ DESIGNATION_ACCESS = {
     "Admin": "admin",
     "HR": "hr",   # combined Admin + PM access (see require_role)
     "Program Manager": "pm",
+    # Team leads live in the PM portal and see everything a PM sees; they simply
+    # cannot approve/edit. Kept in step with DESIGNATION_ROLE_MAP in api/employees.py
+    # — this map decides the token role, that one decides the stored users.role, and
+    # a team lead missing from either lands in the employee portal instead.
+    "Team Lead": "team_lead",
     "Annotator/ Reviewer": "employee",
     "Annotator/Reviewer": "employee",
     "Annotator": "employee",
@@ -222,13 +227,21 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     # Auto-link PM/employee users to an Employee record if not yet linked
     if user.employee_id is None:
         employee = db.query(Employee).filter(Employee.email == user.email).first()
-        if employee is None and user.role in ("pm", "employee"):
-            # Create a fresh Employee record for this user
+        if employee is None and user.role in ("pm", "team_lead", "employee"):
+            # Create a fresh Employee record for this user. The designation has to
+            # match the role we already trust, or the next employee update would read
+            # the designation back and silently rewrite the role (see
+            # api/employees.py — a team lead defaulted to "Program Manager" here would
+            # be promoted to a real PM by an unrelated profile edit).
+            _designation_for_role = {
+                "pm": "Program Manager",
+                "team_lead": "Team Lead",
+            }
             employee = Employee(
                 name=user.name,
                 email=user.email,
                 employee_type="Full-time",
-                designation="Program Manager" if user.role == "pm" else "Annotator/ Reviewer",
+                designation=_designation_for_role.get(user.role, "Annotator/ Reviewer"),
                 status="active",
             )
             db.add(employee)
@@ -242,10 +255,13 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
 
     response_user = build_user_response(user, db)
     # HR uses the Admin login page but carries its own combined role.
+    # Team leads use the PM login page: same portal, same layout, view-only once
+    # inside. Without this they would be turned away as a "wrong portal" account.
     portal_ok = (
         not body.portal
         or response_user.role == body.portal
         or (response_user.role == "hr" and body.portal == "admin")
+        or (response_user.role == "team_lead" and body.portal == "pm")
     )
     if not portal_ok:
         logger.warning(

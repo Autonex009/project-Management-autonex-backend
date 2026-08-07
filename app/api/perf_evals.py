@@ -14,7 +14,8 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from app.services.auth_service import get_current_user, require_role
+from app.services.auth_service import get_current_user, has_team_read, require_role
+from app.services import project_scope
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 from app.models.user import User
@@ -211,7 +212,7 @@ def list_evals(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    if current_user.role not in ["admin", "pm", "hr"]:
+    if not has_team_read(current_user):
         if employee_id is None:
             employee_id = current_user.employee_id
             if employee_id is None:
@@ -244,6 +245,9 @@ def create_eval(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    # Deliberately NOT has_team_read: submitting an evaluation *for* someone else is a
+    # manager's action. A team lead falls through to the self-check below, so it can still
+    # file its own self-evaluation and nobody else's.
     if current_user.role not in ["admin", "pm", "hr"]:
         is_self = current_user.employee_id == payload.employee_id
         if not is_self:
@@ -303,6 +307,10 @@ def review_eval(
     if not ev:
         raise HTTPException(status_code=404, detail="Evaluation not found")
 
+    project_scope.require_employee_scope(
+        db, current_user, ev.employee_id, action="review an evaluation"
+    )
+
     # Merge the PM's review into the existing (employee-supplied) parameter rows.
     review_by_name = {p.name: p for p in payload.parameter_values}
     merged = []
@@ -343,6 +351,11 @@ def delete_eval(
     ev = db.query(PerfEvaluation).filter(PerfEvaluation.id == eval_id).first()
     if not ev:
         raise HTTPException(status_code=404, detail="Evaluation not found")
+
+    project_scope.require_employee_scope(
+        db, current_user, ev.employee_id, action="delete an evaluation"
+    )
+
     db.delete(ev)
     db.commit()
     return {"message": "Evaluation deleted successfully"}
