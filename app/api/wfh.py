@@ -53,6 +53,10 @@ class WFHResponse(BaseModel):
     reason: Optional[str] = None
     status: str
     approved_by: Optional[int] = None
+    # Display name for ``approved_by``, resolved server-side. Any manager or lead of a
+    # project the employee is on may decide, so who did it is not inferable from the
+    # employee — and ``approved_by`` is a users.id the client cannot resolve.
+    approved_by_name: Optional[str] = None
     remark: Optional[str] = None
     employee_name: Optional[str] = None
     created_at: Optional[str] = None
@@ -130,8 +134,26 @@ def _validate_wfh_limit(db: Session, employee: Employee, start_date: date, end_d
     return False
 
 
+def _approver_names(db: Session, requests) -> dict:
+    """Map ``approved_by`` -> approver name for a batch of requests.
+
+    ``approved_by`` holds a **users.id**, not an employees.id, so it resolves against the
+    User table. Batched into one query because this feeds a full table of rows.
+    """
+    ids = {req.approved_by for req in requests if req.approved_by}
+    if not ids:
+        return {}
+    rows = db.query(User.id, User.name).filter(User.id.in_(ids)).all()
+    return {row[0]: row[1] for row in rows}
+
+
 def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
     employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
+    approver = (
+        db.query(User.name).filter(User.id == req.approved_by).scalar()
+        if req.approved_by
+        else None
+    )
     return WFHResponse(
         id=req.id,
         employee_id=req.employee_id,
@@ -140,6 +162,7 @@ def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
         reason=req.reason,
         status=req.status,
         approved_by=req.approved_by,
+        approved_by_name=approver,
         remark=req.remark,
         employee_name=employee.name if employee else None,
         created_at=req.created_at.isoformat() if req.created_at else None,
@@ -189,6 +212,9 @@ def get_wfh_requests(
     requests = q.order_by(WFHRequest.wfh_date.desc()).all()
     emp_ids = list({r.employee_id for r in requests})
     employees = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
+    # Batched rather than per-row: this builds a whole table, and _build_response's
+    # single lookup would become one query per request.
+    approver_names = _approver_names(db, requests)
     result = []
     for req in requests:
         emp = employees.get(req.employee_id)
@@ -200,6 +226,7 @@ def get_wfh_requests(
             reason=req.reason,
             status=req.status,
             approved_by=req.approved_by,
+            approved_by_name=approver_names.get(req.approved_by),
             remark=req.remark,
             employee_name=emp.name if emp else None,
             created_at=req.created_at.isoformat() if req.created_at else None,
