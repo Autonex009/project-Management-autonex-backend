@@ -182,9 +182,31 @@ def create_project(
     project = Project(**data)
     db.add(project)
     db.flush()
-
     # Put the assigned leaders on the project straight away.
     _allocate_project_leaders(db, project, current_user)
+
+    # A team lead who creates a project owns it from the ground up, so they are
+    # allocated to it automatically. They are deliberately NOT added to the project's
+    # assigned_employee_ids because that grants PM-level access across the project;
+    # they receive an allocation with the Team Lead tag instead.
+    if current_user.role == "team_lead" and current_user.employee_id:
+        db.add(
+            Allocation(
+                employee_id=current_user.employee_id,
+                sub_project_id=project.id,
+                total_daily_hours=8,
+                role_tags=[TEAM_LEAD_ROLE_TAG],
+                time_distribution={},
+                active_start_date=project.start_date,
+                active_end_date=project.end_date,
+                override_flag=True,
+                override_reason="Auto-sync from project creator",
+            )
+        )
+        db.flush()
+        project.allocated_employees = (
+            db.query(Allocation).filter(Allocation.sub_project_id == project.id).count()
+        )
 
     audit_service.record(
         db,
