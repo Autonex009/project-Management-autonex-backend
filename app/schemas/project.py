@@ -177,6 +177,8 @@ class ProjectResponse(ProjectBase):
     id: int
     required_manpower: int = 0
     allocated_employees: int = 0
+    allocated_pm_count: int = 0
+    allocated_lead_count: int = 0
     project_status: str = "active"
 
     created_at: datetime
