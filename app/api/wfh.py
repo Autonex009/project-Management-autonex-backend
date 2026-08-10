@@ -210,6 +210,15 @@ def get_wfh_requests(
         except Exception:
             pass
     requests = q.order_by(WFHRequest.wfh_date.desc()).all()
+    
+    # Filter by read privacy
+    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
+        manageable_cache = {current_user.employee_id: True}
+        for req in requests:
+            if req.employee_id not in manageable_cache:
+                manageable_cache[req.employee_id] = project_scope.can_manage_employee(db, current_user, req.employee_id)
+        requests = [req for req in requests if manageable_cache.get(req.employee_id, False)]
+
     emp_ids = list({r.employee_id for r in requests})
     employees = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
     # Batched rather than per-row: this builds a whole table, and _build_response's

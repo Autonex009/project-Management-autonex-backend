@@ -432,6 +432,15 @@ def get_all_leaves(
         query = query.filter(Leave.start_date <= end_date)
 
     leaves = query.order_by(Leave.id.desc()).all()
+    
+    # Filter by read privacy
+    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
+        manageable_cache = {current_user.employee_id: True}
+        for lv in leaves:
+            if lv.employee_id not in manageable_cache:
+                manageable_cache[lv.employee_id] = project_scope.can_manage_employee(db, current_user, lv.employee_id)
+        leaves = [lv for lv in leaves if manageable_cache.get(lv.employee_id, False)]
+
     approver_names = _approver_names(db, leaves)
     return [
         LeaveSchema(

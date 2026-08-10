@@ -1,7 +1,13 @@
 """
-Chat agent — single-agent with tool-calling powered by Gemini 2.5 Flash.
+Chat agent — single agent with tool-calling, powered by DeepSeek.
 
 Handles multi-turn conversation, streaming SSE responses, and tool execution.
+
+DeepSeek serves an OpenAI-compatible API, so this uses the ``openai`` SDK pointed at
+their base URL rather than a DeepSeek-specific client. Note that the *embeddings* behind
+``search_policy`` still run on Gemini (see ``knowledge_service``) — DeepSeek exposes no
+embeddings endpoint, so the two halves of the assistant use different providers and
+different keys on purpose.
 """
 import json
 import logging
@@ -10,8 +16,7 @@ import uuid
 from datetime import date, datetime
 from typing import AsyncGenerator, Optional
 
-from google import genai
-from google.genai import types
+from openai import OpenAI
 from sqlalchemy.orm import Session
 
 from app.models.chat import ChatConversation, ChatMessage
@@ -20,15 +25,18 @@ from app.services import chat_tools
 
 logger = logging.getLogger(__name__)
 
-# ── Gemini Client ───────────────────────────────────────────────────
-MODEL = "gemini-2.5-flash"
+# ── Chatbot client ──────────────────────────────────────────────────
+# The key is named for what it powers rather than for the provider, so changing the model
+# behind the assistant does not mean renaming a variable across every deployment.
+MODEL = "deepseek-chat"
+BASE_URL = "https://api.deepseek.com"
 
 
-def _get_client() -> genai.Client:
-    api_key = os.getenv("GEMINI_API_KEY")
+def _get_client() -> OpenAI:
+    api_key = os.getenv("CHATBOT_API_KEY")
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set")
-    return genai.Client(api_key=api_key)
+        raise RuntimeError("CHATBOT_API_KEY not set")
+    return OpenAI(api_key=api_key, base_url=BASE_URL)
 
 
 # ── System Prompt ───────────────────────────────────────────────────
@@ -108,119 +116,96 @@ Your response (after calling search_policy):
 """
 
 
-# ── Tool Definitions for Gemini ─────────────────────────────────────
-TOOL_DEFINITIONS = types.Tool(
-    function_declarations=[
-        types.FunctionDeclaration(
-            name="get_leave_balance",
-            description="Get the current leave balance for the user, showing quota, used, and remaining for each leave type (paid, casual/sick, floater).",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={},
-                required=[],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="get_my_leaves",
-            description="Get the user's recent leave requests with their statuses (approved, pending, rejected), dates, and types.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={},
-                required=[],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="get_wfh_usage",
-            description="Get the user's work-from-home usage: how many WFH days used this week, this month, and upcoming WFH requests.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={},
-                required=[],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="get_my_projects",
-            description="Get the user's active project allocations, including project names, roles, daily hours, and project managers.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={},
-                required=[],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="get_holidays",
-            description="Get the list of fixed public holidays and approved floater dates for a given year.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "year": types.Schema(type="INTEGER", description="The year to get holidays for. Defaults to current year."),
-                },
-                required=[],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="plan_leave",
-            description="Suggest optimal leave dates to maximize time off. Considers holidays, weekends, and leave balance. Use when the user wants to plan vacation or time off.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "days_wanted": types.Schema(type="INTEGER", description="Number of days off the user wants."),
-                    "preferred_month": types.Schema(type="INTEGER", description="Preferred month (1-12). If not specified, defaults to next month."),
-                },
-                required=["days_wanted"],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="search_policy",
-            description="Search company policy documents for information about leave rules, WFH policy, Slack etiquette, office info, general policies, do's and don'ts.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "query": types.Schema(type="STRING", description="The policy question or topic to search for."),
-                },
-                required=["query"],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="apply_leave",
-            description="Prepare a leave application for the user. This does NOT submit it immediately — it returns a confirmation for the user to approve. Use when the user explicitly asks to apply for leave.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "leave_type": types.Schema(type="STRING", description="Type of leave: 'paid', 'casual_sick', or 'floater'."),
-                    "start_date": types.Schema(type="STRING", description="Start date in YYYY-MM-DD format."),
-                    "end_date": types.Schema(type="STRING", description="End date in YYYY-MM-DD format."),
-                    "reason": types.Schema(type="STRING", description="Reason for the leave."),
-                },
-                required=["leave_type", "start_date", "end_date", "reason"],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="apply_wfh",
-            description="Prepare a Work From Home request for the user. This does NOT submit it immediately — it returns a confirmation for the user to approve.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "wfh_date": types.Schema(type="STRING", description="WFH start date in YYYY-MM-DD format."),
-                    "end_date": types.Schema(type="STRING", description="WFH end date in YYYY-MM-DD format. Same as wfh_date for single day."),
-                    "reason": types.Schema(type="STRING", description="Reason for WFH request."),
-                },
-                required=["wfh_date", "reason"],
-            ),
-        ),
-        types.FunctionDeclaration(
-            name="cancel_leave",
-            description="Prepare a leave cancellation for the user. The user must confirm before the leave is actually cancelled. Only future leaves can be cancelled.",
-            parameters=types.Schema(
-                type="OBJECT",
-                properties={
-                    "leave_id": types.Schema(type="INTEGER", description="The ID of the leave request to cancel."),
-                },
-                required=["leave_id"],
-            ),
-        ),
-    ]
-)
+# ── Tool definitions ────────────────────────────────────────────────
+# Plain JSON Schema in OpenAI's `tools` shape, which DeepSeek accepts unchanged. Argument
+# names must keep matching the keys _execute_tool reads below — anything else is dropped
+# silently rather than erroring.
+def _fn(name: str, description: str, properties: dict | None = None, required: list | None = None) -> dict:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties or {},
+                "required": required or [],
+            },
+        },
+    }
+
+
+TOOL_DEFINITIONS = [
+    _fn(
+        "get_leave_balance",
+        "Get the current leave balance for the user, showing quota, used, and remaining for each leave type (paid, casual/sick, floater).",
+    ),
+    _fn(
+        "get_my_leaves",
+        "Get the user's recent leave requests with their statuses (approved, pending, rejected), dates, and types.",
+    ),
+    _fn(
+        "get_wfh_usage",
+        "Get the user's work-from-home usage: how many WFH days used this week, this month, and upcoming WFH requests.",
+    ),
+    _fn(
+        "get_my_projects",
+        "Get the user's active project allocations, including project names, roles, daily hours, and project managers.",
+    ),
+    _fn(
+        "get_holidays",
+        "Get the list of fixed public holidays and approved floater dates for a given year.",
+        {
+            "year": {"type": "integer", "description": "The year to get holidays for. Defaults to current year."},
+        },
+    ),
+    _fn(
+        "plan_leave",
+        "Suggest optimal leave dates to maximize time off. Considers holidays, weekends, and leave balance. Use when the user wants to plan vacation or time off.",
+        {
+            "days_wanted": {"type": "integer", "description": "Number of days off the user wants."},
+            "preferred_month": {"type": "integer", "description": "Preferred month (1-12). If not specified, defaults to next month."},
+        },
+        ["days_wanted"],
+    ),
+    _fn(
+        "search_policy",
+        "Search company policy documents for information about leave rules, WFH policy, Slack etiquette, office info, general policies, do's and don'ts.",
+        {
+            "query": {"type": "string", "description": "The policy question or topic to search for."},
+        },
+        ["query"],
+    ),
+    _fn(
+        "apply_leave",
+        "Prepare a leave application for the user. This does NOT submit it immediately — it returns a confirmation for the user to approve. Use when the user explicitly asks to apply for leave.",
+        {
+            "leave_type": {"type": "string", "description": "Type of leave: 'paid', 'casual_sick', or 'floater'."},
+            "start_date": {"type": "string", "description": "Start date in YYYY-MM-DD format."},
+            "end_date": {"type": "string", "description": "End date in YYYY-MM-DD format."},
+            "reason": {"type": "string", "description": "Reason for the leave."},
+        },
+        ["leave_type", "start_date", "end_date", "reason"],
+    ),
+    _fn(
+        "apply_wfh",
+        "Prepare a Work From Home request for the user. This does NOT submit it immediately — it returns a confirmation for the user to approve.",
+        {
+            "wfh_date": {"type": "string", "description": "WFH start date in YYYY-MM-DD format."},
+            "end_date": {"type": "string", "description": "WFH end date in YYYY-MM-DD format. Same as wfh_date for single day."},
+            "reason": {"type": "string", "description": "Reason for WFH request."},
+        },
+        ["wfh_date", "reason"],
+    ),
+    _fn(
+        "cancel_leave",
+        "Prepare a leave cancellation for the user. The user must confirm before the leave is actually cancelled. Only future leaves can be cancelled.",
+        {
+            "leave_id": {"type": "integer", "description": "The ID of the leave request to cancel."},
+        },
+        ["leave_id"],
+    ),
+]
 
 
 # ── Execute a tool call ─────────────────────────────────────────────
@@ -282,8 +267,12 @@ def _execute_tool(
 
 
 # ── Load conversation history ──────────────────────────────────────
-def _load_history(conversation_id: str, db: Session) -> list[types.Content]:
-    """Load conversation history from DB as Gemini Content objects."""
+def _load_history(conversation_id: str, db: Session) -> list[dict]:
+    """Load conversation history from the DB as chat messages.
+
+    Stored roles stay "user"/"model" for backward compatibility with existing rows; the
+    wire format wants "assistant", so the mapping happens here rather than in the schema.
+    """
     conversation = db.query(ChatConversation).filter(
         ChatConversation.id == conversation_id
     ).first()
@@ -294,16 +283,10 @@ def _load_history(conversation_id: str, db: Session) -> list[types.Content]:
     history = []
     for msg in conversation.messages:
         if msg.role == "user":
-            history.append(types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=msg.content or "")],
-            ))
+            history.append({"role": "user", "content": msg.content or ""})
         elif msg.role == "model":
-            history.append(types.Content(
-                role="model",
-                parts=[types.Part.from_text(text=msg.content or "")],
-            ))
-        # Skip tool messages — they're embedded in the flow
+            history.append({"role": "assistant", "content": msg.content or ""})
+        # Skip tool messages — they're rebuilt per request, not replayed
 
     # Keep last 20 messages to avoid context overflow
     return history[-20:]
@@ -372,85 +355,85 @@ async def chat_stream(
         employee_name = employee.name if employee else "User"
         employee_type = employee.employee_type if employee else "Full-time"
 
-        # Build system instruction
-        system_prompt = _build_system_prompt(employee_name, employee_type, role)
-
-        # Load conversation history
-        history = _load_history(conversation_id, db)
+        # The system prompt is a message here rather than a separate field, which is the
+        # OpenAI-compatible shape DeepSeek expects.
+        messages = [
+            {"role": "system", "content": _build_system_prompt(employee_name, employee_type, role)},
+            *_load_history(conversation_id, db),
+            {"role": "user", "content": message},
+        ]
 
         # Save user message
         _save_message(conversation_id, user_id, "user", message, db=db)
 
-        # Create the chat
-        config = types.GenerateContentConfig(
-            system_instruction=system_prompt,
-            tools=[TOOL_DEFINITIONS],
-            temperature=0.7,
-            max_output_tokens=2048,
-        )
-
-        # Build contents: history + new message
-        contents = history + [
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=message)],
+        def _complete(msgs: list[dict]):
+            return client.chat.completions.create(
+                model=MODEL,
+                messages=msgs,
+                tools=TOOL_DEFINITIONS,
+                temperature=0.7,
+                max_tokens=2048,
             )
-        ]
 
-        # Generate response (non-streaming first to handle tool calls properly)
-        response = client.models.generate_content(
-            model=MODEL,
-            contents=contents,
-            config=config,
-        )
+        response = _complete(messages)
 
         # Process response — may need multiple rounds for tool calls
         max_rounds = 5
-        current_contents = contents
         final_text = ""
 
-        for round_num in range(max_rounds):
-            candidate = response.candidates[0]
-            parts = candidate.content.parts
+        for _round in range(max_rounds):
+            choice = response.choices[0].message
+            tool_calls = choice.tool_calls or []
 
-            # Check if there are function calls
-            function_calls = [p for p in parts if p.function_call]
-            text_parts = [p for p in parts if p.text]
-
-            if not function_calls:
+            if not tool_calls:
                 # No more tool calls — collect final text
-                for part in text_parts:
-                    if part.text:
-                        final_text += part.text
+                final_text += choice.content or ""
                 break
 
-            # There are function calls — execute them
-            # First, yield any text before the tool calls
-            for part in text_parts:
-                if part.text:
-                    yield json.dumps({"type": "token", "content": part.text})
+            # Any prose the model emitted alongside the tool calls goes out first.
+            if choice.content:
+                yield json.dumps({"type": "token", "content": choice.content})
 
-            # Add the model's response to contents
-            current_contents.append(candidate.content)
+            # The assistant turn must be replayed verbatim before its tool results, or the
+            # next request has tool responses answering nothing.
+            messages.append({
+                "role": "assistant",
+                "content": choice.content or "",
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.function.name,
+                            "arguments": call.function.arguments,
+                        },
+                    }
+                    for call in tool_calls
+                ],
+            })
 
-            # Execute each function call
-            tool_response_parts = []
-            for part in function_calls:
-                fc = part.function_call
-                tool_name = fc.name
-                tool_args = dict(fc.args) if fc.args else {}
+            for call in tool_calls:
+                tool_name = call.function.name
+                # Arguments arrive as a JSON *string*, and a model can emit malformed JSON.
+                # Treating that as "no arguments" keeps the conversation alive instead of
+                # collapsing the whole reply into an error.
+                try:
+                    tool_args = json.loads(call.function.arguments or "{}")
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "Unparseable arguments for tool %s: %r",
+                        tool_name, call.function.arguments,
+                    )
+                    tool_args = {}
 
-                # Yield tool call event
                 yield json.dumps({
                     "type": "tool_call",
                     "tool": tool_name,
                     "status": "running",
                 })
 
-                # Execute the tool
                 result = _execute_tool(tool_name, tool_args, employee_id, db)
 
-                # Yield tool result
                 yield json.dumps({
                     "type": "tool_result",
                     "tool": tool_name,
@@ -465,27 +448,22 @@ async def chat_stream(
                         "details": result["details"],
                     })
 
-                # Build the function response part
-                tool_response_parts.append(
-                    types.Part.from_function_response(
-                        name=tool_name,
-                        response=result,
-                    )
-                )
-
-            # Add tool responses to contents
-            current_contents.append(
-                types.Content(
-                    role="user",
-                    parts=tool_response_parts,
-                )
-            )
+                # Each result is addressed to the call that asked for it; without the id
+                # the API cannot pair them up.
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": json.dumps(result, default=str),
+                })
 
             # Continue the conversation with tool results
-            response = client.models.generate_content(
-                model=MODEL,
-                contents=current_contents,
-                config=config,
+            response = _complete(messages)
+        else:
+            # Ran out of rounds with the model still asking for tools. Say so rather than
+            # returning an empty bubble.
+            logger.warning("Chat hit the %d-round tool limit", max_rounds)
+            final_text = final_text or (
+                "I wasn't able to finish that — could you rephrase or narrow it down?"
             )
 
         # Yield the final text in chunks for streaming feel
