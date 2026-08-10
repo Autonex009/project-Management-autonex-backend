@@ -830,6 +830,9 @@ def get_leaderboard(
     elif range == "week":
         start = today - timedelta(days=6)
         end = today
+    elif range in ("year", "overall"):
+        start = date(today.year, 1, 1)
+        end = today
     else:  # "month" or default
         start = _month_start(today)
         end = today
@@ -850,6 +853,8 @@ def get_leaderboard(
     tasks_submitted_by_user: dict = defaultdict(int)
     labels_created_by_user: dict = defaultdict(int)
 
+    user_project_seconds = defaultdict(lambda: defaultdict(int))
+
     for r in time_rows:
         if not is_autonex_email(r.user_email):
             continue
@@ -861,6 +866,11 @@ def get_leaderboard(
         if _is_review_stage(r.workflow_stage):
             review_seconds[u] += secs
 
+        if r.sub_project_id:
+            user_project_seconds[u][("id", r.sub_project_id)] += secs
+        elif r.encord_project_hash:
+            user_project_seconds[u][("hash", r.encord_project_hash)] += secs
+
     for a in act_rows:
         if not is_autonex_email(a.user_email):
             continue
@@ -870,6 +880,20 @@ def get_leaderboard(
 
     total_team_seconds = sum(user_seconds.values())
     name_by_email = _names_for(db, user_seconds.keys())
+
+    # Map project IDs and hashes to project names from DailySheet
+    all_p_ids = {pid for pmap in user_project_seconds.values() for ptype, pid in pmap.keys() if ptype == "id"}
+    all_p_hashes = {phash for pmap in user_project_seconds.values() for ptype, phash in pmap.keys() if ptype == "hash"}
+
+    proj_name_by_id = {}
+    proj_name_by_hash = {}
+    if all_p_ids:
+        for ds in db.query(DailySheet.id, DailySheet.name).filter(DailySheet.id.in_(all_p_ids)).all():
+            proj_name_by_id[ds.id] = ds.name
+    if all_p_hashes:
+        for ds in db.query(DailySheet.encord_project_hash, DailySheet.name).filter(DailySheet.encord_project_hash.in_(all_p_hashes)).all():
+            if ds.encord_project_hash and ds.name:
+                proj_name_by_hash[ds.encord_project_hash] = ds.name
 
     emails = [e for e in user_seconds.keys() if e]
     # Normalized on both sides, like _names_for — otherwise a whitespace-padded
@@ -895,6 +919,23 @@ def get_leaderboard(
         rev_hrs = _hours(review_seconds[u])
         desig, emp_id, avatar_url = emp_map.get(_norm_encord(u), (None, None, None))
         pct = round((secs / total_team_seconds) * 100, 1) if total_team_seconds else 0.0
+
+        # Determine user's primary project name
+        top_proj_name = None
+        if u in user_project_seconds and user_project_seconds[u]:
+            sorted_projs = sorted(user_project_seconds[u].items(), key=lambda kv: kv[1], reverse=True)
+            for (ptype, pval), _ in sorted_projs:
+                pname = proj_name_by_id.get(pval) if ptype == "id" else proj_name_by_hash.get(pval)
+                if pname:
+                    top_proj_name = pname
+                    break
+
+        if not top_proj_name and emp_id:
+            # Fallback check if user assigned in daily sheets
+            assigned = db.query(DailySheet.name).filter(DailySheet.assigned_employee_ids.contains([emp_id])).first()
+            if assigned:
+                top_proj_name = assigned.name
+
         leaderboard.append({
             "rank": rank,
             "user_email": u,
@@ -902,6 +943,7 @@ def get_leaderboard(
             "employee_id": emp_id,
             "avatar_url": avatar_url,
             "designation": desig or "Annotator / Reviewer",
+            "project_name": top_proj_name or "General",
             "total_hours": hrs,
             "annotation_hours": ann_hrs,
             "review_hours": rev_hrs,
