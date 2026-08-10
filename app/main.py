@@ -112,7 +112,9 @@ def sync_encord_analytics_schema() -> None:
         if "sentiment" not in ds_cols:
             alters.append("ALTER TABLE daily_sheets ADD COLUMN sentiment TEXT")
         for col in ("annotators_total", "workforce_annotators", "autonex_annotators",
-                    "autonex_reviewers", "workforce_reviewers", "qc_count"):
+                    "autonex_reviewers", "workforce_reviewers", "qc_count",
+                    "developers_count", "team_lead_count", "team_manager_count",
+                    "others_count"):
             if col not in ds_cols:
                 alters.append(f"ALTER TABLE daily_sheets ADD COLUMN {col} INTEGER DEFAULT 0")
         for col in ("review_time_per_task", "gearing_ratio"):
@@ -127,6 +129,22 @@ def sync_encord_analytics_schema() -> None:
             with engine.begin() as connection:
                 for stmt in alters:
                     connection.execute(text(stmt))
+
+        # The "Developer" project-type category was renamed to "Development".
+        # Renamed IN PLACE, keeping each project's subtype, rather than left to
+        # the UI as an alias: project_types is free-form JSON, so a row whose key
+        # no longer matches any category is silently dropped the next time that
+        # project is saved. Idempotent — after the first run nothing matches.
+        with engine.begin() as connection:
+            connection.execute(text("""
+                UPDATE daily_sheets
+                SET project_types = (
+                        (project_types::jsonb - 'Developer')
+                        || jsonb_build_object('Development', project_types::jsonb -> 'Developer')
+                    )::json
+                WHERE project_types IS NOT NULL
+                  AND project_types::jsonb ? 'Developer'
+            """))
     except Exception:
         pass
 

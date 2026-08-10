@@ -236,7 +236,18 @@ def list_evals(
         q = q.filter(PerfEvaluation.period == period)
     if status:
         q = q.filter(PerfEvaluation.status == status)
-    return q.order_by(PerfEvaluation.period.desc(), PerfEvaluation.created_at.desc()).all()
+    
+    evals = q.order_by(PerfEvaluation.period.desc(), PerfEvaluation.created_at.desc()).all()
+    
+    # Filter by read privacy
+    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
+        manageable_cache = {current_user.employee_id: True}
+        for ev in evals:
+            if ev.employee_id not in manageable_cache:
+                manageable_cache[ev.employee_id] = project_scope.can_manage_employee(db, current_user, ev.employee_id)
+        evals = [ev for ev in evals if manageable_cache.get(ev.employee_id, False)]
+        
+    return evals
 
 
 @router.post("", response_model=PerfEvalResponse, status_code=201)

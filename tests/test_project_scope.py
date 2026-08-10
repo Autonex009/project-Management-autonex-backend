@@ -359,6 +359,57 @@ def test_the_role_tag_alone_makes_someone_a_lead(db):
     assert project_scope.can_act_on_project(db, user("pm", PM_B_EMP), project(db, 1))
 
 
+def test_a_converted_manager_reads_as_a_lead_without_editing_the_project(db):
+    """Designation wins over the stored manager slot.
+
+    People converted from Program Manager to Team Lead keep their seat in
+    assigned_employee_ids until someone re-saves the project. Reading the slot literally
+    would show them under "Project Manager" and — worse — leave them deciding the other
+    leads' requests on that project.
+    """
+    converted = Employee(id=540, name="Converted", email="conv@x.com",
+                         employee_type="Full-time", designation="Team Lead")
+    sheet = DailySheet(id=20, name="Converted PM project", main_project_id=None,
+                       assigned_employee_ids=[540, PM_A_EMP],
+                       client="c", project_type="Full", total_tasks=1,
+                       estimated_time_per_task=1.0, start_date=date(2026, 1, 1))
+    db.add_all([converted, sheet])
+    db.commit()
+
+    assert project_scope.project_pm_ids(db, sheet) == {PM_A_EMP}, "no longer a manager"
+    assert 540 in project_scope.project_lead_ids(db, sheet), "reads as a lead instead"
+    # They may still act on the project — a lead has a manager's powers there...
+    assert project_scope.can_act_on_project(db, user("team_lead", 540), sheet)
+    # ...but their own requests now escalate, and they cannot decide a peer lead's.
+    assert project_scope.escalates_to_pm(db, 540)
+
+
+def test_a_project_whose_whole_manager_slot_converted_has_no_pm(db):
+    """Accurate rather than convenient: it has leads and no manager.
+
+    Consequence worth knowing — a lead's own request there can only go to an admin.
+    """
+    sheet = DailySheet(id=21, name="All converted", main_project_id=None,
+                       assigned_employee_ids=[540],
+                       client="c", project_type="Full", total_tasks=1,
+                       estimated_time_per_task=1.0, start_date=date(2026, 1, 1))
+    db.add(sheet)
+    db.commit()
+
+    assert project_scope.project_pm_ids(db, sheet) == set()
+    assert project_scope.project_lead_ids(db, sheet) == {540}
+    assert project_scope.can_act_on_project(db, user("team_lead", 540), sheet)
+
+    # The lead's own request on a project with no manager: nobody at project level can
+    # decide it, so it belongs to an admin.
+    db.add(Allocation(employee_id=540, sub_project_id=21, role_tags=["Team Lead"]))
+    db.commit()
+    assert not project_scope.can_manage_employee(db, user("team_lead", 540), 540), "not themselves"
+    assert not project_scope.can_manage_employee(db, user("pm", PM_A_EMP), 540), "not an outside PM"
+    assert not project_scope.can_manage_employee(db, user("team_lead", LEAD_EMP), 540), "not a peer lead"
+    assert project_scope.can_manage_employee(db, user("admin", None), 540), "admin can"
+
+
 def test_an_ordinary_allocation_does_not_make_someone_a_lead(db):
     """Otherwise every annotator on a project could act on it."""
     assert WORKER_EMP not in project_scope.project_lead_ids(db, project(db, 1))

@@ -41,20 +41,38 @@ def normalize_project_payload(data: dict, db: Session | None = None) -> dict:
 
 
 def _autonex_headcount(source) -> int:
-    """required_manpower = Autonex Annotators + Autonex Reviewers.
+    """Every role the project asks for, summed into ``required_manpower``.
 
-    QC is no longer part of a project's team composition and is excluded. The column
-    remains so historical rows keep their value, but nothing adds to it.
+    Annotators + reviewers + others + team leads + team managers + developers.
 
-    The project's managers and team leads are deliberately *not* counted here: they are
-    added when the ratio is displayed (``totalRequiredManpower`` on the frontend), because
-    resolving them needs the allocations and the organisation fallback.
+    Team leads and managers ARE counted here — the client derives those two from the
+    people picked in the Team Lead and Program Manager fields rather than accepting a
+    typed number, so the headcount cannot contradict the roster on the same screen. That
+    also means the displayed ratio uses this figure as-is and must not add them again.
+
+    QC is excluded: it is no longer part of a project's composition. The column remains so
+    historical rows keep their value, but nothing adds to it.
+
+    "Total Annotators" is deliberately absent — it counts the vendor's people as well as
+    ours, so it is informational rather than a headcount we staff.
     """
     def g(name):
         if isinstance(source, dict):
             return source.get(name) or 0
         return getattr(source, name, 0) or 0
-    return int(g("autonex_annotators")) + int(g("autonex_reviewers"))
+    return sum(
+        int(g(field))
+        for field in (
+            "autonex_annotators",
+            "autonex_reviewers",
+            "others_count",
+            "team_lead_count",
+            "team_manager_count",
+            # Development projects staff engineers, so they ARE the team: a project
+            # asking for 3 of them must read 0/3, not 0/0. Zero everywhere else.
+            "developers_count",
+        )
+    )
 
 router = APIRouter(
     prefix="/api/sub-projects",
@@ -67,55 +85,74 @@ router = APIRouter(
 TEAM_LEAD_ROLE_TAG = "Team Lead"
 
 
-def _allocate_project_creator(db: Session, project: Project, current_user: User) -> None:
-    """Allocate whoever just created ``project`` to it.
-
-    An admin is skipped: they create projects on other people's behalf and are not staff on
-    them, so an allocation would put them in the manpower count and the avatar strip.
-
-    A team lead's row is tagged, which is what records them as this project's lead — it is
-    the per-project marker, unlike ``assigned_employee_ids`` which would give them a
-    manager's rank over the project's other leads.
-
-    Overridden on purpose: the capacity guard exists to stop someone being booked past their
-    working day, and it would refuse anyone who already runs a project. Creating a project
-    should never fail for that reason, and the recorded reason keeps it auditable.
-    """
-    if not current_user or current_user.role == "admin":
-        return
-    employee_id = getattr(current_user, "employee_id", None)
-    if not employee_id:
-        return
-
-    already_on = (
-        db.query(Allocation)
-        .filter(
-            Allocation.employee_id == employee_id,
-            Allocation.sub_project_id == project.id,
+def _allocate_project_leaders(db: Session, project: Project, current_user: User) -> None:
+    """Allocate all PMs/TLs assigned to the project."""
+    # Ensure current user (creator) is in the list if they are PM/HR
+    ids_to_allocate = list(project.assigned_employee_ids or [])
+    if current_user and current_user.role in ("pm", "hr") and current_user.employee_id:
+        if current_user.employee_id not in ids_to_allocate:
+            ids_to_allocate.append(current_user.employee_id)
+            
+    for employee_id in ids_to_allocate:
+        try:
+            employee_id = int(employee_id)
+        except:
+            continue
+            
+        already_on = (
+            db.query(Allocation)
+            .filter(
+                Allocation.employee_id == employee_id,
+                Allocation.sub_project_id == project.id,
+            )
+            .first()
         )
-        .first()
-    )
-    if already_on:
-        return
+        if already_on:
+            continue
 
-    is_lead = project_scope.escalates_to_pm(db, employee_id)
-    db.add(
-        Allocation(
-            employee_id=employee_id,
-            sub_project_id=project.id,
-            total_daily_hours=8,
-            role_tags=[TEAM_LEAD_ROLE_TAG] if is_lead else [],
-            time_distribution={},
-            active_start_date=project.start_date,
-            active_end_date=project.end_date,
-            override_flag=True,
-            override_reason="Created this project",
+        is_lead = project_scope.escalates_to_pm(db, employee_id)
+        db.add(
+            Allocation(
+                employee_id=employee_id,
+                sub_project_id=project.id,
+                total_daily_hours=8,
+                role_tags=[TEAM_LEAD_ROLE_TAG] if is_lead else [],
+                time_distribution={},
+                active_start_date=project.start_date,
+                active_end_date=project.end_date,
+                override_flag=True,
+                override_reason="Auto-sync from project manager/lead assignment",
+            )
         )
-    )
-    # Denormalised count the cards read; kept in step with the row just added.
+        
+    db.flush()
     project.allocated_employees = (
-        db.query(Allocation).filter(Allocation.sub_project_id == project.id).count() + 1
+        db.query(Allocation).filter(Allocation.sub_project_id == project.id).count()
     )
+
+
+def enrich_project_response(db: Session, project: Project) -> dict:
+    from datetime import date
+    today = date.today()
+    allocs = db.query(Allocation).filter(Allocation.sub_project_id == project.id).all()
+    
+    lead_count = 0
+    pm_count = 0
+    
+    for alloc in allocs:
+        # Ignore stale allocations
+        if alloc.active_end_date and alloc.active_end_date < today:
+            continue
+            
+        if alloc.role_tags and TEAM_LEAD_ROLE_TAG in alloc.role_tags:
+            lead_count += 1
+        elif project_scope.escalates_to_admin(db, alloc.employee_id):
+            pm_count += 1
+            
+    resp = ProjectResponse.model_validate(project).model_dump()
+    resp["allocated_pm_count"] = pm_count
+    resp["allocated_lead_count"] = lead_count
+    return resp
 
 
 # ✅ CREATE PROJECT
@@ -145,12 +182,31 @@ def create_project(
     project = Project(**data)
     db.add(project)
     db.flush()
+    # Put the assigned leaders on the project straight away.
+    _allocate_project_leaders(db, project, current_user)
 
-    # Put the creator on their own project straight away. Being the recorded manager is not
-    # enough on its own: the Allocations page and the manpower avatar strip are built from
-    # allocation rows, so without one the person who just created the project is missing
-    # from both. Done here rather than in the client so it cannot be skipped or half-applied.
-    _allocate_project_creator(db, project, current_user)
+    # A team lead who creates a project owns it from the ground up, so they are
+    # allocated to it automatically. They are deliberately NOT added to the project's
+    # assigned_employee_ids because that grants PM-level access across the project;
+    # they receive an allocation with the Team Lead tag instead.
+    if current_user.role == "team_lead" and current_user.employee_id:
+        db.add(
+            Allocation(
+                employee_id=current_user.employee_id,
+                sub_project_id=project.id,
+                total_daily_hours=8,
+                role_tags=[TEAM_LEAD_ROLE_TAG],
+                time_distribution={},
+                active_start_date=project.start_date,
+                active_end_date=project.end_date,
+                override_flag=True,
+                override_reason="Auto-sync from project creator",
+            )
+        )
+        db.flush()
+        project.allocated_employees = (
+            db.query(Allocation).filter(Allocation.sub_project_id == project.id).count()
+        )
 
     audit_service.record(
         db,
@@ -177,13 +233,19 @@ def create_project(
 
     db.commit()
     db.refresh(project)
-    return project
+    return enrich_project_response(db, project)
 
 
 # ✅ LIST PROJECTS
-@router.get("", response_model=list[ProjectResponse])
-def list_projects(db: Session = Depends(get_db)):
-    return db.query(Project).order_by(Project.id.asc()).all()
+@router.get("", response_model=list[dict])
+def list_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    projects = db.query(Project).order_by(Project.id.asc()).all()
+    
+    # Filter projects based on user scope
+    if current_user.role in ("pm", "hr", "team_lead") and not project_scope.has_full_access(current_user):
+        projects = [p for p in projects if project_scope.can_act_on_project(db, current_user, p)]
+        
+    return [enrich_project_response(db, p) for p in projects]
 
 
 # ✅ UPDATE PROJECT
@@ -227,6 +289,42 @@ def update_project(
 
     # Keep required_manpower in sync with the Autonex headcount
     project.required_manpower = _autonex_headcount(project)
+
+    # Auto-allocate any newly assigned PM/TL
+    if "assigned_employee_ids" in update_data:
+        for employee_id in project.assigned_employee_ids or []:
+            try:
+                employee_id = int(employee_id)
+            except:
+                continue
+                
+            already_on = (
+                db.query(Allocation)
+                .filter(
+                    Allocation.employee_id == employee_id,
+                    Allocation.sub_project_id == project.id,
+                )
+                .first()
+            )
+            if not already_on:
+                is_lead = project_scope.escalates_to_pm(db, employee_id)
+                db.add(
+                    Allocation(
+                        employee_id=employee_id,
+                        sub_project_id=project.id,
+                        total_daily_hours=8,
+                        role_tags=[TEAM_LEAD_ROLE_TAG] if is_lead else [],
+                        time_distribution={},
+                        active_start_date=project.start_date,
+                        active_end_date=project.end_date,
+                        override_flag=True,
+                        override_reason="Auto-sync from project manager/lead assignment",
+                    )
+                )
+        db.flush()
+        project.allocated_employees = (
+            db.query(Allocation).filter(Allocation.sub_project_id == project.id).count()
+        )
 
     # Auto-release: when project is completed, delete all allocations
     released_allocations = 0
@@ -284,13 +382,16 @@ def update_project(
             request=http_request,
         )
 
+    # Also sync new allocations if new leaders were added
+    _allocate_project_leaders(db, project, current_user)
+    
     db.commit()
     db.refresh(project)
 
     # Note: project edits no longer notify allocated employees. Employees are only
     # notified when they are newly added to a project (handled in the allocations API).
 
-    return project
+    return enrich_project_response(db, project)
 
 
 # ✅ DELETE PROJECT
