@@ -6,6 +6,14 @@ import logging
 import os
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+
+import hmac
+import hashlib
+import random
+import string
+from datetime import datetime, timezone, timedelta
+from app.models.email_otp import EmailOtpVerification
+from app.services.email_service import try_send_otp_email
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -230,7 +238,50 @@ def list_employees(
                 func.trim(Employee.encord_id).ilike(term),
             )
         )
-    return query.all()
+    return query.order_by(Employee.id.desc()).all()
+
+
+# ✅ LIST EMPLOYEES (PAGINATED)
+@router.get("/paginated", dependencies=[Depends(require_role("admin", "pm"))])
+def list_employees_paginated(
+    status: str = None,
+    include_archived: bool = False,
+    search: Optional[str] = Query(
+        default=None,
+        max_length=200,
+        description="Substring match on name, email or Encord ID (case-insensitive).",
+    ),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=1000),
+    db: Session = Depends(get_db)
+):
+    query = db.query(Employee)
+    if status == "idle":
+        allocated_employee_ids = db.query(Allocation.employee_id).distinct()
+        query = query.filter(Employee.status == "active", Employee.id.notin_(allocated_employee_ids))
+    elif status:
+        query = query.filter(Employee.status == status)
+    elif not include_archived:
+        query = query.filter(Employee.status != "archived")
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        query = query.filter(
+            or_(
+                Employee.name.ilike(term),
+                Employee.email.ilike(term),
+                func.trim(Employee.encord_id).ilike(term),
+            )
+        )
+    
+    total = query.count()
+    items = query.order_by(Employee.id.desc()).offset((page - 1) * limit).limit(limit).all()
+    
+    return {
+        "data": [EmployeeResponse.model_validate(item).model_dump() for item in items],
+        "total": total,
+        "page": page,
+        "limit": limit
+    }
 
 
 @router.get("/status/active", response_model=list[EmployeeResponse], dependencies=[Depends(require_role("admin", "pm"))])
@@ -372,52 +423,37 @@ def update_employee(
     return employee
 
 
-class ChangeEmailBody(BaseModel):
+
+class RequestEmailChangeBody(BaseModel):
     new_email: EmailStr
 
-
-@router.patch("/{employee_id}/email", response_model=EmployeeResponse)
-def change_employee_email(
+@router.post("/{employee_id}/email/request")
+def request_employee_email_change(
     employee_id: int,
-    body: ChangeEmailBody,
-    http_request: Request,
+    body: RequestEmailChangeBody,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Move an employee's login onto their real company address.
-
-    Restricted to @{COMPANY_EMAIL_DOMAIN} so an employee can correct a personal
-    address to their work one, but can't point their login at somewhere arbitrary.
-
-    Updates Employee.email AND the linked User.email (login reads User.email), and
-    leaves password_hash untouched — the same password keeps working, which is what
-    the confirmation email tells them.
-    """
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    # Self, or an admin/PM acting on their behalf.
     check_employee_access(employee, current_user)
 
     new_email = (body.new_email or "").strip().lower()
     old_email = employee.email or ""
 
-    domain = new_email.rsplit("@", 1)[-1]
-    if domain != COMPANY_EMAIL_DOMAIN:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Your login email must be a @{COMPANY_EMAIL_DOMAIN} address.",
-        )
-
     if new_email == old_email.strip().lower():
+        raise HTTPException(status_code=400, detail="That is already your current email address.")
+
+    # Only an admin can set an out-of-domain email. Self-service must stay in-house.
+    if current_user.role != "admin" and not new_email.endswith(f"@{COMPANY_EMAIL_DOMAIN}"):
         raise HTTPException(
             status_code=400,
-            detail="That is already your current email address.",
+            detail=f"Email changes are restricted to the @{COMPANY_EMAIL_DOMAIN} domain.",
         )
 
     linked_user = db.query(User).filter(User.employee_id == employee.id).first()
-    # Excluding this person's own records so their existing rows don't self-conflict.
     check_duplicate_identity(
         db,
         email=new_email,
@@ -425,12 +461,80 @@ def change_employee_email(
         exclude_user_id=linked_user.id if linked_user else None,
     )
 
+    # Clean up old OTP requests for this user
+    db.query(EmailOtpVerification).filter(EmailOtpVerification.employee_id == employee.id).delete()
+
+    otp = ''.join(random.choices(string.digits, k=6))
+    
+    secret_key = os.getenv("OTP_SECRET_KEY", "fallback_dev_secret")
+    encrypted_otp = hmac.new(secret_key.encode('utf-8'), otp.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    otp_record = EmailOtpVerification(
+        employee_id=employee.id,
+        new_email=new_email,
+        encrypted_otp=encrypted_otp,
+        expires_at=expires_at
+    )
+    db.add(otp_record)
+    db.commit()
+
+    sent = try_send_otp_email(to_email=new_email, to_name=employee.name or new_email, otp=otp)
+    if not sent:
+        raise HTTPException(status_code=500, detail="Failed to send OTP email.")
+
+    return {"status": "success"}
+
+class VerifyEmailChangeBody(BaseModel):
+    otp: str
+
+@router.post("/{employee_id}/email/verify", response_model=EmployeeResponse)
+def verify_employee_email_change(
+    employee_id: int,
+    body: VerifyEmailChangeBody,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    check_employee_access(employee, current_user)
+
+    secret_key = os.getenv("OTP_SECRET_KEY", "fallback_dev_secret")
+    provided_hash = hmac.new(secret_key.encode('utf-8'), body.otp.encode('utf-8'), hashlib.sha256).hexdigest()
+
+    otp_record = db.query(EmailOtpVerification).filter(
+        EmailOtpVerification.employee_id == employee.id
+    ).first()
+
+    if not otp_record:
+        raise HTTPException(status_code=400, detail="No pending email change request found.")
+
+    if otp_record.expires_at.replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        db.delete(otp_record)
+        db.commit()
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
+
+    if otp_record.encrypted_otp != provided_hash:
+        otp_record.attempts += 1
+        if otp_record.attempts >= 3:
+            db.delete(otp_record)
+            db.commit()
+            raise HTTPException(status_code=400, detail="Maximum verification attempts reached. Request a new OTP.")
+        db.commit()
+        raise HTTPException(status_code=400, detail="Invalid or expired OTP.")
+
+    old_email = employee.email or ""
+    new_email = otp_record.new_email
+
     employee.email = new_email
+    linked_user = db.query(User).filter(User.employee_id == employee.id).first()
     if linked_user:
         linked_user.email = new_email
 
-    # This moves which address can log in as this person, so it is a credential
-    # change, not a profile edit. Both addresses are recorded.
     audit_service.record(
         db,
         actor=current_user,
@@ -446,31 +550,17 @@ def change_employee_email(
             audit_service.field_diff("Login email", old_email, new_email),
         ),
         summary=(
-            f"Changed login email for {employee.name}: {old_email} → {new_email}"
+            f"Changed login email for {employee.name}: {old_email} → {new_email} (Verified with OTP)"
             + ("" if current_user.employee_id == employee.id else " (changed by an admin)")
         ),
         request=http_request,
     )
+
+    db.delete(otp_record)
     db.commit()
     db.refresh(employee)
-
-    # Best-effort: the change is already committed, so a mail failure must not undo
-    # it or 500 the request. It's logged, and the new address is on screen anyway.
-    sent = try_send_email_changed_email(
-        to_email=new_email,
-        to_name=employee.name or new_email,
-        old_email=old_email,
-        portal_url=EMPLOYEE_PORTAL_URL,
-    )
-    logger.info(
-        "[change-email] employee id=%s %s -> %s (login row %s, notice %s)",
-        employee.id, old_email, new_email,
-        "updated" if linked_user else "MISSING",
-        "sent" if sent else "FAILED",
-    )
-
+    
     return employee
-
 
 class ConvertToFulltimeBody(BaseModel):
     converted_by: Optional[int] = None   # user_id of the admin performing the promotion

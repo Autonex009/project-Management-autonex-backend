@@ -354,6 +354,57 @@ def try_send_password_reset_email(*, to_email: str, to_name: str, reset_link: st
         return False
 
 
+def send_otp_email(*, to_email: str, to_name: str, otp: str) -> None:
+    first = to_name.split()[0]
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f4f7; margin: 0; padding: 0; }}
+    .container {{ max-width: 560px; margin: 40px auto; background: #fff; border-radius: 8px;
+                  padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+    h2 {{ color: #1a1a2e; margin-top: 0; }}
+    .otp-code {{ font-size: 24px; font-weight: bold; color: #4f46e5; letter-spacing: 2px;
+                 background: #e0e7ff; padding: 12px 24px; border-radius: 6px; display: inline-block; margin: 20px 0; }}
+    p {{ color: #374151; line-height: 1.6; }}
+    .note {{ font-size: 13px; color: #6b7280; margin-top: 20px; }}
+    .footer {{ margin-top: 32px; font-size: 12px; color: #9ca3af;
+               border-top: 1px solid #e5e7eb; padding-top: 16px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h2>Verify your email address</h2>
+    <p>Hi {first},</p>
+    <p>Use the following OTP to complete your email change request. This OTP is valid for 10 minutes.</p>
+    <div class="otp-code">{otp}</div>
+    <p class="note">
+      If you did not request this change, you can safely ignore this email.
+    </p>
+    <div class="footer">
+      <p>Autonex AI &mdash; {os.getenv("MAIL_FROM", "")}</p>
+    </div>
+  </div>
+</body>
+</html>"""
+    _send(
+        to_email=to_email,
+        to_name=to_name,
+        subject="Your OTP for Autonex AI email verification",
+        html_body=html,
+    )
+
+
+def try_send_otp_email(**kwargs) -> bool:
+    try:
+        send_otp_email(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning("[email] OTP email failed: %s", exc)
+        return False
+
+
 # ── Referral emails ───────────────────────────────────────────────────────────
 
 def send_referral_confirmation_email(
