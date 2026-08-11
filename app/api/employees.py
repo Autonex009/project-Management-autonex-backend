@@ -446,6 +446,13 @@ def request_employee_email_change(
     if new_email == old_email.strip().lower():
         raise HTTPException(status_code=400, detail="That is already your current email address.")
 
+    # Only an admin can set an out-of-domain email. Self-service must stay in-house.
+    if current_user.role != "admin" and not new_email.endswith(f"@{COMPANY_EMAIL_DOMAIN}"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Email changes are restricted to the @{COMPANY_EMAIL_DOMAIN} domain.",
+        )
+
     linked_user = db.query(User).filter(User.employee_id == employee.id).first()
     check_duplicate_identity(
         db,
