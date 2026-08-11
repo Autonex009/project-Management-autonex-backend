@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import app.db.database as database
 from app.db.database import Base
 import app.models.allocation       # noqa: F401
+import app.models.email_otp        # noqa: F401
 import app.models.employee         # noqa: F401
 import app.models.guideline        # noqa: F401
 import app.models.leave            # noqa: F401
@@ -44,9 +45,9 @@ from app.services.auth_service import get_current_user
 
 employees_api.hash_password = lambda pw: "hashed-pw"
 
-# Capture the confirmation notice instead of sending it.
+# Capture the OTP email notice instead of sending it.
 notices = []
-employees_api.try_send_email_changed_email = lambda **kw: (notices.append(kw), True)[1]
+employees_api.try_send_otp_email = lambda **kw: (notices.append(kw), True)[1]
 
 PERSONAL = "person@gmail.com"
 WORK = f"person@{COMPANY_EMAIL_DOMAIN}"
@@ -95,7 +96,12 @@ def ctx():
 
 
 def change_email(client, employee_id, new_email):
-    return client.patch(f"/api/employees/{employee_id}/email", json={"new_email": new_email})
+    notices.clear()
+    resp1 = client.post(f"/api/employees/{employee_id}/email/request", json={"new_email": new_email})
+    if resp1.status_code != 200:
+        return resp1
+    otp = notices[-1]["otp"]
+    return client.post(f"/api/employees/{employee_id}/email/verify", json={"otp": otp})
 
 
 def test_rejects_an_address_outside_the_company_domain(ctx):
@@ -131,7 +137,7 @@ def test_confirmation_notice_goes_to_the_new_address(ctx):
 
     assert len(notices) == 1
     assert notices[0]["to_email"] == WORK
-    assert notices[0]["old_email"] == PERSONAL
+    assert "otp" in notices[0]
 
 
 def test_uppercase_input_is_normalised(ctx):
