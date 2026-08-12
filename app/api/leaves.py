@@ -642,16 +642,6 @@ def create_leave(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    if (
-        current_user.role not in ["admin", "hr"]
-        and not payload.is_emergency
-        and payload.start_date < date_type.today()
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Employees and PMs cannot apply for leaves on past dates unless marked as Emergency Leave."
-        )
-
     if payload.is_half_day:
         validate_half_day_timing(payload.start_date, payload.half_day_slot)
 
@@ -966,19 +956,6 @@ def update_leave(
         raise HTTPException(status_code=404, detail="Leave not found")
     check_leave_access(leave.employee_id, current_user, db)
     check_leave_access(payload.employee_id, current_user, db)
-    if current_user.role not in ["admin", "hr"] and leave.start_date <= date_type.today():
-        raise HTTPException(status_code=400, detail="Cannot edit a leave that has already started")
-
-    if (
-        current_user.role not in ["admin", "hr"]
-        and not payload.is_emergency
-        and payload.start_date < date_type.today()
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Employees and PMs cannot update leaves to past dates unless marked as Emergency Leave."
-        )
-
     if payload.is_half_day:
         validate_half_day_timing(payload.start_date, payload.half_day_slot)
 
