@@ -261,12 +261,6 @@ def create_wfh_request(
     if end_date < payload.wfh_date:
         raise HTTPException(status_code=400, detail="End date cannot be before start date")
 
-    if current_user.role not in ["admin", "hr"] and payload.wfh_date < date.today():
-        raise HTTPException(
-            status_code=400,
-            detail="Employees and PMs cannot submit WFH requests for past dates."
-        )
-
     # Check for overlap with existing non-rejected WFH requests
     overlap = db.query(WFHRequest).filter(
         WFHRequest.employee_id == payload.employee_id,
@@ -657,18 +651,9 @@ def update_wfh_request(
         raise HTTPException(status_code=404, detail="WFH request not found")
     check_wfh_access(req.employee_id, current_user, db)
     check_wfh_access(payload.employee_id, current_user, db)
-    if current_user.role not in ["admin", "hr"] and req.wfh_date <= date.today():
-        raise HTTPException(status_code=400, detail="Cannot edit a WFH request on or after its date")
-
     end_date = payload.end_date or payload.wfh_date
     if end_date < payload.wfh_date:
         raise HTTPException(status_code=400, detail="End date cannot be before start date")
-
-    if current_user.role not in ["admin", "hr"] and payload.wfh_date < date.today():
-        raise HTTPException(
-            status_code=400,
-            detail="Employees and PMs cannot update WFH requests to past dates."
-        )
 
     # Check for overlap with other non-rejected WFH requests (excluding this one)
     overlap = db.query(WFHRequest).filter(

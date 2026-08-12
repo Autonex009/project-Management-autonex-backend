@@ -118,9 +118,6 @@ def confirm_leave(
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format")
 
-    if start < date.today():
-        raise HTTPException(status_code=400, detail="Cannot apply leave for past dates")
-
     leave = Leave(
         employee_id=body.employee_id,
         leave_type=normalize_leave_type(body.leave_type),
@@ -161,9 +158,6 @@ def confirm_wfh(
         wfh_end = date.fromisoformat(body.end_date) if body.end_date else wfh_start
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid date format")
-
-    if wfh_start < date.today():
-        raise HTTPException(status_code=400, detail="Cannot apply WFH for past dates")
 
     wfh = WFHRequest(
         employee_id=body.employee_id,
