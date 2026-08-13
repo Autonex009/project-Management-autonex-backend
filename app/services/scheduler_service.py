@@ -7,6 +7,11 @@ from apscheduler.schedulers.background import BackgroundScheduler  # type: ignor
 from app.db.database import SessionLocal
 from app.services.hiring_sync_service import run_sync
 from app.services.encord_sync_service import run_sync as run_encord_sync
+from app.services.badge_award_jobs import (
+    run_weekly_badge_job,
+    run_monthly_badge_job,
+    run_tenure_and_yearly_job,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +79,47 @@ def start_scheduler() -> None:
             id="hiring_sync",
             replace_existing=True,
             next_run_time=datetime.now(),
+        )
+
+    # Weekly badges – every Monday at 00:30
+    if not _scheduler.get_job("weekly_badge_award"):
+        _scheduler.add_job(
+            run_weekly_badge_job,
+            trigger="cron",
+            day_of_week="mon",
+            hour=0,
+            minute=30,
+            id="weekly_badge_award",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # Monthly badges – 1st of every month at 01:00
+    if not _scheduler.get_job("monthly_badge_award"):
+        _scheduler.add_job(
+            run_monthly_badge_job,
+            trigger="cron",
+            day=1,
+            hour=1,
+            minute=0,
+            id="monthly_badge_award",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # Tenure + Yearly milestones – every day at 02:00
+    if not _scheduler.get_job("tenure_yearly_badges"):
+        _scheduler.add_job(
+            run_tenure_and_yearly_job,
+            trigger="cron",
+            hour=2,
+            minute=0,
+            id="tenure_yearly_badges",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
         )
 
     if not _scheduler.running:
