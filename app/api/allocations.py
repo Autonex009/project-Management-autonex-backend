@@ -213,10 +213,14 @@ def create_allocation(
     """Create a new allocation with validation."""
     # Staffing a project is the PM's call, so scope on the target project rather than on
     # the employee: the person being added is by definition not on it yet.
+    project = db.query(Project).filter(Project.id == data.sub_project_id).first()
+    if project and project.project_status == "archived":
+        raise HTTPException(status_code=400, detail="Cannot allocate employees to an archived project.")
+
     project_scope.require_project_scope(
         db,
         current_user,
-        db.query(Project).filter(Project.id == data.sub_project_id).first(),
+        project,
         action="allocate people to this project",
     )
 
@@ -270,7 +274,8 @@ def create_allocation(
     actual_count = 0
     if project:
         actual_count = db.query(Allocation).filter(
-            Allocation.sub_project_id == data.sub_project_id
+            Allocation.sub_project_id == data.sub_project_id,
+            Allocation.is_active == True
         ).count()
         project.allocated_employees = actual_count
 
@@ -329,7 +334,7 @@ def create_allocation(
 @router.get("", response_model=List[dict], dependencies=[Depends(require_role("admin", "pm"))])
 def get_allocations(db: Session = Depends(get_db)):
     """Get all allocations with enriched data (optimized to avoid N+1 queries)."""
-    allocations = db.query(Allocation).all()
+    allocations = db.query(Allocation).filter(Allocation.is_active == True).all()
     
     if not allocations:
         return []
@@ -392,7 +397,8 @@ def get_employee_allocation_status(
 def get_allocations_by_project(project_id: int, db: Session = Depends(get_db)):
     """Get all allocations for a specific project."""
     allocations = db.query(Allocation).filter(
-        Allocation.sub_project_id == project_id
+        Allocation.sub_project_id == project_id,
+        Allocation.is_active == True
     ).all()
     return [enrich_allocation_response(a, db) for a in allocations]
 
@@ -411,7 +417,8 @@ def get_allocations_by_employee(
             if not employee or current_user.email != employee.email:
                 raise HTTPException(status_code=403, detail="Access denied")
     allocations = db.query(Allocation).filter(
-        Allocation.employee_id == employee_id
+        Allocation.employee_id == employee_id,
+        Allocation.is_active == True
     ).all()
     return [enrich_allocation_response(a, db) for a in allocations]
 
@@ -431,19 +438,27 @@ def update_allocation(
         raise HTTPException(status_code=404, detail="Allocation not found")
 
     # Scope on the project the allocation is on now...
+    old_project = db.query(Project).filter(Project.id == allocation.sub_project_id).first()
+    if old_project and old_project.project_status == "archived":
+        raise HTTPException(status_code=400, detail="Cannot edit allocations for an archived project.")
+
     project_scope.require_project_scope(
         db,
         current_user,
-        db.query(Project).filter(Project.id == allocation.sub_project_id).first(),
+        old_project,
         action="change allocations on this project",
     )
     # ...and, when the allocation is being moved, on the destination too. Checking only
     # the source would let a PM push someone onto a project they do not manage.
     if data.sub_project_id and data.sub_project_id != allocation.sub_project_id:
+        new_project = db.query(Project).filter(Project.id == data.sub_project_id).first()
+        if new_project and new_project.project_status == "archived":
+            raise HTTPException(status_code=400, detail="Cannot move an allocation to an archived project.")
+
         project_scope.require_project_scope(
             db,
             current_user,
-            db.query(Project).filter(Project.id == data.sub_project_id).first(),
+            new_project,
             action="move allocations onto this project",
         )
 
@@ -516,7 +531,8 @@ def update_allocation(
         project = db.query(Project).filter(Project.id == pid).first()
         if project:
             actual_count = db.query(Allocation).filter(
-                Allocation.sub_project_id == pid
+                Allocation.sub_project_id == pid,
+                Allocation.is_active == True
             ).count()
             project.allocated_employees = actual_count
 
@@ -633,7 +649,8 @@ def delete_allocation(
     # Sync project allocated_employees count from actual allocation records
     if project:
         actual_count = db.query(Allocation).filter(
-            Allocation.sub_project_id == sub_project_id
+            Allocation.sub_project_id == sub_project_id,
+            Allocation.is_active == True
         ).count()
         project.allocated_employees = actual_count
 

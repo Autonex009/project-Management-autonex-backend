@@ -724,6 +724,7 @@ def _resolve_employee(db: Session, current_user: User) -> Employee | None:
 def my_encord_activity(
     days: int = 7,
     sub_project_id: Optional[int] = None,
+    employee_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -740,7 +741,10 @@ def my_encord_activity(
     """
     days = max(1, min(int(days or 7), 90))
 
-    emp = _resolve_employee(db, current_user)
+    if employee_id and current_user.role in ("admin", "pm", "hr"):
+        emp = db.query(Employee).filter(Employee.id == employee_id).first()
+    else:
+        emp = _resolve_employee(db, current_user)
     encord_id = (emp.encord_id or "").strip() if emp else ""
 
     # Window: the last `days` days ending on the latest synced date (the sync runs

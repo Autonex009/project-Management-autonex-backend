@@ -292,7 +292,7 @@ def delete_employee_note(
     note_id: int,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(require_role("admin", "pm", "hr")),
 ):
     note = db.query(EmployeeNote).filter(EmployeeNote.id == note_id).first()
     if not note:
