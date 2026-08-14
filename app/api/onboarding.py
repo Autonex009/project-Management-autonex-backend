@@ -105,12 +105,12 @@ def is_module_locked(user_id: int, module_id: int, db: Session) -> bool:
             return not previous_completed
             
         total_sections = len(m.sections)
-        completed_count = db.query(OnboardingProgress).filter(
+        completed_count = db.query(OnboardingProgress.section_id).filter(
             OnboardingProgress.user_id == user_id,
             OnboardingProgress.module_id == m.id
-        ).count()
+        ).distinct().count()
         
-        is_completed = (total_sections > 0 and completed_count == total_sections) or (total_sections == 0)
+        is_completed = (total_sections > 0 and completed_count >= total_sections) or (total_sections == 0)
         previous_completed = is_completed
         
     return False
@@ -732,7 +732,9 @@ def get_candidate_dashboard(
     completed_section_ids = {p.section_id for p in progress_records}
     completed_module_sections = {}
     for p in progress_records:
-        completed_module_sections[p.module_id] = completed_module_sections.get(p.module_id, 0) + 1
+        if p.module_id not in completed_module_sections:
+            completed_module_sections[p.module_id] = set()
+        completed_module_sections[p.module_id].add(p.section_id)
 
     attempt_map = {a.question_id: a.is_correct for a in quiz_attempts}
 
@@ -744,7 +746,7 @@ def get_candidate_dashboard(
     previous_completed = True
     for m in modules:
         total_sections = len(m.sections)
-        completed = completed_module_sections.get(m.id, 0)
+        completed = len(completed_module_sections.get(m.id, set()))
         progress = int((completed / total_sections) * 100) if total_sections > 0 else 0
 
         # Determine locked state
