@@ -218,7 +218,7 @@ def list_employees(
 ):
     query = db.query(Employee)
     if status == "idle":
-        allocated_employee_ids = db.query(Allocation.employee_id).distinct()
+        allocated_employee_ids = db.query(Allocation.employee_id).filter(Allocation.is_active == True).distinct()
         query = query.filter(Employee.status == "active", Employee.id.notin_(allocated_employee_ids))
     elif status:
         query = query.filter(Employee.status == status)
@@ -257,7 +257,7 @@ def list_employees_paginated(
 ):
     query = db.query(Employee)
     if status == "idle":
-        allocated_employee_ids = db.query(Allocation.employee_id).distinct()
+        allocated_employee_ids = db.query(Allocation.employee_id).filter(Allocation.is_active == True).distinct()
         query = query.filter(Employee.status == "active", Employee.id.notin_(allocated_employee_ids))
     elif status:
         query = query.filter(Employee.status == status)
@@ -296,7 +296,7 @@ def get_inactive_employees(db: Session = Depends(get_db)):
 
 @router.get("/status/idle", response_model=list[EmployeeResponse], dependencies=[Depends(require_role("admin", "pm"))])
 def get_idle_employees(db: Session = Depends(get_db)):
-    allocated_employee_ids = db.query(Allocation.employee_id).distinct()
+    allocated_employee_ids = db.query(Allocation.employee_id).filter(Allocation.is_active == True).distinct()
     return db.query(Employee).filter(
         Employee.status == "active",
         Employee.id.notin_(allocated_employee_ids)

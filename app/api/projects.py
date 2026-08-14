@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from app.services.auth_service import get_current_user, require_role
 from app.services import audit_service, project_scope
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import func
 
 from app.db.database import get_db
 from app.models.project import SubProject, Project  # SubProject with alias
@@ -127,14 +128,20 @@ def _allocate_project_leaders(db: Session, project: Project, current_user: User)
         
     db.flush()
     project.allocated_employees = (
-        db.query(Allocation).filter(Allocation.sub_project_id == project.id).count()
+        db.query(Allocation).filter(
+            Allocation.sub_project_id == project.id,
+            Allocation.is_active == True
+        ).count()
     )
 
 
 def enrich_project_response(db: Session, project: Project) -> dict:
     from datetime import date
     today = date.today()
-    allocs = db.query(Allocation).filter(Allocation.sub_project_id == project.id).all()
+    allocs = db.query(Allocation).filter(
+        Allocation.sub_project_id == project.id,
+        Allocation.is_active == True
+    ).all()
     
     lead_count = 0
     pm_count = 0
@@ -205,7 +212,10 @@ def create_project(
         )
         db.flush()
         project.allocated_employees = (
-            db.query(Allocation).filter(Allocation.sub_project_id == project.id).count()
+            db.query(Allocation).filter(
+                Allocation.sub_project_id == project.id,
+                Allocation.is_active == True
+            ).count()
         )
 
     audit_service.record(
@@ -270,6 +280,26 @@ def update_project(
     old_status = project.project_status
     new_status = update_data.get('project_status', old_status)
 
+    if old_status != "archived" and new_status == "archived":
+        db.query(Allocation).filter(
+            Allocation.sub_project_id == project.id,
+            Allocation.is_active == True
+        ).update({
+            "is_active": False,
+            "deactivated_at": func.now(),
+            "deactivated_reason": "project_archived"
+        }, synchronize_session=False)
+    elif old_status == "archived" and new_status != "archived":
+        db.query(Allocation).filter(
+            Allocation.sub_project_id == project.id,
+            Allocation.is_active == False,
+            Allocation.deactivated_reason == "project_archived"
+        ).update({
+            "is_active": True,
+            "deactivated_at": None,
+            "deactivated_reason": None
+        }, synchronize_session=False)
+
     # A PM (or HR) editing a project can't drop themselves off it — keep them among
     # the project PMs so they never lose visibility of their own project.
     if (
@@ -323,7 +353,10 @@ def update_project(
                 )
         db.flush()
         project.allocated_employees = (
-            db.query(Allocation).filter(Allocation.sub_project_id == project.id).count()
+            db.query(Allocation).filter(
+                Allocation.sub_project_id == project.id,
+                Allocation.is_active == True
+            ).count()
         )
 
     # Auto-release: when project is completed, delete all allocations
@@ -334,6 +367,13 @@ def update_project(
         ).count()
         db.query(Allocation).filter(Allocation.sub_project_id == project_id).delete()
         project.allocated_employees = 0
+    elif (old_status != "archived" and new_status == "archived") or (old_status == "archived" and new_status != "archived"):
+        project.allocated_employees = (
+            db.query(Allocation).filter(
+                Allocation.sub_project_id == project.id,
+                Allocation.is_active == True
+            ).count()
+        )
 
     details = audit_service.diff_all(
         before,

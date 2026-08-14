@@ -102,7 +102,8 @@ class RecommendationEngine:
             
             # Check current allocation load
             current_allocations = self.db.query(Allocation).filter(
-                Allocation.employee_id == candidate.id
+                Allocation.employee_id == candidate.id,
+                Allocation.is_active == True
             ).all()
             total_allocated_hours = sum(
                 (a.total_daily_hours or 8) for a in current_allocations
@@ -146,7 +147,8 @@ class RecommendationEngine:
         
         # Get all allocations for this project
         allocations = self.db.query(Allocation).filter(
-            Allocation.sub_project_id == project_id
+            Allocation.sub_project_id == project_id,
+            Allocation.is_active == True
         ).all()
         
         # Capacity needs a finite timeline; open-ended sub-projects (no end date)

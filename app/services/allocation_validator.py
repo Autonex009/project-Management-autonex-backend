@@ -205,7 +205,10 @@ def check_double_booking(
     max_capacity = int(employee.working_hours_per_day or 8)
     
     # Build query for existing allocations
-    query = db.query(Allocation).filter(Allocation.employee_id == employee_id)
+    query = db.query(Allocation).filter(
+        Allocation.employee_id == employee_id,
+        Allocation.is_active == True
+    )
     
     # Exclude current allocation if updating
     if exclude_allocation_id:
@@ -345,6 +348,7 @@ def get_employee_allocation_status(
     today = date.today()
     allocations = db.query(Allocation).filter(
         Allocation.employee_id == employee_id,
+        Allocation.is_active == True,
         or_(
             Allocation.active_start_date.is_(None),
             Allocation.active_start_date <= today
