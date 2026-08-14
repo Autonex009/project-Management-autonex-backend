@@ -10,7 +10,7 @@ from arq import create_pool
 from arq.connections import RedisSettings
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log, employee_badge
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -43,6 +43,8 @@ from app.api.analytics import router as analytics_router, me_router as analytics
 from app.api.audit_logs import router as audit_logs_router
 from app.seed_skills import seed_skills
 from app.services.scheduler_service import start_scheduler, shutdown_scheduler
+from app.api.employee_notes import router as employee_notes_router
+from app.api.badges import router as badges_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -797,4 +799,6 @@ app.include_router(encord_sync_router)
 app.include_router(analytics_router)
 app.include_router(analytics_me_router)
 app.include_router(audit_logs_router)
+app.include_router(employee_notes_router)
+app.include_router(badges_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")

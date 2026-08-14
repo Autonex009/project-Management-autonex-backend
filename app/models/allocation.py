@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, Date, ForeignKey, Boolean, Text, JSON, TIMESTAMP
+from sqlalchemy import Column, Integer, Float, Date, ForeignKey, Boolean, Text, JSON, TIMESTAMP, String
 from sqlalchemy.sql import func
 from app.db.database import Base
 
@@ -31,6 +31,11 @@ class Allocation(Base):
     # Override for forced allocations despite warnings
     override_flag = Column(Boolean, default=False)
     override_reason = Column(Text, nullable=True)
+
+    # Soft-hide / Archive fields
+    is_active = Column(Boolean, default=True, nullable=False, index=True)
+    deactivated_at = Column(TIMESTAMP, nullable=True)
+    deactivated_reason = Column(String(50), nullable=True)
     
     # Legacy fields
     weekly_hours_allocated = Column(Float, nullable=True)
