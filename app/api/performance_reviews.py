@@ -4,7 +4,7 @@ Performance Reviews API — PMs can add feedback, reviews, and comments for empl
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from app.services.auth_service import get_current_user, require_role
 from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
@@ -66,7 +66,7 @@ class PerformanceReviewResponse(BaseModel):
         from_attributes = True
 
 
-@router.get("", response_model=List[PerformanceReviewResponse])
+@router.get("", response_model=list[PerformanceReviewResponse])
 def list_reviews(
     employee_id: Optional[int] = None,
     reviewer_id: Optional[int] = None,
@@ -80,6 +80,7 @@ def list_reviews(
         query = query.filter(PerformanceReview.reviewer_id == reviewer_id)
     if review_type:
         query = query.filter(PerformanceReview.review_type == review_type)
+        
     return query.order_by(PerformanceReview.created_at.desc()).all()
 
 

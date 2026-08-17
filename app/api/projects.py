@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Query
 from app.services.auth_service import get_current_user, require_role
 from app.services import audit_service, project_scope
 from sqlalchemy.orm import Session
@@ -256,7 +256,6 @@ def list_projects(db: Session = Depends(get_db), current_user: User = Depends(ge
         projects = [p for p in projects if project_scope.can_act_on_project(db, current_user, p)]
         
     return [enrich_project_response(db, p) for p in projects]
-
 
 # ✅ UPDATE PROJECT
 @router.put("/{project_id}", response_model=ProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
