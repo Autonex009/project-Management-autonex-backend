@@ -25,6 +25,8 @@ from app.models.encord_analytics import EncordDailyTimeSpent
 from app.models.encord_activity import EncordDailyActivity
 from app.models.employee import Employee
 from app.models.user import User
+from app.models.leave import Leave
+from app.models.wfh import WFHRequest
 
 router = APIRouter(prefix="/api/analytics", tags=["Analytics"], dependencies=[Depends(require_role("admin", "pm"))])
 

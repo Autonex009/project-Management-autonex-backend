@@ -241,48 +241,6 @@ def list_employees(
     return query.order_by(Employee.id.desc()).all()
 
 
-# ✅ LIST EMPLOYEES (PAGINATED)
-@router.get("/paginated", dependencies=[Depends(require_role("admin", "pm"))])
-def list_employees_paginated(
-    status: str = None,
-    include_archived: bool = False,
-    search: Optional[str] = Query(
-        default=None,
-        max_length=200,
-        description="Substring match on name, email or Encord ID (case-insensitive).",
-    ),
-    page: int = Query(1, ge=1),
-    limit: int = Query(50, ge=1, le=1000),
-    db: Session = Depends(get_db)
-):
-    query = db.query(Employee)
-    if status == "idle":
-        allocated_employee_ids = db.query(Allocation.employee_id).filter(Allocation.is_active == True).distinct()
-        query = query.filter(Employee.status == "active", Employee.id.notin_(allocated_employee_ids))
-    elif status:
-        query = query.filter(Employee.status == status)
-    elif not include_archived:
-        query = query.filter(Employee.status != "archived")
-    if search and search.strip():
-        term = f"%{search.strip()}%"
-        query = query.filter(
-            or_(
-                Employee.name.ilike(term),
-                Employee.email.ilike(term),
-                func.trim(Employee.encord_id).ilike(term),
-            )
-        )
-    
-    total = query.count()
-    items = query.order_by(Employee.id.desc()).offset((page - 1) * limit).limit(limit).all()
-    
-    return {
-        "data": [EmployeeResponse.model_validate(item).model_dump() for item in items],
-        "total": total,
-        "page": page,
-        "limit": limit
-    }
-
 
 @router.get("/status/active", response_model=list[EmployeeResponse], dependencies=[Depends(require_role("admin", "pm"))])
 def get_active_employees(db: Session = Depends(get_db)):
@@ -301,8 +259,6 @@ def get_idle_employees(db: Session = Depends(get_db)):
         Employee.status == "active",
         Employee.id.notin_(allocated_employee_ids)
     ).all()
-
-
 
 # ✅ GET EMPLOYEE BY ID
 @router.get("/{employee_id}", response_model=EmployeeResponse)

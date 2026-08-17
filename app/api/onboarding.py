@@ -936,7 +936,7 @@ def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] 
     if candidates is None:
         candidates = get_onboarding_candidates(db)
 
-    modules = db.query(OnboardingModule).filter(OnboardingModule.status.ilike("PUBLISHED")).all()
+    modules = db.query(OnboardingModule).filter(OnboardingModule.status.ilike("PUBLISHED")).order_by(OnboardingModule.order.asc()).all()
     if not candidates:
         return []
 
@@ -984,7 +984,9 @@ def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] 
         progress_records = progress_by_user.get(c.id, [])
         completed_module_sections = {}
         for p in progress_records:
-            completed_module_sections[p.module_id] = completed_module_sections.get(p.module_id, 0) + 1
+            if p.module_id not in completed_module_sections:
+                completed_module_sections[p.module_id] = set()
+            completed_module_sections[p.module_id].add(p.section_id)
 
         quiz_attempts = attempts_by_user.get(c.id, [])
         attempt_map = {a.question_id: a.is_correct for a in quiz_attempts}
@@ -997,8 +999,8 @@ def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] 
         module_stats = []
         for m in modules:
             total_sections = total_sections_by_module.get(m.id, 0)
-            completed = completed_module_sections.get(m.id, 0)
-            progress = int((completed / total_sections) * 100) if total_sections > 0 else 0
+            completed = len(completed_module_sections.get(m.id, set()))
+            progress = min(100, int((completed / total_sections) * 100)) if total_sections > 0 else 0
             total_progress += progress
 
             module_questions = 0
