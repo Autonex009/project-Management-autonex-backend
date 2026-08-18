@@ -97,3 +97,57 @@ class EmployeeAllocationStatus(BaseModel):
     max_capacity: int
     utilization_percent: float
 
+class AllocatedEmployeePreview(BaseModel):
+    allocation_id: int
+    employee_id: int
+    name: str
+    avatar_url: Optional[str] = None
+    is_pm: bool = False
+    is_lead: bool = False
+    stale: bool = False
+
+
+class ProjectAllocationRow(BaseModel):
+    project_id: int
+    project_name: str
+    project_type: Optional[str] = None
+    required_manpower: int = 0
+    pm_slots: int = 0
+    lead_slots: int = 0
+    requested_manpower: int = 0
+    assigned_manpower: int = 0
+    stale_count: int = 0
+    wfo_count: int = 0
+    wfh_count: int = 0
+    on_leave_count: int = 0
+    allocated_preview: List[AllocatedEmployeePreview] = []
+    total_allocated_count: int = 0
+
+
+class AllocationsPageResponse(BaseModel):
+    items: List[ProjectAllocationRow]
+    page: int
+    page_size: int
+    total_items: int
+    total_pages: int
+
+
+class ProjectAllocationDetailItem(BaseModel):
+    allocation_id: int
+    employee_id: int
+    name: str
+    email: Optional[str] = None
+    avatar_url: Optional[str] = None
+    total_daily_hours: Optional[float] = None
+    role_tags: List[str] = []
+    is_pm: bool = False
+    is_lead: bool = False
+    stale: bool = False
+
+
+class ProjectAllocationDetailResponse(BaseModel):
+    project_id: int
+    project_name: str
+    required_manpower: int = 0
+    items: List[ProjectAllocationDetailItem] = []
+
