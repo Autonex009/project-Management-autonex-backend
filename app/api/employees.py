@@ -563,6 +563,186 @@ def employee_stats(db: Session = Depends(get_db)):
     }
 
 # ✅ GET EMPLOYEE BY ID
+@router.get("/team-kpi", response_model=dict, dependencies=[Depends(require_role("pm", "team_lead"))])
+def get_team_kpis(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from app.models.allocation import Allocation
+    from app.models.project import DailySheet
+    from app.models.leave import Leave
+    from app.services.project_scope import can_act_on_project, has_full_access
+    from datetime import date
+    
+    # 1. Get scoped projects
+    all_projects = db.query(DailySheet).all()
+    if has_full_access(current_user):
+        scoped_projects = all_projects
+    else:
+        scoped_projects = [p for p in all_projects if can_act_on_project(db, current_user, p)]
+    
+    scoped_project_ids = [p.id for p in scoped_projects]
+    
+    # Project Health
+    active_projects = sum(1 for p in scoped_projects if (p.project_status or "active").lower().strip() == "active")
+    on_hold_projects = sum(1 for p in scoped_projects if (p.project_status or "").lower().strip() == "on-hold")
+    completed_projects = sum(1 for p in scoped_projects if (p.project_status or "").lower().strip() == "completed")
+    
+    # 2. Get scoped employees & allocations
+    if not scoped_project_ids:
+        return {
+            "capacity": {"optimal": 0, "over": 0, "unassigned": 0},
+            "projects": {"active": active_projects, "on_hold": on_hold_projects, "completed": completed_projects},
+            "attendance": {"wfo": 0, "wfh": 0, "leave": 0},
+            "roles": {"tl": 0, "annotator": 0}
+        }
+        
+    allocations = db.query(Allocation).filter(
+        Allocation.sub_project_id.in_(scoped_project_ids),
+        Allocation.is_active == True
+    ).all()
+    
+    emp_hours = {}
+    emp_ids = set()
+    for a in allocations:
+        if a.employee_id:
+            emp_ids.add(a.employee_id)
+            emp_hours[a.employee_id] = emp_hours.get(a.employee_id, 0) + (a.total_daily_hours or 0)
+            
+    optimal = sum(1 for h in emp_hours.values() if 6 <= h <= 8)
+    over = sum(1 for h in emp_hours.values() if h > 8)
+    unassigned = sum(1 for h in emp_hours.values() if h == 0)
+    
+    # 3. Attendance
+    today = date.today().isoformat()
+    leaves = db.query(Leave).filter(
+        Leave.employee_id.in_(emp_ids),
+        Leave.start_date <= today,
+        Leave.end_date >= today,
+        Leave.status == "Approved"
+    ).all()
+    on_leave_ids = {l.employee_id for l in leaves}
+    
+    employees = db.query(Employee).filter(Employee.id.in_(emp_ids)).all()
+    wfo = 0
+    wfh = 0
+    for e in employees:
+        if e.id in on_leave_ids:
+            continue
+        wm = (e.work_model or "WFO").upper()
+        if "WFO" in wm or "OFFICE" in wm:
+            wfo += 1
+        else:
+            wfh += 1
+            
+    # 4. Roles
+    tl_count = sum(1 for e in employees if "lead" in (e.designation or "").lower() or "tl" in (e.designation or "").lower())
+    annotator_count = sum(1 for e in employees if "annotator" in (e.designation or "").lower() or "reviewer" in (e.designation or "").lower())
+    
+    return {
+        "capacity": {"optimal": optimal, "over": over, "unassigned": unassigned},
+        "projects": {"active": active_projects, "on_hold": on_hold_projects, "completed": completed_projects},
+        "attendance": {"wfo": wfo, "wfh": wfh, "leave": len(on_leave_ids)},
+        "roles": {"tl": tl_count, "annotator": annotator_count}
+    }
+
+
+@router.get("/team-data", response_model=dict, dependencies=[Depends(require_role("pm", "team_lead"))])
+def get_team_data(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from app.models.allocation import Allocation
+    from app.models.project import DailySheet
+    from app.models.parent_project import MainProject
+    from app.schemas.employee import EmployeeResponse
+    from app.services.project_scope import can_act_on_project, has_full_access
+    
+    all_projects = db.query(DailySheet).all()
+    if has_full_access(current_user):
+        scoped_projects = all_projects
+    else:
+        scoped_projects = [p for p in all_projects if can_act_on_project(db, current_user, p)]
+        
+    scoped_project_ids = [p.id for p in scoped_projects]
+    
+    if not scoped_project_ids:
+        return {"projects": [], "allocations": [], "employees": []}
+        
+    allocations = db.query(Allocation).filter(
+        Allocation.sub_project_id.in_(scoped_project_ids),
+        Allocation.is_active == True
+    ).all()
+    
+    emp_ids = list(set([a.employee_id for a in allocations if a.employee_id]))
+    
+    employees = db.query(Employee).filter(Employee.id.in_(emp_ids)).all()
+    
+    # Fetch leaves and wfh requests for these employees
+    from app.models.leave import Leave
+    from app.models.wfh import WFHRequest
+    
+    leaves = db.query(Leave).filter(Leave.employee_id.in_(emp_ids)).all()
+    wfh_requests = db.query(WFHRequest).filter(WFHRequest.employee_id.in_(emp_ids)).all()
+
+    # We only return the specific fields the frontend needs to avoid sending huge payloads
+    return {
+        "projects": [
+            {
+                "id": p.id,
+                "name": p.name,
+                "client": p.client,
+                "project_status": p.project_status,
+                "main_project_id": p.main_project_id
+            } for p in scoped_projects
+        ],
+        "allocations": [
+            {
+                "id": a.id,
+                "employee_id": a.employee_id,
+                "sub_project_id": a.sub_project_id,
+                "total_daily_hours": a.total_daily_hours
+            } for a in allocations
+        ],
+        "employees": [EmployeeResponse.model_validate(e).model_dump(mode='json') for e in employees],
+        "leaves": [
+            {
+                "id": l.id,
+                "leave_id": l.id,
+                "employee_id": l.employee_id,
+                "start_date": l.start_date.isoformat() if l.start_date else None,
+                "end_date": l.end_date.isoformat() if l.end_date else None,
+                "status": l.status,
+                "leave_type": l.leave_type,
+                "reason": l.reason,
+                "is_half_day": l.is_half_day,
+                "half_day_slot": l.half_day_slot,
+                "is_emergency": getattr(l, "is_emergency", False),
+                "flagged": getattr(l, "flagged", False),
+                "approval_remark": getattr(l, "approval_remark", None),
+                "approved_by": l.approved_by,
+                "created_at": l.created_at.isoformat() if getattr(l, "created_at", None) else None,
+                "updated_at": l.updated_at.isoformat() if getattr(l, "updated_at", None) else None,
+            } for l in leaves
+        ],
+        "wfh_requests": [
+            {
+                "id": w.id,
+                "employee_id": w.employee_id,
+                "wfh_date": w.wfh_date.isoformat() if w.wfh_date else None,
+                "start_date": w.wfh_date.isoformat() if w.wfh_date else None,
+                "end_date": w.end_date.isoformat() if w.end_date else None,
+                "status": w.status,
+                "reason": w.reason,
+                "remark": w.remark,
+                "flagged": getattr(w, "flagged", False),
+                "approved_by": w.approved_by,
+                "created_at": w.created_at.isoformat() if w.created_at else None
+            } for w in wfh_requests
+        ]
+    }
+
+
 @router.get("/{employee_id}", response_model=EmployeeResponse)
 def get_employee(
     employee_id: int,
@@ -1353,150 +1533,3 @@ def delete_employee_avatar(
     return employee
 
 
-@router.get("/team-kpi", response_model=dict, dependencies=[Depends(require_role("pm", "team_lead"))])
-def get_team_kpis(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    from app.models.allocation import Allocation
-    from app.models.project import DailySheet
-    from app.models.leave import Leave
-    from app.services.project_scope import can_act_on_project, has_full_access
-    from datetime import date
-    
-    # 1. Get scoped projects
-    all_projects = db.query(DailySheet).all()
-    if has_full_access(current_user):
-        scoped_projects = all_projects
-    else:
-        scoped_projects = [p for p in all_projects if can_act_on_project(db, current_user, p)]
-    
-    scoped_project_ids = [p.id for p in scoped_projects]
-    
-    # Project Health
-    active_projects = sum(1 for p in scoped_projects if (p.project_status or "active").lower().strip() == "active")
-    on_hold_projects = sum(1 for p in scoped_projects if (p.project_status or "").lower().strip() == "on-hold")
-    completed_projects = sum(1 for p in scoped_projects if (p.project_status or "").lower().strip() == "completed")
-    
-    # 2. Get scoped employees & allocations
-    if not scoped_project_ids:
-        return {
-            "capacity": {"optimal": 0, "over": 0, "unassigned": 0},
-            "projects": {"active": active_projects, "on_hold": on_hold_projects, "completed": completed_projects},
-            "attendance": {"wfo": 0, "wfh": 0, "leave": 0},
-            "roles": {"tl": 0, "annotator": 0}
-        }
-        
-    allocations = db.query(Allocation).filter(
-        Allocation.sub_project_id.in_(scoped_project_ids),
-        Allocation.is_active == True
-    ).all()
-    
-    emp_hours = {}
-    emp_ids = set()
-    for a in allocations:
-        if a.employee_id:
-            emp_ids.add(a.employee_id)
-            emp_hours[a.employee_id] = emp_hours.get(a.employee_id, 0) + (a.total_daily_hours or 0)
-            
-    optimal = sum(1 for h in emp_hours.values() if 6 <= h <= 8)
-    over = sum(1 for h in emp_hours.values() if h > 8)
-    unassigned = sum(1 for h in emp_hours.values() if h == 0)
-    
-    # 3. Attendance
-    today = date.today().isoformat()
-    leaves = db.query(Leave).filter(
-        Leave.employee_id.in_(emp_ids),
-        Leave.start_date <= today,
-        Leave.end_date >= today,
-        Leave.status == "Approved"
-    ).all()
-    on_leave_ids = {l.employee_id for l in leaves}
-    
-    employees = db.query(Employee).filter(Employee.id.in_(emp_ids)).all()
-    wfo = 0
-    wfh = 0
-    for e in employees:
-        if e.id in on_leave_ids:
-            continue
-        wm = (e.work_model or "WFO").upper()
-        if "WFO" in wm or "OFFICE" in wm:
-            wfo += 1
-        else:
-            wfh += 1
-            
-    # 4. Roles
-    tl_count = sum(1 for e in employees if "lead" in (e.designation or "").lower() or "tl" in (e.designation or "").lower())
-    annotator_count = sum(1 for e in employees if "annotator" in (e.designation or "").lower() or "reviewer" in (e.designation or "").lower())
-    
-    return {
-        "capacity": {"optimal": optimal, "over": over, "unassigned": unassigned},
-        "projects": {"active": active_projects, "on_hold": on_hold_projects, "completed": completed_projects},
-        "attendance": {"wfo": wfo, "wfh": wfh, "leave": len(on_leave_ids)},
-        "roles": {"tl": tl_count, "annotator": annotator_count}
-    }
-
-
-@router.get("/team-data", response_model=dict, dependencies=[Depends(require_role("pm", "team_lead"))])
-def get_team_data(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    from app.models.allocation import Allocation
-    from app.models.project import DailySheet
-    from app.models.parent_project import MainProject
-    from app.schemas.employee import EmployeeResponse
-    from app.services.project_scope import can_act_on_project, has_full_access
-    
-    all_projects = db.query(DailySheet).all()
-    if has_full_access(current_user):
-        scoped_projects = all_projects
-    else:
-        scoped_projects = [p for p in all_projects if can_act_on_project(db, current_user, p)]
-        
-    scoped_project_ids = [p.id for p in scoped_projects]
-    
-    if not scoped_project_ids:
-        return {"projects": [], "allocations": [], "employees": []}
-        
-    allocations = db.query(Allocation).filter(
-        Allocation.sub_project_id.in_(scoped_project_ids),
-        Allocation.is_active == True
-    ).all()
-    
-    emp_ids = list(set([a.employee_id for a in allocations if a.employee_id]))
-    
-    employees = db.query(Employee).filter(Employee.id.in_(emp_ids)).all()
-    
-    # Fetch leaves and wfh requests for these employees
-    from app.models.leave import Leave
-    from app.models.wfh import WFHRequest
-    from app.schemas.leave import LeaveResponse
-    from app.schemas.wfh import WFHRequestResponse
-    
-    leaves = db.query(Leave).filter(Leave.employee_id.in_(emp_ids)).all()
-    wfh_requests = db.query(WFHRequest).filter(WFHRequest.employee_id.in_(emp_ids)).all()
-
-    # We only return the specific fields the frontend needs to avoid sending huge payloads
-    return {
-        "projects": [
-            {
-                "id": p.id,
-                "name": p.name,
-                "client": p.client,
-                "project_status": p.project_status,
-                "main_project_id": p.main_project_id
-            } for p in scoped_projects
-        ],
-        "allocations": [
-            {
-                "id": a.id,
-                "employee_id": a.employee_id,
-                "sub_project_id": a.sub_project_id,
-                "total_daily_hours": a.total_daily_hours
-            } for a in allocations
-        ],
-        "employees": [EmployeeResponse.model_validate(e).model_dump(mode='json') for e in employees],
-        "leaves": [LeaveResponse.model_validate(l).model_dump(mode='json') for l in leaves],
-        "wfh_requests": [WFHRequestResponse.model_validate(w).model_dump(mode='json') for w in wfh_requests]
-    }
