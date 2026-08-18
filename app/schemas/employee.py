@@ -119,6 +119,8 @@ class EmployeeResponse(EmployeeBase):
     previous_employee_type: Optional[str] = None
     converted_to_fulltime_at: Optional[datetime] = None
     converted_by: Optional[int] = None
+    assigned_projects: Optional[List[str]] = Field(default_factory=list)
+    managers: Optional[List[str]] = Field(default_factory=list)
     created_at: datetime
     updated_at: datetime
 

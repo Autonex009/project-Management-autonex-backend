@@ -66,11 +66,13 @@ class PerformanceReviewResponse(BaseModel):
         from_attributes = True
 
 
-@router.get("", response_model=list[PerformanceReviewResponse])
+@router.get("", response_model=dict)
 def list_reviews(
     employee_id: Optional[int] = None,
     reviewer_id: Optional[int] = None,
     review_type: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=100),
     db: Session = Depends(get_db),
 ):
     query = db.query(PerformanceReview)
@@ -81,7 +83,17 @@ def list_reviews(
     if review_type:
         query = query.filter(PerformanceReview.review_type == review_type)
         
-    return query.order_by(PerformanceReview.created_at.desc()).all()
+    total = query.count()
+    items = query.order_by(PerformanceReview.created_at.desc())\
+                 .offset((page - 1) * limit)\
+                 .limit(limit).all()
+                 
+    return {
+        "items": [PerformanceReviewResponse.model_validate(item).model_dump() for item in items],
+        "total": total,
+        "page": page,
+        "limit": limit
+    }
 
 
 @router.get("/{review_id}", response_model=PerformanceReviewResponse)
