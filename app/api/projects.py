@@ -498,6 +498,7 @@ def _get_filtered_enriched_projects(
 
 @router.get("/paginated", response_model=dict)
 def list_projects_paginated(
+    is_dashboard: bool = Query(False),
     page: int = Query(1, ge=1),
     limit: int = Query(5, ge=1, le=100),
     search: str | None = None,
@@ -522,7 +523,20 @@ def list_projects_paginated(
     paginated_projects = filtered[(page - 1) * limit : page * limit]
     
     # Enrich ONLY the visible projects for full payload response
-    items = [enrich_project_response(db, p) for p in paginated_projects]
+
+    if is_dashboard:
+        items = [{
+            "id": p.id,
+            "name": p.name,
+            "client": p.client,
+            "sentiment": p.sentiment,
+            "encord_project_hash": p.encord_project_hash,
+            "autonex_annotators": p.autonex_annotators,
+            "autonex_reviewers": p.autonex_reviewers
+        } for p in paginated_projects]
+    else:
+        items = [enrich_project_response(db, p) for p in paginated_projects]
+
     
     return {
         "items": items,

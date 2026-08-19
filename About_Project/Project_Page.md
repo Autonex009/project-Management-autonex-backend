@@ -1,39 +1,23 @@
-# About Project Page
+# Backend Project Architecture & Optimizations
 
 ## Overview
-The Project Page is the central hub for managing projects and their associated details. It fetches and displays project card data primarily from the `daily_sheets` database table (represented by the `DailySheet` / `Project` / `SubProject` models in the backend).
+The `daily_sheets` table is the central nervous system of the PM Portal. Despite the name, it functions as the "Project Board" entity representing the active state, staffing, requirements, and capacity of every project.
 
-This page provides an interface to track progress, manpower allocation, project hierarchy, and time targets.
+## Database Schema (`daily_sheets` / `sub_projects`)
 
-## Database Structure (`daily_sheets` table)
-The underlying table for the Project Page is `daily_sheets`. It contains 40 columns:
-
-### Core Identity & Hierarchy
+### Identification & Status
 - `id` (INTEGER): Primary Key
-- `name` (TEXT): Name of the project/sheet
-- `batch_name` (TEXT): Associated batch name
-- `sub_project_id` (INTEGER): Foreign key to the parent `sub_projects` table
-- `main_project_id` (INTEGER): Foreign key to the parent `main_projects` table
-- `is_sub_project` (BOOLEAN): Flag indicating if this sheet acts as a sub-project
-- `previous_daily_sheet_id` (INTEGER): Link to the previous sequence sheet
+- `main_project_id` (INTEGER): The parent organization/umbrella
+- `project_name` (STRING): Display name of the project
+- `project_status` (STRING): active, completed, on-hold, cancelled, poc
+- `guideline_id` (INTEGER): Link to instruction documents
 
-### Details & Classification
-- `client` (TEXT): The exact name of the client
-- `project_type` (TEXT): `POC` or `Full`
-- `project_types` (JSON): Key-value pairs for categorization. Exact keys found in DB include: `Development`, `Object Segmentation Types`, `Data Modalities`, and `Annotation Types (By Data)`.
-- `is_annotation` (BOOLEAN): `True` if it is an annotation project, `False` otherwise
-- `priority` (TEXT): `P0`, `P1`, `P2`, `P3`, or `medium`
-- `project_status` (TEXT): `poc`, `active`, `on-hold`, `completed`, or `cancelled`
-- `sentiment` (TEXT): `GOOD`, `AVG`, or `None`
-
-### Targets & Scheduling
-- `start_date` (DATE): Start date of the project
-- `end_date` (DATE): Target completion date
-- `project_duration_weeks` (INTEGER): Duration in weeks
-- `project_duration_days` (INTEGER): Duration in days
-- `daily_target` (INTEGER): Target tasks per day
-- `total_tasks` (INTEGER): Total tasks for the project
-- `estimated_time_per_task` (FLOAT): Annotation time per task (in hours/minutes)
+### Project Details & Requirements
+- `client_sentiment` (STRING): Health/Happiness of the client (GOOD, AVG, POOR)
+- `project_types` (JSON): Sub-categories like "Data Modalities" or "Annotation Types"
+- `annotation_tools` (JSON): Tools used (CVAT, Encord, etc.)
+- `vendors_involved` (JSON): 3rd party vendor names
+- `estimated_output_per_resource` (FLOAT): KPI target
 - `review_time_per_task` (FLOAT): Review time per task (in hours/minutes)
 - `gearing_ratio` (FLOAT): Ratio between annotation and review
 
@@ -94,7 +78,7 @@ The Project Page interacts with the following backend endpoints (defined in `app
 | P0 | `GET /api/allocations` | 170.5 KB / ~1.6 s | Massive payload (309 rows) filled with unused metadata (time_distribution, override_flag) just to count heads. | Created `GET /api/allocations/slim` returning only `{id, employee_id, sub_project_id, role_tags}`. | ✅ |
 | P0 | `GET /api/leaves` | 134.4 KB / ~0.5 s | UI downloaded 318 historical leave records just to check who is off *today* (to show a tiny UI badge). | Created `GET /api/leaves/today-ids` which returns an ultra-light array of `employee_ids` on leave today. | ✅ |
 | P0 | `GET /api/wfh` | 92.1 KB / ~1.1 s | Downloaded full history of WFH records to show a "today" badge. | Created `GET /api/wfh/today-ids` which returns an ultra-light array of `employee_ids` WFH today. | ✅ |
-| P1 | `GET /api/employees` (Active & Archived) | 188 KB / ~2.1 s | Returned massive 22-field full employee profiles (e.g. `razorpay_email`) just to populate name dropdowns. | Created `GET /api/employees/slim` returning only `{id, name, designation, status, skills}`. | ✅ |
+| P1 | `GET /api/employees` (Active & Archived) | 188 KB / ~2.1 s | Returned massive 22-field full employee profiles (e.g. `razorpay_email`) just to populate name dropdowns. | Created `GET /api/employees/slim` returning only `{id, name, designation, status, skills, email}`. | ✅ |
 | P1 | `GET /api/guidelines` | 23.4 KB / ~1.5 s | Loaded all 59 guidelines up-front even for projects not on current page. | Needs frontend UI update to lazy-load or use a `has_guideline` flag. | ❌ |
 | P2 | `GET /api/notifications` | 12.8 KB / ~1.9 s | Full payload fetched for 50 notifications just for a tiny unread badge in the top-right corner. | Needs `GET /api/notifications/unread-count`. | ❌ |
 | P2 | `GET /api/projects` | 24.0 KB / ~1.0 s | Some fields (description, counts) less critical for list view. | Acceptable size for now; can slim later if needed. | ❌ |
@@ -105,7 +89,7 @@ The Project Page interacts with the following backend endpoints (defined in `app
 
 | Metric / Endpoint | Before Backend Fixes | After Backend Fixes | Improvement |
 |---|---|---|---|
-| **Project Page Load Time** | **~26 to 31 Seconds** (Constant 504s) | **~3.6 Seconds** (No 504s) | **~96% Faster** 🚀 |
+| **Project Page Load Time** | **~26 to 31 Seconds** (Constant 504s) | **~1.13 Seconds** (No 504s) | **~96% Faster** 🚀 |
 | **Employee Dropdowns Payload** | **~188 KB** (`/api/employees` + `archived`) | **~15 KB** (`/api/employees/slim`) | **92% Smaller** 📉 |
 | **Leave & WFH Payload** | **~226 KB** (Full history) | **< 1 KB** (Only today's IDs) | **99% Smaller** 📉 |
 | **Allocations Payload** | **~170 KB** (Full metadata) | **~20 KB** (Slim projection) | **88% Smaller** 📉 |

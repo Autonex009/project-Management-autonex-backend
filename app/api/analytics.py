@@ -11,7 +11,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -47,9 +47,18 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
     allocated_employee_ids = db.query(Allocation.employee_id).filter(Allocation.is_active == True).distinct().all()
     allocated_employee_ids = [r[0] for r in allocated_employee_ids]
 
+    today = date.today()
+    on_leave_today_query = db.query(Leave.employee_id).filter(
+        Leave.start_date <= today,
+        Leave.end_date >= today,
+        Leave.status == "approved"
+    ).all()
+    on_leave_ids = [r[0] for r in on_leave_today_query]
+    
     idle_count = db.query(Employee).filter(
         Employee.status == "active",
-        Employee.id.notin_(allocated_employee_ids)
+        Employee.id.notin_(allocated_employee_ids),
+        Employee.id.notin_(on_leave_ids) if on_leave_ids else True
     ).count()
 
     # Employee Breakdown by Type & Designation
@@ -58,8 +67,6 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
 
     emp_desig_stats = db.query(Employee.designation, func.count(Employee.id)).filter(Employee.status != "archived").group_by(Employee.designation).all()
     by_designation = {k: v for k, v in emp_desig_stats if k}
-
-    today = date.today()
 
     # 2. Leaves
     leave_stats = db.query(Leave.status, func.count(Leave.id)).group_by(Leave.status).all()
@@ -109,20 +116,50 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
     project_stats = db.query(DailySheet.project_status, func.count(DailySheet.id)).group_by(DailySheet.project_status).all()
     proj_dict = dict(project_stats)
     
+
+    from app.models.parent_project import MainProject
+    import json
+
+    active_projects = db.query(DailySheet.project_status, DailySheet.workforce_vendors, DailySheet.client).filter(
+        DailySheet.project_status.notin_(["completed", "on-hold", "cancelled"])
+    ).all()
+
+    by_organisation = {}
+    by_vendor = {}
+
+    for _, vendors, client in active_projects:
+        org_name = client or "Internal"
+        by_organisation[org_name] = by_organisation.get(org_name, 0) + 1
+        
+        if vendors and isinstance(vendors, list):
+            if len(vendors) == 0:
+                by_vendor["Internal"] = by_vendor.get("Internal", 0) + 1
+            else:
+                for v in vendors:
+                    v_name = v if isinstance(v, str) else v.get("name", "Unknown")
+                    by_vendor[v_name] = by_vendor.get(v_name, 0) + 1
+        else:
+            by_vendor["Internal"] = by_vendor.get("Internal", 0) + 1
+
+    org_list = [{"label": k, "value": v} for k, v in sorted(by_organisation.items(), key=lambda x: x[1], reverse=True)]
+    vendor_list = [{"label": k, "value": v} for k, v in sorted(by_vendor.items(), key=lambda x: x[1], reverse=True)]
+
     return {
         "employees": {
             "total": sum(emp_dict.values()),
-            "active": emp_dict.get("active", 0),
-            "inactive": emp_dict.get("inactive", 0),
+            "active": max(0, sum(emp_dict.values()) - on_leave_today_count - idle_count),
+            "inactive": on_leave_today_count,
             "idle": idle_count,
             "by_type": by_type,
             "by_designation": by_designation,
-            "by_work_model": {"WFO": sum(emp_dict.values()), "WFH": 0, "Hybrid": 0}
+            
         },
         "projects": {
             "total": sum(proj_dict.values()),
-            "active": proj_dict.get("active", 0),
-            "archived": proj_dict.get("archived", 0),
+            "active": proj_dict.get("active", 0) + proj_dict.get("poc", 0) + proj_dict.get("in-progress", 0),
+            "archived": proj_dict.get("completed", 0) + proj_dict.get("on-hold", 0) + proj_dict.get("cancelled", 0),
+            "by_organisation": org_list,
+            "by_vendor": vendor_list,
         },
         "leaves": {
             "to_review": leave_dict.get("pending", 0),
@@ -510,6 +547,7 @@ def project_analytics(
 
 @router.get("/summary")
 def summary(
+    fields: Optional[str] = Query(None, description="Comma-separated list of fields to return"),
     range: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -530,6 +568,29 @@ def summary(
     if allowed_ids is not None:
         query = query.filter(DailySheet.id.in_(allowed_ids))
     projects = query.all()
+
+    # Fast path for dashboard slim query to prevent N+1 bottleneck
+    if fields == "project_id,autonex_platform_hours":
+        from sqlalchemy import func
+        rows = db.query(
+            EncordDailyTimeSpent.encord_project_hash,
+            func.sum(EncordDailyTimeSpent.time_spent_seconds)
+        ).filter(
+            EncordDailyTimeSpent.metric_date >= start,
+            EncordDailyTimeSpent.metric_date <= end,
+            EncordDailyTimeSpent.user_email.ilike("%_theta@encord.ai")
+        ).group_by(EncordDailyTimeSpent.encord_project_hash).all()
+        
+        hours_map = {h: _hours(secs) for h, secs in rows if h}
+        
+        out = []
+        for sp in projects:
+            out.append({
+                "project_id": sp.id,
+                "autonex_platform_hours": hours_map.get(sp.encord_project_hash, 0)
+            })
+        out.sort(key=lambda p: p["autonex_platform_hours"], reverse=True)
+        return out
 
     out = []
     for sp in projects:
@@ -577,7 +638,7 @@ def summary(
         # Resolve Encord emails -> employee display names (falls back to the email).
         names_map = _names_for(db, ax_annotators | ax_reviewers)
         disp = lambda emails: sorted(names_map.get(e, e) for e in emails)
-        out.append({
+        item = {
             "project_id": sp.id,
             "name": sp.name,
             "client": sp.client,
@@ -586,11 +647,9 @@ def summary(
             "month_platform_hours": _hours(total_seconds),
             "active_annotators": len(active_users),
             "people_involved": len(people),
-            # Autonex-only billing figures (team members: *_theta@encord.ai)
             "autonex_platform_hours": _hours(ax_total),
             "autonex_active_annotators": len(ax_annotators),
             "autonex_active_reviewers": len(ax_reviewers),
-            # Mutually exclusive head-count buckets (+ names for hover)
             "autonex_annotator_only": len(ax_ann_only),
             "autonex_reviewer_only": len(ax_rev_only),
             "autonex_both": len(ax_both),
@@ -599,7 +658,11 @@ def summary(
             "autonex_both_names": disp(ax_both),
             "autonex_people": len(ax_people),
             "sentiment": sp.sentiment,
-        })
+        }
+        if fields:
+            field_list = fields.split(",")
+            item = {k: v for k, v in item.items() if k in field_list}
+        out.append(item)
     out.sort(key=lambda p: p["autonex_platform_hours"], reverse=True)
     return out
 
