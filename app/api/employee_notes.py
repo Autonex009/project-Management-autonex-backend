@@ -63,7 +63,7 @@ def create_employee_note(
     payload: EmployeeNoteCreate,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm", "hr")),
+    current_user: User = Depends(require_role("admin", "pm", "hr", "team_lead")),
 ):
     if payload.type not in ALLOWED_TYPES:
         raise HTTPException(status_code=400, detail="Invalid type")
@@ -190,7 +190,7 @@ def update_employee_note(
     payload: EmployeeNoteUpdate,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm", "hr")),
+    current_user: User = Depends(require_role("admin", "pm", "hr", "team_lead")),
 ):
     note = db.query(EmployeeNote).filter(EmployeeNote.id == note_id).first()
     if not note:
@@ -247,7 +247,7 @@ def resolve_employee_note(
     payload: EmployeeNoteResolve,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm", "hr")),
+    current_user: User = Depends(require_role("admin", "pm", "hr", "team_lead")),
 ):
     note = db.query(EmployeeNote).filter(EmployeeNote.id == note_id).first()
     if not note:
@@ -292,7 +292,7 @@ def delete_employee_note(
     note_id: int,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm", "hr")),
+    current_user: User = Depends(require_role("admin", "pm", "hr", "team_lead")),
 ):
     note = db.query(EmployeeNote).filter(EmployeeNote.id == note_id).first()
     if not note:

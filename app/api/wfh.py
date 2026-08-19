@@ -15,6 +15,7 @@ from app.models.user import User
 from app.models.notification import Notification
 from types import SimpleNamespace
 from app.api.leaves import _get_pm_notification_targets, _get_admin_notification_targets
+from app.services.slack_service import try_send_pm_wfh_request_message, try_send_wfh_status_message
 from app.constants.leave_types import is_intern_or_contractor
 
 from sqlalchemy import or_
@@ -441,6 +442,8 @@ def create_wfh_request(
     notify_admins = escalates_to_admin or escalates_to_pm or not pm_targets
 
     notified_user_ids: set[int] = set()
+    duration_days = (end_date - req.wfh_date).days + 1
+
     for target in pm_targets:
         # In-app notification for PM
         pm_emp_id = getattr(target["pm_employee"], "id", None)
@@ -455,9 +458,45 @@ def create_wfh_request(
                     "wfh_applied",
                 )
 
+        # Slack DM for PM
+        pm_slack_id = target.get("pm_slack_user_id")
+        if pm_slack_id:
+            try_send_pm_wfh_request_message(
+                pm_slack_user_id=pm_slack_id,
+                pm_name=getattr(target["pm_employee"], "name", "PM"),
+                employee_name=employee.name,
+                employee_email=employee.email,
+                employee_designation=employee.designation,
+                start_date=req.wfh_date.isoformat(),
+                end_date=end_date.isoformat(),
+                duration_days=duration_days,
+                reason=req.reason,
+                impacted_projects=target.get("impacted_projects", []),
+                wfh_id=req.id,
+            )
+
     # Admins: as a fallback when nobody else resolved, and additionally for a team lead's
     # own request, which is theirs to countersign alongside the program manager.
     if notify_admins:
+        # FUTURE: To expand this to HR/Admins, simply uncomment this block:
+        # admin_targets = _get_admin_notification_targets(db)
+        # for target in admin_targets:
+        #     admin_slack_id = target.get("pm_slack_user_id")
+        #     if admin_slack_id:
+        #         try_send_pm_wfh_request_message(
+        #             pm_slack_user_id=admin_slack_id,
+        #             pm_name=getattr(target["pm_employee"], "name", "Admin"),
+        #             employee_name=employee.name,
+        #             employee_email=employee.email,
+        #             employee_designation=employee.designation,
+        #             start_date=req.wfh_date.isoformat(),
+        #             end_date=end_date.isoformat(),
+        #             duration_days=duration_days,
+        #             reason=req.reason,
+        #             impacted_projects=target.get("impacted_projects", []),
+        #             wfh_id=req.id,
+        #         )
+
         for admin_user in db.query(User).filter(User.role == "admin", User.is_active == True).all():
             if admin_user.id not in notified_user_ids:
                 notified_user_ids.add(admin_user.id)
@@ -537,6 +576,15 @@ def approve_wfh(
             "wfh_approved")
         db.commit()
 
+    try_send_wfh_status_message(
+        employee_email=employee.email if employee else "unknown",
+        employee_name=employee.name if employee else "unknown",
+        start_date=req.wfh_date.isoformat(),
+        end_date=req.end_date.isoformat() if req.end_date else req.wfh_date.isoformat(),
+        pm_name=approver_name,
+        approved=True,
+    )
+
     return {"message": "WFH request approved", "wfh_id": wfh_id, "status": "approved"}
 
 
@@ -595,6 +643,15 @@ def reject_wfh(
             f"Your WFH request for {req.wfh_date} was declined by {approver_name}.",
             "wfh_rejected")
         db.commit()
+
+    try_send_wfh_status_message(
+        employee_email=employee.email if employee else "unknown",
+        employee_name=employee.name if employee else "unknown",
+        start_date=req.wfh_date.isoformat(),
+        end_date=req.end_date.isoformat() if req.end_date else req.wfh_date.isoformat(),
+        pm_name=approver_name,
+        approved=False,
+    )
 
     return {"message": "WFH request rejected", "wfh_id": wfh_id, "status": "rejected"}
 

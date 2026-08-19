@@ -302,11 +302,15 @@ def _get_pm_notification_targets(db: Session, employee: Employee, leave: Leave) 
 
         allocation_start = allocation.active_start_date or project.start_date
         allocation_end = allocation.active_end_date or project.end_date
-        if not allocation_start or not allocation_end:
+        if not allocation_start:
             continue
 
-        if not _date_ranges_overlap(leave.start_date, leave.end_date, allocation_start, allocation_end):
-            continue
+        if allocation_end:
+            if not _date_ranges_overlap(leave.start_date, leave.end_date, allocation_start, allocation_end):
+                continue
+        else:
+            if leave.end_date < allocation_start:
+                continue
 
         sub_project = sub_project_map.get(project.sub_project_id) if project.sub_project_id else None
         main_project = main_project_map.get(project.main_project_id) if project.main_project_id else None
@@ -1080,6 +1084,7 @@ def create_leave(
             duration_days=duration_days,
             reason=leave.reason,
             impacted_projects=target["impacted_projects"],
+            leave_id=leave.id,
         )
         # In-app notification for PM (real PM only — admin fallback handled below)
         pm_emp_id = getattr(target["pm_employee"], "id", None)
