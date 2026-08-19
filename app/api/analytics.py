@@ -30,114 +30,6 @@ from app.models.wfh import WFHRequest
 
 router = APIRouter(prefix="/api/analytics", tags=["Analytics"], dependencies=[Depends(require_role("admin", "pm"))])
 
-@router.get("/dashboard-kpis")
-def get_dashboard_kpis(db: Session = Depends(get_db)):
-    from app.models.employee import Employee
-    from app.models.project import DailySheet
-    from app.models.leave import Leave
-    from app.models.wfh import WFHRequest
-    from app.models.allocation import Allocation
-    from datetime import date
-    from sqlalchemy import func
-
-    # 1. Employee stats
-    emp_stats = db.query(Employee.status, func.count(Employee.id)).filter(Employee.status != "archived").group_by(Employee.status).all()
-    emp_dict = dict(emp_stats)
-
-    allocated_employee_ids = db.query(Allocation.employee_id).filter(Allocation.is_active == True).distinct().all()
-    allocated_employee_ids = [r[0] for r in allocated_employee_ids]
-
-    idle_count = db.query(Employee).filter(
-        Employee.status == "active",
-        Employee.id.notin_(allocated_employee_ids)
-    ).count()
-
-    # Employee Breakdown by Type & Designation
-    emp_type_stats = db.query(Employee.employee_type, func.count(Employee.id)).filter(Employee.status != "archived").group_by(Employee.employee_type).all()
-    by_type = {k: v for k, v in emp_type_stats if k}
-
-    emp_desig_stats = db.query(Employee.designation, func.count(Employee.id)).filter(Employee.status != "archived").group_by(Employee.designation).all()
-    by_designation = {k: v for k, v in emp_desig_stats if k}
-
-    today = date.today()
-
-    # 2. Leaves
-    leave_stats = db.query(Leave.status, func.count(Leave.id)).group_by(Leave.status).all()
-    leave_dict = dict(leave_stats)
-    
-    on_leave_today_query = db.query(Leave.employee_id, Employee.name).join(Employee, Leave.employee_id == Employee.id).filter(
-        Leave.start_date <= today,
-        Leave.end_date >= today,
-        Leave.status == "approved"
-    ).all()
-    on_leave_today_count = len(on_leave_today_query)
-    on_leave_today_people = [{"id": r[0], "name": r[1]} for r in on_leave_today_query]
-
-    pending_leaves = db.query(Leave.id, Leave.employee_id, Employee.name, Leave.start_date, Leave.end_date, Leave.is_emergency).join(Employee, Leave.employee_id == Employee.id).filter(Leave.status == "pending").all()
-    pending_leaves_list = [{
-        "id": l.id,
-        "employee_id": l.employee_id,
-        "employee_name": l.name,
-        "start_date": str(l.start_date),
-        "end_date": str(l.end_date) if l.end_date else str(l.start_date),
-        "is_emergency": l.is_emergency
-    } for l in pending_leaves]
-
-    # 3. WFH
-    wfh_stats = db.query(WFHRequest.status, func.count(WFHRequest.id)).group_by(WFHRequest.status).all()
-    wfh_dict = dict(wfh_stats)
-
-    on_wfh_today_query = db.query(WFHRequest.employee_id, Employee.name).join(Employee, WFHRequest.employee_id == Employee.id).filter(
-        WFHRequest.wfh_date <= today,
-        func.coalesce(WFHRequest.end_date, WFHRequest.wfh_date) >= today,
-        WFHRequest.status == "approved"
-    ).all()
-    on_wfh_today_count = len(on_wfh_today_query)
-    on_wfh_today_people = [{"id": r[0], "name": r[1]} for r in on_wfh_today_query]
-
-    pending_wfh = db.query(WFHRequest.id, WFHRequest.employee_id, Employee.name, WFHRequest.wfh_date, WFHRequest.end_date).join(Employee, WFHRequest.employee_id == Employee.id).filter(WFHRequest.status == "pending").all()
-    pending_wfh_list = [{
-        "id": w.id,
-        "employee_id": w.employee_id,
-        "employee_name": w.name,
-        "start_date": str(w.wfh_date),
-        "end_date": str(w.end_date) if w.end_date else str(w.wfh_date),
-        "is_emergency": False
-    } for w in pending_wfh]
-
-    # 4. Projects
-    project_stats = db.query(DailySheet.project_status, func.count(DailySheet.id)).group_by(DailySheet.project_status).all()
-    proj_dict = dict(project_stats)
-    
-    return {
-        "employees": {
-            "total": sum(emp_dict.values()),
-            "active": emp_dict.get("active", 0),
-            "inactive": emp_dict.get("inactive", 0),
-            "idle": idle_count,
-            "by_type": by_type,
-            "by_designation": by_designation,
-            "by_work_model": {"WFO": sum(emp_dict.values()), "WFH": 0, "Hybrid": 0}
-        },
-        "projects": {
-            "total": sum(proj_dict.values()),
-            "active": proj_dict.get("active", 0),
-            "archived": proj_dict.get("archived", 0),
-        },
-        "leaves": {
-            "to_review": leave_dict.get("pending", 0),
-            "on_leave": on_leave_today_count,
-            "today_people": on_leave_today_people,
-            "pending_list": pending_leaves_list
-        },
-        "wfh": {
-            "to_review": wfh_dict.get("pending", 0),
-            "on_wfh": on_wfh_today_count,
-            "today_people": on_wfh_today_people,
-            "pending_list": pending_wfh_list
-        }
-    }
-
 # Self-service router: any authenticated user, but every endpoint here is strictly
 # scoped to the caller's OWN Encord activity (resolved from their employee record).
 # It carries no admin/pm dependency so employees can see their own dashboard chart.
@@ -851,7 +743,7 @@ def my_encord_activity(
     """
     days = max(1, min(int(days or 7), 90))
 
-    if employee_id and current_user.role in ("admin", "pm", "hr", "team_lead"):
+    if employee_id and current_user.role in ("admin", "pm", "hr"):
         emp = db.query(Employee).filter(Employee.id == employee_id).first()
     else:
         emp = _resolve_employee(db, current_user)

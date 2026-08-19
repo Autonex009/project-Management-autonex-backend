@@ -20,41 +20,12 @@ logger = logging.getLogger(__name__)
 
 def _get_employee_hours(db: Session, start: date, end: date) -> dict[int, float]:
     """
-    Calculate real hours using EncordDailyTimeSpent.
-    Returns {employee_id: total_hours} for the given date range.
+    TODO: Replace this with your real hours calculation.
+    Should return {employee_id: total_hours} for the given date range.
+    Use your timesheet / daily_sheets / encord activity tables.
     """
-    from sqlalchemy import func
-    from app.models.employee import Employee
-    from app.models.encord_analytics import EncordDailyTimeSpent
-
-    employees = db.query(Employee).all()
-    emp_map = {}
-    for emp in employees:
-        if emp.encord_id:
-            emp_map[emp.encord_id] = emp.id
-        if emp.email:
-            emp_map[emp.email] = emp.id
-
-    results = (
-        db.query(
-            EncordDailyTimeSpent.user_email,
-            func.sum(EncordDailyTimeSpent.time_spent_seconds).label("total_seconds")
-        )
-        .filter(
-            EncordDailyTimeSpent.metric_date >= start,
-            EncordDailyTimeSpent.metric_date <= end,
-        )
-        .group_by(EncordDailyTimeSpent.user_email)
-        .all()
-    )
-
-    hours_by_emp = {}
-    for user_email, total_seconds in results:
-        emp_id = emp_map.get(user_email)
-        if emp_id:
-            hours_by_emp[emp_id] = hours_by_emp.get(emp_id, 0.0) + (total_seconds / 3600.0)
-
-    return hours_by_emp
+    # Example placeholder – replace with real query
+    return {}
 
 
 def run_weekly_badge_job() -> dict:
