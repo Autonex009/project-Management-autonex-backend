@@ -42,6 +42,40 @@ from app.services.slack_service import (
 
 TEAM_LEAD_TAG = "Team Lead"  # matches TEAM_LEAD_ROLE_TAG in sub_projects.py / TEAM_LEAD_TAG in frontend
 
+
+def sync_project_allocations(db, project_id: int):
+    from app.models.project import Project
+    from app.models.allocation import Allocation
+    from app.services import project_scope
+    from app.api.projects import _autonex_headcount
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project: return
+
+    allocs = db.query(Allocation).filter(
+        Allocation.sub_project_id == project_id,
+        Allocation.is_active == True
+    ).all()
+
+    project.allocated_employees = len(allocs)
+
+    lead_count = 0
+    pm_ids = set()
+
+    for a in allocs:
+        if a.role_tags and "Team Lead" in a.role_tags:
+            lead_count += 1
+        elif project_scope.escalates_to_admin(db, a.employee_id):
+            pm_ids.add(a.employee_id)
+
+    project.team_lead_count = lead_count
+    project.team_manager_count = len(pm_ids)
+    
+    # Strictly sync assigned_employee_ids to the active PM allocations
+    project.assigned_employee_ids = list(pm_ids)
+    
+    project.required_manpower = _autonex_headcount(project)
+
 router = APIRouter(prefix="/api/allocations", tags=["Allocations"], dependencies=[Depends(get_current_user)])
 
 def _resolve_pm_ids(project: Project, main_project_map: dict, employee_map: dict) -> list[int]:
@@ -273,15 +307,40 @@ def get_project_allocation_detail(
             ))
 
     items = []
+    
+    today = date_cls.today()
+    leaves = db.query(Leave).filter(
+        Leave.employee_id.in_(employee_ids),
+        Leave.status == "approved",
+        Leave.start_date <= today,
+        Leave.end_date >= today
+    ).all() if employee_ids else []
+    on_leave_ids = {leave.employee_id for leave in leaves}
+
+    wfhs = db.query(WFHRequest).filter(
+        WFHRequest.employee_id.in_(employee_ids),
+        WFHRequest.status == "approved",
+        WFHRequest.wfh_date <= today,
+        (WFHRequest.end_date >= today) | (WFHRequest.end_date.is_(None))
+    ).all() if employee_ids else []
+    wfh_ids = {wfh.employee_id for wfh in wfhs}
+
     for a in allocs:
         emp = employee_map.get(a.employee_id)
         stale = emp is None or emp.status == "archived"
+        
+        is_wfh = emp and emp.id in wfh_ids
+        location = "WFH" if is_wfh else ("WFO" if emp else None)
+        
         items.append(ProjectAllocationDetailItem(
             allocation_id=a.id,
             employee_id=a.employee_id,
             name=(emp.name if emp else "Former employee"),
             email=(emp.email if emp else None),
             avatar_url=(emp.avatar_url if emp else None),
+            designation=(emp.designation if emp else None),
+            location=location,
+            is_on_leave=bool(emp and emp.id in on_leave_ids),
             total_daily_hours=a.total_daily_hours,
             role_tags=a.role_tags or [],
             is_pm=a.employee_id in pm_ids,
@@ -559,14 +618,8 @@ def create_allocation(
     db.add(allocation)
     db.flush()  # Flush to include the new allocation in the count query
 
-    # Sync project allocated_employees count from actual allocation records
-    actual_count = 0
-    if project:
-        actual_count = db.query(Allocation).filter(
-            Allocation.sub_project_id == data.sub_project_id,
-            Allocation.is_active == True
-        ).count()
-        project.allocated_employees = actual_count
+    # Sync project allocated_employees and role counts dynamically
+    sync_project_allocations(db, data.sub_project_id)
 
     allocated_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
     allocated_name = allocated_employee.name if allocated_employee else None
@@ -619,6 +672,14 @@ def create_allocation(
         }
     return response
 
+
+@router.get("/slim")
+def get_allocations_slim(db: Session = Depends(get_db)):
+    """Ultra-lightweight endpoint for popovers and UI counting."""
+    allocs = db.query(Allocation.id, Allocation.employee_id, Allocation.sub_project_id, Allocation.role_tags).filter(
+        Allocation.is_active == True
+    ).all()
+    return [{"id": a[0], "employee_id": a[1], "sub_project_id": a[2], "role_tags": a[3]} for a in allocs]
 
 @router.get("", response_model=List[dict], dependencies=[Depends(require_role("admin", "pm"))])
 def get_allocations(db: Session = Depends(get_db)):
@@ -935,13 +996,9 @@ def delete_allocation(
     db.delete(allocation)
     db.flush()
 
-    # Sync project allocated_employees count from actual allocation records
+    # Sync project allocated_employees and role counts dynamically
     if project:
-        actual_count = db.query(Allocation).filter(
-            Allocation.sub_project_id == sub_project_id,
-            Allocation.is_active == True
-        ).count()
-        project.allocated_employees = actual_count
+        sync_project_allocations(db, sub_project_id)
 
     db.commit()
 

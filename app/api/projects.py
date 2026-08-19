@@ -156,10 +156,21 @@ def enrich_project_response(db: Session, project: Project) -> dict:
             continue
         allocated_employee_ids.append(alloc.employee_id)
             
+    # Bulk fetch designations to avoid N+1 escalates_to_admin queries
+    from app.models.employee import Employee
+    emp_designations = {}
+    if allocated_employee_ids:
+        emps_query = db.query(Employee.id, Employee.designation).filter(Employee.id.in_(allocated_employee_ids)).all()
+        emp_designations = {e.id: str(e.designation or "").lower().strip() for e in emps_query}
+        
+    for alloc in allocs:
+        if alloc.active_end_date and alloc.active_end_date < today:
+            continue
+            
         if alloc.role_tags and TEAM_LEAD_ROLE_TAG in alloc.role_tags:
             lead_count += 1
             team_lead_ids.append(alloc.employee_id)
-        elif project_scope.escalates_to_admin(db, alloc.employee_id):
+        elif emp_designations.get(alloc.employee_id) in ("program manager", "project manager", "hr"):
             pm_count += 1
             pm_ids.append(alloc.employee_id)
             
@@ -256,6 +267,7 @@ def create_project(
     # cached session whose user object had no employee_id). Admin-created projects
     # are left as-is (admins see everything anyway).
     #
+
     # A team lead is deliberately NOT added here: a seat in assigned_employee_ids is the
     # manager's, and holding it would let them decide the project's other leads' requests.
     # They are put on the project as its lead instead — see the allocation below.
@@ -336,6 +348,59 @@ def list_projects(db: Session = Depends(get_db), current_user: User = Depends(ge
     return [enrich_project_response(db, p) for p in projects]
 
 # ✅ LIST PROJECTS (PAGINATED)
+def bulk_compute_capacity(db: Session, projects: list[Project]) -> dict[int, str]:
+    from datetime import date, timedelta
+    import math
+    from app.models.allocation import Allocation
+    from app.models.leave import Leave
+    today = date.today()
+    if not projects: return {}
+    pids = [p.id for p in projects]
+    allocs = db.query(Allocation).filter(
+        Allocation.sub_project_id.in_(pids),
+        Allocation.is_active == True
+    ).all()
+    emp_ids = {a.employee_id for a in allocs if a.employee_id}
+    all_leaves = db.query(Leave).filter(
+        Leave.employee_id.in_(emp_ids),
+        Leave.start_date <= max([p.end_date for p in projects if p.end_date] or [today]),
+        Leave.end_date >= min([p.start_date for p in projects if p.start_date] or [today]),
+        Leave.status == "approved"
+    ).all() if emp_ids else []
+    
+    res = {}
+    for p in projects:
+        cap = "unknown"
+        if p.end_date:
+            p_allocs = [a for a in allocs if a.sub_project_id == p.id]
+            p_emp_ids = [a.employee_id for a in p_allocs if not (a.active_end_date and a.active_end_date < today)]
+            
+            tc = p.remaining_tasks if p.remaining_tasks is not None else p.total_tasks
+            req_hrs = float(tc or 0) * float(p.estimated_time_per_task or 0)
+            
+            days = 0
+            curr = today
+            while curr <= p.end_date:
+                if curr.weekday() < 5: days += 1
+                curr += timedelta(days=1)
+            
+            if days <= 0: cap = "overdue"
+            else:
+                p_leaves = [l for l in all_leaves if l.employee_id in p_emp_ids and l.start_date <= p.end_date and l.end_date >= p.start_date]
+                leave_eids = {l.employee_id for l in p_leaves}
+                active_count = len([e for e in p_emp_ids if e not in leave_eids])
+                
+                if p.required_manpower and active_count >= p.required_manpower:
+                    cap = "balanced"
+                elif active_count == 0:
+                    cap = "no_staff"
+                else:
+                    total_cap = active_count * 8 * days
+                    lr = req_hrs / total_cap if total_cap > 0 else float('inf')
+                    cap = "overburden" if lr > 1.1 else "balanced"
+        res[p.id] = cap
+    return res
+
 def _get_filtered_enriched_projects(
     db: Session,
     current_user: User,
@@ -362,9 +427,19 @@ def _get_filtered_enriched_projects(
     all_projects = query.all()
     
     if current_user.role in ("pm", "hr", "team_lead") and not project_scope.has_full_access(current_user):
-        all_projects = [p for p in all_projects if project_scope.can_act_on_project(db, current_user, p)]
+        allowed_ids = project_scope.managed_projects_of_employee(db, current_user, current_user.employee_id)
+        all_projects = [p for p in all_projects if p.id in allowed_ids]
         
-    enriched = []
+    tl_valid_pids = set()
+    if team_lead_id and team_lead_id != "all":
+        from app.models.allocation import Allocation
+        tl_allocs = db.query(Allocation.sub_project_id, Allocation.role_tags).filter(
+            Allocation.employee_id == team_lead_id,
+            Allocation.is_active == True
+        ).all()
+        tl_valid_pids = {r[0] for r in tl_allocs if r[1] and TEAM_LEAD_ROLE_TAG in r[1]}
+        
+    filtered = []
     
     for p in all_projects:
         # Client / Organization
@@ -403,35 +478,22 @@ def _get_filtered_enriched_projects(
             else:
                 if status_val != status.lower(): continue
 
-        # Enrich early for PM / Team Lead and recommendation
-        enriched_p = enrich_project_response(db, p)
-        
         if pm_id and pm_id != "all":
-            # In frontend, PM is someone who escalates_to_admin and is allocated (or in assigned_employee_ids)
-            # Backend enrich_project_response calculates `allocated_pm_count`, but doesn't return list of PMs.
-            # To strictly match UI, check assigned_employee_ids or allocations. For simplicity, just check assigned_employee_ids:
             assigned = p.assigned_employee_ids or []
             if str(pm_id) not in [str(x) for x in assigned]:
                 continue
                 
         if team_lead_id and team_lead_id != "all":
-            # To perfectly filter by team lead, we check allocations for this project
-            allocs = db.query(Allocation).filter(
-                Allocation.sub_project_id == p.id,
-                Allocation.employee_id == team_lead_id,
-                Allocation.is_active == True
-            ).first()
-            if not allocs or TEAM_LEAD_ROLE_TAG not in (allocs.role_tags or []):
+            if p.id not in tl_valid_pids:
                 continue
                 
-        if recommendation and recommendation != "all":
-            cap_status = enriched_p.get("capacity", {}).get("status", "")
-            if cap_status.lower() != recommendation.lower():
-                continue
-                
-        enriched.append(enriched_p)
+        filtered.append(p)
         
-    return enriched
+    if recommendation and recommendation != "all":
+        caps = bulk_compute_capacity(db, filtered)
+        filtered = [p for p in filtered if caps.get(p.id, "").lower() == recommendation.lower()]
+        
+    return filtered
 
 
 @router.get("/paginated", response_model=dict)
@@ -451,16 +513,19 @@ def list_projects_paginated(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    enriched = _get_filtered_enriched_projects(
+    filtered = _get_filtered_enriched_projects(
         db, current_user, search, project_view, status, priority, 
         organization, autonex_only, pm_id, team_lead_id, recommendation, main_project_id
     )
     
-    total = len(enriched)
-    paginated = enriched[(page - 1) * limit : page * limit]
+    total = len(filtered)
+    paginated_projects = filtered[(page - 1) * limit : page * limit]
+    
+    # Enrich ONLY the visible projects for full payload response
+    items = [enrich_project_response(db, p) for p in paginated_projects]
     
     return {
-        "items": paginated,
+        "items": items,
         "total": total,
         "page": page,
         "limit": limit
@@ -472,11 +537,10 @@ def get_projects_kpi(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    # Fetch all enriched projects without filters to calculate global KPIs
-    enriched = _get_filtered_enriched_projects(db, current_user)
+    filtered = _get_filtered_enriched_projects(db, current_user)
     
     metrics = {
-        "totalProjects": len(enriched),
+        "totalProjects": len(filtered),
         "activeProjects": 0,
         "overburdenedProjects": 0,
         "balancedProjects": 0,
@@ -491,12 +555,14 @@ def get_projects_kpi(
         "development": 0
     }
     
-    for p in enriched:
-        status_val = (p.get("project_status") or "active").lower().strip()
+    active_for_cap = []
+    
+    for p in filtered:
+        status_val = (p.project_status or "active").lower().strip()
         archived_statuses = ["completed", "on-hold", "cancelled"]
         is_archived = status_val in archived_statuses
         
-        types = p.get("project_types") or {}
+        types = p.project_types or {}
         is_dev = bool(types and "Development" in types)
         
         # Tab counts
@@ -510,11 +576,7 @@ def get_projects_kpi(
         # Metrics
         if not is_archived and not is_dev:
             metrics["activeProjects"] += 1
-            cap = p.get("capacity", {}).get("status", "")
-            if cap == "overburden":
-                metrics["overburdenedProjects"] += 1
-            elif cap == "balanced":
-                metrics["balancedProjects"] += 1
+            active_for_cap.append(p)
                 
         if status_val == "completed":
             metrics["completedProjects"] += 1
@@ -522,6 +584,14 @@ def get_projects_kpi(
             metrics["onHoldProjects"] += 1
         elif status_val == "cancelled":
             metrics["cancelledProjects"] += 1
+            
+    caps = bulk_compute_capacity(db, active_for_cap)
+    for p in active_for_cap:
+        cap = caps.get(p.id, "")
+        if cap == "overburden":
+            metrics["overburdenedProjects"] += 1
+        elif cap == "balanced":
+            metrics["balancedProjects"] += 1
             
     return {
         "metrics": metrics,

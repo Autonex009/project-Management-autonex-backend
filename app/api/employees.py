@@ -102,6 +102,12 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
+@router.get("/slim")
+def get_employees_slim(db: Session = Depends(get_db)):
+    """Ultra-lightweight endpoint for dropdowns."""
+    emps = db.query(Employee.id, Employee.name, Employee.designation, Employee.status, Employee.employee_type, Employee.skills, Employee.email).all()
+    return [{"id": e[0], "name": e[1], "designation": e[2], "status": e[3], "employee_type": e[4], "skills": e[5], "email": e[6]} for e in emps]
+
 DEFAULT_EMPLOYEE_PASSWORD = "emp123"
 
 # Self-service email changes are confined to the company domain — an employee can
@@ -350,35 +356,45 @@ def list_employees_paginated(
         query = query.distinct(Employee.id)
 
     if col_type:
-        t = col_type.lower()
-        if t == "full-time":
-            query = query.filter(Employee.employee_type.ilike("%full%"))
-        elif t == "intern":
-            query = query.filter(Employee.employee_type.ilike("%intern%"))
-        elif t == "contract":
-            query = query.filter(or_(Employee.employee_type.ilike("%contract%"), Employee.employee_type.ilike("%part%")))
-        else:
-            query = query.filter(func.lower(Employee.employee_type) == t)
+        type_conditions = []
+        for t in [x.strip().lower() for x in col_type.split(",")]:
+            if t == "full-time":
+                type_conditions.append(Employee.employee_type.ilike("%full%"))
+            elif t == "intern":
+                type_conditions.append(Employee.employee_type.ilike("%intern%"))
+            elif t == "contract":
+                type_conditions.append(or_(Employee.employee_type.ilike("%contract%"), Employee.employee_type.ilike("%part%")))
+            else:
+                type_conditions.append(func.lower(Employee.employee_type) == t)
+        if type_conditions:
+            query = query.filter(or_(*type_conditions))
 
     if col_designation:
-        d = col_designation.lower()
-        if d == "manager":
-            query = query.filter(or_(Employee.designation.ilike("%manager%"), Employee.designation.ilike("%pm%")))
-        elif d == "annotator":
-            query = query.filter(or_(Employee.designation.ilike("%annotator%"), Employee.designation.ilike("%reviewer%")))
-        elif d == "tl":
-            query = query.filter(or_(Employee.designation.ilike("%lead%"), Employee.designation.ilike("%tl%")))
-        else:
-            query = query.filter(func.lower(Employee.designation) == d)
+        desig_conditions = []
+        for d in [x.strip().lower() for x in col_designation.split(",")]:
+            if d == "manager":
+                desig_conditions.append(or_(Employee.designation.ilike("%manager%"), Employee.designation.ilike("%pm%"), Employee.designation.ilike("%admin%")))
+            elif d == "annotator":
+                desig_conditions.append(or_(Employee.designation.ilike("%annotator%"), Employee.designation.ilike("%reviewer%")))
+            elif d == "tl":
+                desig_conditions.append(or_(Employee.designation.ilike("%lead%"), Employee.designation.ilike("%tl%"), Employee.designation.ilike("%admin%")))
+            else:
+                desig_conditions.append(func.lower(Employee.designation) == d)
+        if desig_conditions:
+            query = query.filter(or_(*desig_conditions))
 
     if designation:
         # Exact match for the designation tab filter
-        query = query.filter(Employee.designation == designation)
+        desigs = [d.strip() for d in designation.split(",")]
+        query = query.filter(Employee.designation.in_(desigs))
 
     if skill:
-        # Cast JSON to string to search within the array
         from sqlalchemy import cast, String
-        query = query.filter(cast(Employee.skills, String).ilike(f'%"{skill}"%'))
+        skill_conditions = []
+        for s in [x.strip() for x in skill.split(",")]:
+            skill_conditions.append(cast(Employee.skills, String).ilike(f'%"{s}"%'))
+        if skill_conditions:
+            query = query.filter(or_(*skill_conditions))
 
     from app.models.leave import Leave
     from app.models.allocation import Allocation
