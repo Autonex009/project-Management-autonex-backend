@@ -1056,14 +1056,18 @@ def _send_slack_reset_link_sync(user_slack_id: str, reset_link: str) -> None:
 
     raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
 
-def send_channel_message(channel: str, text: str) -> bool:
+def send_channel_message(channel: str, text: str, blocks: list | None = None) -> bool:
     try:
+        payload = {
+            "channel": channel,
+            "text": text,
+        }
+        if blocks:
+            payload["blocks"] = blocks
+            
         response = _slack_request(
             "/chat.postMessage",
-            {
-                "channel": channel,
-                "text": text,
-            }
+            payload
         )
         if not response.get("ok"):
             logger.error(f"Failed to send Slack channel message: {response.get('error')}")

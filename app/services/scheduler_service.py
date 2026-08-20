@@ -76,7 +76,6 @@ def _scheduled_encord_sync() -> None:
         monthly_users = get_top_users(db, month_start, today)
         
         # Weekly Top 10 (Last 7 Days)
-        from datetime import timedelta
         # Weekly Top 10 (Current Calendar Week: Monday to Today)
         week_start = today - timedelta(days=today.weekday()) # Monday
         weekly_users = get_top_users(db, week_start, today)
@@ -85,30 +84,93 @@ def _scheduled_encord_sync() -> None:
         yesterday = today - timedelta(days=1)
         daily_users = get_top_users(db, yesterday, yesterday)
         
-        def format_leaderboard(title, users):
-            if not users:
-                return f"*{title}*\n_No data available_\n\n"
-            
-            text = f"*{title}*\n"
+        def users_to_table_rows(users):
+            def make_cell(text):
+                return {"type": "raw_text", "text": str(text)}
+
+            rows = [[make_cell("Rank"), make_cell("Employee Name"), make_cell("Hours")]]
             medals = ["🥇", "🥈", "🥉"]
             for index, user in enumerate(users):
-                rank = index + 1
-                medal = medals[index] if index < 3 else f" {rank} "
-                name = user.get("employee_name") or user.get("user_email")
-                hours = user.get("hours", 0)
-                text += f"{medal} *{name}* - {hours}h\n"
-            return text + "\n"
-        
-        # Format the title with the dynamic date of yesterday (since it's the leaderboard for the previous day)
+                if index < 3:
+                    rank = medals[index]
+                else:
+                    rank = str(index + 1)
+                    
+                name = user.get("employee_name") or user.get("user_email") or "Unknown"
+                hours = f"{user.get('hours', 0)}h"
+                
+                rows.append([make_cell(rank), make_cell(name), make_cell(hours)])
+            
+            if len(rows) == 1:
+                rows.append([make_cell("-"), make_cell("No data available"), make_cell("-")])
+                
+            return rows
+
         display_date = yesterday.strftime("%d %b")
-        slack_message_text = f"🏆 *Autonex Leaderboard Update as of {display_date}* 🏆\n\n"
-        slack_message_text += format_leaderboard("📅 Monthly Top 10", monthly_users)
-        slack_message_text += format_leaderboard("🗓️ Weekly Top 10 (This Week)", weekly_users)
-        slack_message_text += format_leaderboard("☀️ Daily Top 10 (Previous Day)", daily_users)
+        
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"Autonex Leaderboard Update as of {display_date}",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Monthly Top 10*"
+                }
+            },
+            {
+                "type": "table",
+                "rows": users_to_table_rows(monthly_users),
+                "column_settings": [
+                    {"align": "center"},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "right"}
+                ]
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Weekly Top 10 (This Week)*"
+                }
+            },
+            {
+                "type": "table",
+                "rows": users_to_table_rows(weekly_users),
+                "column_settings": [
+                    {"align": "center"},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "right"}
+                ]
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Daily Top 10 (Previous Day)*"
+                }
+            },
+            {
+                "type": "table",
+                "rows": users_to_table_rows(daily_users),
+                "column_settings": [
+                    {"align": "center"},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "right"}
+                ]
+            }
+        ]
         
         send_channel_message(
             channel="#encord-leaderboard",
-            text=slack_message_text
+            text="Autonex Leaderboard Update",
+            blocks=blocks
         )
         logger.info("[scheduler] Successfully posted daily leaderboard to Slack.")
             
