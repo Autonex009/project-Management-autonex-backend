@@ -138,6 +138,9 @@ class ProjectAllocationDetailItem(BaseModel):
     name: str
     email: Optional[str] = None
     avatar_url: Optional[str] = None
+    designation: Optional[str] = None
+    location: Optional[str] = None
+    is_on_leave: bool = False
     total_daily_hours: Optional[float] = None
     role_tags: List[str] = []
     is_pm: bool = False

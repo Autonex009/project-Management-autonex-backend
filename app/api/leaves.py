@@ -113,6 +113,17 @@ from fastapi import Request as HTTPRequest
 
 router = APIRouter(prefix="/api/leaves", tags=["Leaves"], dependencies=[Depends(get_current_user)])
 
+@router.get("/today-ids")
+def get_leaves_today_ids(db: Session = Depends(get_db)):
+    """Ultra-lightweight endpoint returning only employee IDs on leave today."""
+    today = date_type.today()
+    leaves = db.query(Leave.employee_id).filter(
+        Leave.status == "approved",
+        Leave.start_date <= today,
+        Leave.end_date >= today
+    ).all()
+    return [l[0] for l in leaves if l[0]]
+
 
 def check_leave_access(leave_employee_id: int, current_user: User, db: Session):
     if not has_team_read(current_user):
