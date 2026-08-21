@@ -519,10 +519,13 @@ def get_all_leaves(
 def get_calendar(
     month: str = Query(..., description="YYYY-MM"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Returns all leaves and WFH requests for a given month.
-    month: YYYY-MM format
+    Returns all leaves and WFH requests for a given month with privacy controls:
+    - Admin / HR users see full details (reasons and flags) for all employees.
+    - Managers / Team Leads see reasons and flags for employees in their project scope; reasons are redacted for others.
+    - Regular employees only see reasons and flags for their own requests; other employees' reasons are redacted.
     """
     from app.models.wfh import WFHRequest
     try:
@@ -549,9 +552,29 @@ def get_calendar(
     emp_ids = list({l.employee_id for l in leaves} | {w.employee_id for w in wfh_requests})
     employees = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
 
+    is_admin = project_scope.has_full_access(current_user)
+    manageable_cache: dict[int, bool] = {}
+
+    def can_view_sensitive_details(target_employee_id: int) -> bool:
+        if is_admin:
+            return True
+        if current_user.employee_id and current_user.employee_id == target_employee_id:
+            return True
+        emp = employees.get(target_employee_id)
+        if emp and emp.email and current_user.email and emp.email.strip().lower() == current_user.email.strip().lower():
+            return True
+        if current_user.role in ("pm", "team_lead"):
+            if target_employee_id not in manageable_cache:
+                manageable_cache[target_employee_id] = project_scope.can_manage_employee(
+                    db, current_user, target_employee_id
+                )
+            return manageable_cache[target_employee_id]
+        return False
+
     leave_events = []
     for leave in leaves:
         emp = employees.get(leave.employee_id)
+        has_detail_access = can_view_sensitive_details(leave.employee_id)
         leave_events.append({
             "id": leave.id,
             "type": "leave",
@@ -561,8 +584,8 @@ def get_calendar(
             "start_date": leave.start_date.isoformat(),
             "end_date": leave.end_date.isoformat(),
             "status": leave.status,
-            "reason": leave.reason,
-            "flagged": leave.flagged or False,
+            "reason": leave.reason if has_detail_access else None,
+            "flagged": (leave.flagged or False) if has_detail_access else False,
             "is_half_day": leave.is_half_day or False,
             "half_day_slot": leave.half_day_slot,
         })
@@ -570,6 +593,7 @@ def get_calendar(
     wfh_events = []
     for wfh in wfh_requests:
         emp = employees.get(wfh.employee_id)
+        has_detail_access = can_view_sensitive_details(wfh.employee_id)
         wfh_events.append({
             "id": wfh.id,
             "type": "wfh",
@@ -577,10 +601,11 @@ def get_calendar(
             "employee_name": emp.name if emp else "Unknown",
             "date": wfh.wfh_date.isoformat(),
             "status": wfh.status,
-            "reason": wfh.reason,
+            "reason": wfh.reason if has_detail_access else None,
         })
 
     return {"month": month, "leaves": leave_events, "wfh": wfh_events}
+
 
 def _apply_leave_privacy_filter(leaves, current_user: User, db: Session):
     """Same privacy rules used by get_all_leaves — extracted so page endpoint reuses them."""
