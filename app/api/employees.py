@@ -103,9 +103,33 @@ router = APIRouter(
 )
 
 @router.get("/slim")
-def get_employees_slim(db: Session = Depends(get_db)):
+def get_employees_slim(
+    status: Optional[str] = None,
+    team_only: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     """Ultra-lightweight endpoint for dropdowns."""
-    emps = db.query(Employee.id, Employee.name, Employee.designation, Employee.status, Employee.employee_type, Employee.skills, Employee.email).all()
+    query = db.query(
+        Employee.id, Employee.name, Employee.designation, 
+        Employee.status, Employee.employee_type, Employee.skills, Employee.email
+    )
+
+    if status:
+        query = query.filter(Employee.status == status)
+
+    if team_only and current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
+        from app.services import project_scope
+        all_emp_ids = {r[0] for r in db.query(Employee.id).all()}
+        manageable = {
+            eid for eid in all_emp_ids
+            if project_scope.can_manage_employee(db, current_user, eid) or eid == current_user.employee_id
+        }
+        if not manageable:
+            return []
+        query = query.filter(Employee.id.in_(manageable))
+
+    emps = query.all()
     return [{"id": e[0], "name": e[1], "designation": e[2], "status": e[3], "employee_type": e[4], "skills": e[5], "email": e[6]} for e in emps]
 
 DEFAULT_EMPLOYEE_PASSWORD = "emp123"
