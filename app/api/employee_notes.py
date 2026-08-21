@@ -15,7 +15,7 @@ from app.schemas.employee_note import (
     EmployeeNoteResponse,
 )
 from app.services.auth_service import get_current_user, has_team_read, require_role
-from app.services import audit_service
+from app.services import audit_service, project_scope
 
 router = APIRouter(
     prefix="/api/employee-notes",
@@ -27,11 +27,14 @@ ALLOWED_TYPES = {"complaint", "warning", "recognition"}
 ALLOWED_SEVERITIES = {"low", "medium", "high"}
 
 
-def _ensure_note_access_for_employee(employee_id: int, current_user: User) -> None:
-    if has_team_read(current_user):
+def _ensure_note_read_access_for_employee(employee_id: int, current_user: User, db: Session) -> None:
+    if project_scope.has_full_access(current_user):
         return
-    if current_user.employee_id != employee_id:
-        raise HTTPException(status_code=403, detail="Access denied")
+    if current_user.employee_id == employee_id:
+        return
+    if current_user.role in ("pm", "team_lead") and project_scope.can_manage_employee(db, current_user, employee_id):
+        return
+    raise HTTPException(status_code=403, detail="Access denied")
 
 
 def _enrich_note(db: Session, note: EmployeeNote) -> dict:
@@ -74,6 +77,10 @@ def create_employee_note(
     employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
+
+    project_scope.require_employee_scope(
+        db, current_user, payload.employee_id, action="create notes"
+    )
 
     note = EmployeeNote(
         employee_id=payload.employee_id,
@@ -122,11 +129,33 @@ def list_employee_notes(
 ):
     query = db.query(EmployeeNote)
 
-    if has_team_read(current_user):
+    if project_scope.has_full_access(current_user):
         if employee_id is not None:
             query = query.filter(EmployeeNote.employee_id == employee_id)
+    elif current_user.role in ("pm", "team_lead"):
+        if employee_id is not None:
+            _ensure_note_read_access_for_employee(employee_id, current_user, db)
+            query = query.filter(EmployeeNote.employee_id == employee_id)
+        else:
+            notes = query.order_by(EmployeeNote.issued_at.desc(), EmployeeNote.id.desc()).all()
+            manageable_cache = {current_user.employee_id: True}
+            filtered_notes = []
+            for n in notes:
+                if n.employee_id not in manageable_cache:
+                    manageable_cache[n.employee_id] = project_scope.can_manage_employee(db, current_user, n.employee_id)
+                if manageable_cache.get(n.employee_id, False):
+                    filtered_notes.append(n)
+            if type:
+                if type not in ALLOWED_TYPES:
+                    raise HTTPException(status_code=400, detail="Invalid type")
+                filtered_notes = [n for n in filtered_notes if n.type == type]
+            if status:
+                filtered_notes = [n for n in filtered_notes if n.status == status]
+            return [_enrich_note(db, n) for n in filtered_notes]
     else:
         if not current_user.employee_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+        if employee_id is not None and employee_id != current_user.employee_id:
             raise HTTPException(status_code=403, detail="Access denied")
         query = query.filter(EmployeeNote.employee_id == current_user.employee_id)
 
@@ -154,7 +183,7 @@ def list_notes_by_employee(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    _ensure_note_access_for_employee(employee_id, current_user)
+    _ensure_note_read_access_for_employee(employee_id, current_user, db)
 
     query = db.query(EmployeeNote).filter(EmployeeNote.employee_id == employee_id)
 
@@ -180,7 +209,7 @@ def get_employee_note(
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
 
-    _ensure_note_access_for_employee(note.employee_id, current_user)
+    _ensure_note_read_access_for_employee(note.employee_id, current_user, db)
     return _enrich_note(db, note)
 
 
@@ -195,6 +224,10 @@ def update_employee_note(
     note = db.query(EmployeeNote).filter(EmployeeNote.id == note_id).first()
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
+
+    project_scope.require_employee_scope(
+        db, current_user, note.employee_id, action="update notes"
+    )
 
     if note.status != "open":
         raise HTTPException(status_code=400, detail="Only open notes can be updated")
@@ -253,6 +286,10 @@ def resolve_employee_note(
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
 
+    project_scope.require_employee_scope(
+        db, current_user, note.employee_id, action="resolve notes"
+    )
+
     if note.status == "resolved":
         raise HTTPException(status_code=400, detail="Note is already resolved")
 
@@ -297,6 +334,10 @@ def delete_employee_note(
     note = db.query(EmployeeNote).filter(EmployeeNote.id == note_id).first()
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
+
+    project_scope.require_employee_scope(
+        db, current_user, note.employee_id, action="delete notes"
+    )
 
     employee = db.query(Employee).filter(Employee.id == note.employee_id).first()
 
