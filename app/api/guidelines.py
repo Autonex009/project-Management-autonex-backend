@@ -101,6 +101,51 @@ def get_guideline(guideline_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Guideline not found")
     return guideline
 
+@router.get("/for-me", response_model=List[GuidelineResponse])
+def list_guidelines_for_me(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Guidelines for projects the logged-in employee is allocated to.
+    Avoids the client downloading every guideline + every project just to filter.
+    """
+    from app.models.allocation import Allocation
+    from app.models.project import DailySheet
+
+    if not current_user.employee_id:
+        return []
+
+    alloc_rows = (
+        db.query(Allocation.sub_project_id)
+        .filter(
+            Allocation.employee_id == current_user.employee_id,
+            Allocation.is_active == True,
+            Allocation.sub_project_id.isnot(None),
+        )
+        .distinct()
+        .all()
+    )
+    sub_project_ids = {r[0] for r in alloc_rows if r[0]}
+    if not sub_project_ids:
+        return []
+
+    # Main-project ids for those daily sheets (org-level guidelines)
+    main_rows = (
+        db.query(DailySheet.main_project_id)
+        .filter(DailySheet.id.in_(sub_project_ids))
+        .all()
+    )
+    main_project_ids = {r[0] for r in main_rows if r[0]}
+
+    from sqlalchemy import or_
+
+    query = db.query(Guideline).filter(
+        or_(
+            Guideline.sub_project_id.in_(sub_project_ids),
+            Guideline.main_project_id.in_(main_project_ids) if main_project_ids else False,
+        )
+    )
+    return query.order_by(Guideline.created_at.desc()).all()
 
 @router.post("", response_model=GuidelineResponse)
 def create_guideline(
