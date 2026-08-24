@@ -469,11 +469,12 @@ def _send_employee_allocation_removed_notification(db: Session, allocation: Allo
     )
 
 
-def enrich_allocation_response(allocation: Allocation, db: Session) -> dict:
-    """Add employee and sub-project names to allocation response."""
-    employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
-    sub_project = db.query(SubProject).filter(SubProject.id == allocation.sub_project_id).first()
-    
+def _allocation_to_dict(
+    allocation: Allocation,
+    employee: Optional[Employee] = None,
+    sub_project: Optional[SubProject] = None,
+) -> dict:
+    """Single source of truth for the allocation response shape."""
     return {
         "id": allocation.id,
         "employee_id": allocation.employee_id,
@@ -494,8 +495,15 @@ def enrich_allocation_response(allocation: Allocation, db: Session) -> dict:
         "updated_at": allocation.updated_at,
         "employee_name": employee.name if employee else None,
         "project_name": sub_project.name if sub_project else None,
-        "sub_project_name": sub_project.name if sub_project else None
+        "sub_project_name": sub_project.name if sub_project else None,
     }
+
+
+def enrich_allocation_response(allocation: Allocation, db: Session) -> dict:
+    """Add employee and sub-project names (single-row path; does its own lookups)."""
+    employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
+    sub_project = db.query(SubProject).filter(SubProject.id == allocation.sub_project_id).first()
+    return _allocation_to_dict(allocation, employee, sub_project)
 
 
 @router.post("/validate", response_model=AllocationValidationResponse, dependencies=[Depends(require_role("admin", "pm"))])
@@ -711,28 +719,7 @@ def get_allocations(db: Session = Depends(get_db)):
     for allocation in allocations:
         emp = employee_map.get(allocation.employee_id)
         proj = project_map.get(allocation.sub_project_id)
-        result.append({
-            "id": allocation.id,
-            "employee_id": allocation.employee_id,
-            "sub_project_id": allocation.sub_project_id,
-            "project_id": allocation.sub_project_id,
-            "total_daily_hours": allocation.total_daily_hours or 8,
-            "active_start_date": allocation.active_start_date,
-            "active_end_date": allocation.active_end_date,
-            "role_tags": allocation.role_tags or [],
-            "time_distribution": allocation.time_distribution or {},
-            "override_flag": allocation.override_flag or False,
-            "override_reason": allocation.override_reason,
-            "productivity_override": allocation.productivity_override or 1.0,
-            "weekly_hours_allocated": allocation.weekly_hours_allocated,
-            "weekly_tasks_allocated": allocation.weekly_tasks_allocated,
-            "effective_week": allocation.effective_week,
-            "created_at": allocation.created_at,
-            "updated_at": allocation.updated_at,
-            "employee_name": emp.name if emp else None,
-            "project_name": proj.name if proj else None,
-            "sub_project_name": proj.name if proj else None
-        })
+        result.append(_allocation_to_dict(allocation, emp, proj))
     
     return result
 
