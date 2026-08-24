@@ -126,3 +126,8 @@ class EmployeeResponse(EmployeeBase):
 
     class Config:
         from_attributes = True
+
+
+class EmployeeCreateResponse(EmployeeResponse):
+    temp_password: Optional[str] = None
+    portal_url: Optional[str] = None

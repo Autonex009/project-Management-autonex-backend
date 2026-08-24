@@ -65,6 +65,10 @@ def submit_signup(client, *, email, **fields):
 
 @pytest.fixture()
 def client_and_db():
+    auth_api.verify_password = lambda plain, hashed: True
+    auth_api.hash_password = lambda pw: "hashed-pw"
+    employees_api.hash_password = lambda pw: "hashed-pw"
+
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(bind=engine)
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -247,7 +251,7 @@ def test_auto_link_prevents_duplicate_user(client_and_db):
     user_a = User(
         name="User A",
         email="user_a@autonex.com",
-        password_hash="pw",
+        password_hash=auth_api.hash_password("pw"),
         role="employee",
         employee_id=emp.id
     )
@@ -258,7 +262,7 @@ def test_auto_link_prevents_duplicate_user(client_and_db):
     user_b = User(
         name="User B",
         email="linked@autonex.com",
-        password_hash="pw",
+        password_hash=auth_api.hash_password("pw"),
         role="employee",
         employee_id=None
     )
