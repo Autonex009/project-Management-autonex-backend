@@ -97,7 +97,7 @@ def _allocate_project_leaders(db: Session, project: Project, current_user: User)
     for employee_id in ids_to_allocate:
         try:
             employee_id = int(employee_id)
-        except:
+        except (TypeError, ValueError):
             continue
             
         already_on = (
@@ -251,6 +251,187 @@ def enrich_project_response(db: Session, project: Project) -> dict:
     return resp
 
 
+def enrich_projects_bulk(db: Session, projects: list[Project]) -> list[dict]:
+    """Batch-enrich many projects in a fixed number of queries (not per project)."""
+    from datetime import date, timedelta
+    import math
+    from app.models.leave import Leave
+
+    if not projects:
+        return []
+
+    today = date.today()
+    pids = [p.id for p in projects]
+
+    all_allocs = (
+        db.query(Allocation)
+        .filter(
+            Allocation.sub_project_id.in_(pids),
+            Allocation.is_active == True,
+        )
+        .all()
+    )
+    allocs_by_project: dict[int, list] = {}
+    for a in all_allocs:
+        allocs_by_project.setdefault(a.sub_project_id, []).append(a)
+
+    emp_ids: set[int] = set()
+    for a in all_allocs:
+        if a.employee_id and not (a.active_end_date and a.active_end_date < today):
+            emp_ids.add(a.employee_id)
+
+    emp_designations: dict[int, str] = {}
+    emp_names: dict[int, str] = {}
+    if emp_ids:
+        emps = (
+            db.query(Employee.id, Employee.designation, Employee.name)
+            .filter(Employee.id.in_(emp_ids))
+            .all()
+        )
+        for e in emps:
+            emp_designations[e.id] = str(e.designation or "").lower().strip()
+            emp_names[e.id] = (e.name or "").strip()
+
+    end_dates = [p.end_date for p in projects if p.end_date]
+    start_dates = [p.start_date for p in projects if p.start_date]
+    all_leaves = []
+    if emp_ids and end_dates and start_dates:
+        all_leaves = (
+            db.query(Leave)
+            .filter(
+                Leave.employee_id.in_(emp_ids),
+                Leave.start_date <= max(end_dates),
+                Leave.end_date >= min(start_dates),
+                Leave.status == "approved",
+            )
+            .all()
+        )
+
+    def get_working_days(start_dt, end_dt):
+        if start_dt > end_dt:
+            return 0
+        days = 0
+        curr = start_dt
+        while curr <= end_dt:
+            if curr.weekday() < 5:
+                days += 1
+            curr += timedelta(days=1)
+        return days
+
+    results = []
+    for project in projects:
+        allocs = allocs_by_project.get(project.id, [])
+        lead_count = 0
+        pm_count = 0
+        pm_ids = []
+        team_lead_ids = []
+        allocated_employee_ids = []
+
+        for alloc in allocs:
+            if alloc.active_end_date and alloc.active_end_date < today:
+                continue
+            if not alloc.employee_id:
+                continue
+            allocated_employee_ids.append(alloc.employee_id)
+            if alloc.role_tags and TEAM_LEAD_ROLE_TAG in alloc.role_tags:
+                lead_count += 1
+                team_lead_ids.append(alloc.employee_id)
+            elif emp_designations.get(alloc.employee_id) in (
+                "program manager",
+                "project manager",
+                "hr",
+            ):
+                pm_count += 1
+                pm_ids.append(alloc.employee_id)
+
+        capacity = {"status": "unknown", "recommendation": None}
+        if project.end_date:
+            task_count = (
+                project.remaining_tasks
+                if project.remaining_tasks is not None
+                else project.total_tasks
+            )
+            required_hours = float(task_count or 0) * float(
+                project.estimated_time_per_task or 0
+            )
+            working_days = get_working_days(today, project.end_date)
+
+            if working_days <= 0:
+                capacity = {
+                    "status": "overdue",
+                    "recommendation": {"message": "Past deadline"},
+                }
+            else:
+                leave_emp_ids = {
+                    l.employee_id
+                    for l in all_leaves
+                    if l.employee_id in allocated_employee_ids
+                    and l.start_date <= project.end_date
+                    and l.end_date >= project.start_date
+                }
+                active_allocated_count = len(
+                    [e for e in allocated_employee_ids if e not in leave_emp_ids]
+                )
+
+                if (
+                    project.required_manpower
+                    and active_allocated_count >= project.required_manpower
+                ):
+                    capacity = {"status": "balanced", "recommendation": None}
+                elif active_allocated_count == 0:
+                    capacity = {
+                        "status": "no_staff",
+                        "recommendation": {"message": "Needs staffing"},
+                    }
+                else:
+                    standard_day_hours = 8
+                    total_cap = (
+                        active_allocated_count * standard_day_hours * working_days
+                    )
+                    load_ratio = (
+                        required_hours / total_cap if total_cap > 0 else float("inf")
+                    )
+                    if load_ratio > 1.1:
+                        if (
+                            project.required_manpower
+                            and active_allocated_count < project.required_manpower
+                        ):
+                            extra = project.required_manpower - active_allocated_count
+                            capacity = {
+                                "status": "overburden",
+                                "recommendation": {
+                                    "message": f"+{extra} staff needed"
+                                },
+                            }
+                        else:
+                            deficit = required_hours - total_cap
+                            extra = math.ceil(
+                                deficit / (working_days * standard_day_hours)
+                            )
+                            capacity = {
+                                "status": "overburden",
+                                "recommendation": {
+                                    "message": f"+{extra} staff needed"
+                                },
+                            }
+                    else:
+                        capacity = {"status": "balanced", "recommendation": None}
+
+        resp = ProjectResponse.model_validate(project).model_dump()
+        resp["allocated_pm_count"] = pm_count
+        resp["allocated_lead_count"] = lead_count
+        resp["capacity"] = capacity
+        resp["pm_names"] = [emp_names.get(pid, "Unknown") for pid in pm_ids]
+        resp["team_lead_names"] = [
+            emp_names.get(lid, "Unknown") for lid in team_lead_ids
+        ]
+        resp["pm_ids"] = pm_ids
+        resp["team_lead_ids"] = team_lead_ids
+        results.append(resp)
+
+    return results
+
+
 # ✅ CREATE PROJECT
 @router.post("", response_model=ProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def create_project(
@@ -345,7 +526,8 @@ def list_projects(db: Session = Depends(get_db), current_user: User = Depends(ge
     if current_user.role in ("pm", "hr", "team_lead") and not project_scope.has_full_access(current_user):
         projects = [p for p in projects if project_scope.can_act_on_project(db, current_user, p)]
         
-    return [enrich_project_response(db, p) for p in projects]
+    # return [enrich_project_response(db, p) for p in projects]
+    return enrich_projects_bulk(db, projects)
 
 # ✅ LIST PROJECTS (PAGINATED)
 def bulk_compute_capacity(db: Session, projects: list[Project]) -> dict[int, str]:
@@ -535,7 +717,8 @@ def list_projects_paginated(
             "autonex_reviewers": p.autonex_reviewers
         } for p in paginated_projects]
     else:
-        items = [enrich_project_response(db, p) for p in paginated_projects]
+        # items = [enrich_project_response(db, p) for p in paginated_projects]
+        items = enrich_projects_bulk(db, paginated_projects)
 
     
     return {
@@ -680,7 +863,7 @@ def update_project(
         for employee_id in project.assigned_employee_ids or []:
             try:
                 employee_id = int(employee_id)
-            except:
+            except (TypeError, ValueError):
                 continue
                 
             already_on = (

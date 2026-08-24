@@ -621,6 +621,12 @@ def create_allocation(
     # Sync project allocated_employees and role counts dynamically
     sync_project_allocations(db, data.sub_project_id)
 
+    # Count active allocations on this project (includes the one just flushed)
+    actual_count = db.query(Allocation).filter(
+        Allocation.sub_project_id == data.sub_project_id,
+        Allocation.is_active == True,
+    ).count()
+
     allocated_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
     allocated_name = allocated_employee.name if allocated_employee else None
     audit_service.record(
@@ -824,27 +830,50 @@ def update_allocation(
                 detail=time_check['message']
             )
     
-    # Double-booking check if hours are changing
-    if data.total_daily_hours:
-        booking_check = check_double_booking(
-            db=db,
-            employee_id=data.employee_id or allocation.employee_id,
-            new_hours=data.total_daily_hours,
-            active_start=data.active_start_date or allocation.active_start_date,
-            active_end=data.active_end_date or allocation.active_end_date,
-            exclude_allocation_id=allocation_id
+    # Double-booking check — always re-validate on update.
+    # Moving an allocation to a new project / date range / employee without
+    # changing hours can still create overlaps that the previous range avoided.
+    # (Previously the check only ran when data.total_daily_hours was truthy.)
+    resolved_employee_id = data.employee_id if data.employee_id is not None else allocation.employee_id
+    resolved_hours = (
+        data.total_daily_hours
+        if data.total_daily_hours is not None
+        else (allocation.total_daily_hours or 8)
+    )
+    resolved_start = (
+        data.active_start_date
+        if data.active_start_date is not None
+        else allocation.active_start_date
+    )
+    resolved_end = (
+        data.active_end_date
+        if data.active_end_date is not None
+        else allocation.active_end_date
+    )
+
+    booking_check = check_double_booking(
+        db=db,
+        employee_id=resolved_employee_id,
+        new_hours=resolved_hours,
+        active_start=resolved_start,
+        active_end=resolved_end,
+        exclude_allocation_id=allocation_id,
+    )
+
+    override_flag = (
+        data.override_flag
+        if data.override_flag is not None
+        else allocation.override_flag
+    )
+    if booking_check.get("is_overbooked") and not override_flag:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": booking_check["message"],
+                "requires_override": True,
+                "booking_details": booking_check,
+            },
         )
-        
-        override_flag = data.override_flag if data.override_flag is not None else allocation.override_flag
-        if booking_check.get('is_overbooked') and not override_flag:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "message": booking_check['message'],
-                    "requires_override": True,
-                    "booking_details": booking_check
-                }
-            )
 
     # Leave-overlap check on update: informational only.
     resolved_employee_id = data.employee_id or allocation.employee_id
