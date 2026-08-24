@@ -330,7 +330,7 @@ sync_employee_contact_schema()
 
 
 def sync_user_password_reset_schema() -> None:
-    """Backfill missing password-reset columns on existing databases."""
+    """Backfill missing password-reset and forced change columns on existing databases."""
     inspector = inspect(engine)
     try:
         columns = {column["name"] for column in inspector.get_columns("users")}
@@ -342,6 +342,8 @@ def sync_user_password_reset_schema() -> None:
         statements.append("ALTER TABLE users ADD COLUMN password_reset_token_hash TEXT")
     if "password_reset_expires_at" not in columns:
         statements.append("ALTER TABLE users ADD COLUMN password_reset_expires_at TIMESTAMP")
+    if "must_change_password" not in columns:
+        statements.append("ALTER TABLE users ADD COLUMN must_change_password BOOLEAN NOT NULL DEFAULT FALSE")
 
     if not statements:
         return

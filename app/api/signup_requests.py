@@ -464,6 +464,7 @@ def approve_signup_request(
         existing_user.password_hash = pw_hash
         existing_user.employee_id = employee.id
         existing_user.skills = req.skills or []
+        existing_user.must_change_password = True
         user = existing_user
     else:
         user = User(
@@ -473,6 +474,7 @@ def approve_signup_request(
             role="employee",
             employee_id=employee.id,
             is_active=True,
+            must_change_password=True,
             skills=req.skills or [],
         )
         db.add(user)
