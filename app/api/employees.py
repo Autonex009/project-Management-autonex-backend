@@ -970,7 +970,9 @@ def request_employee_email_change(
 
     otp = ''.join(random.choices(string.digits, k=6))
     
-    secret_key = os.getenv("OTP_SECRET_KEY", "fallback_dev_secret")
+    secret_key = os.getenv("OTP_SECRET_KEY")
+    if not secret_key:
+        raise HTTPException(status_code=500, detail="Server misconfiguration: Missing OTP_SECRET_KEY")
     encrypted_otp = hmac.new(secret_key.encode('utf-8'), otp.encode('utf-8'), hashlib.sha256).hexdigest()
 
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
@@ -1007,7 +1009,9 @@ def verify_employee_email_change(
 
     check_employee_access(employee, current_user)
 
-    secret_key = os.getenv("OTP_SECRET_KEY", "fallback_dev_secret")
+    secret_key = os.getenv("OTP_SECRET_KEY")
+    if not secret_key:
+        raise HTTPException(status_code=500, detail="Server misconfiguration: Missing OTP_SECRET_KEY")
     provided_hash = hmac.new(secret_key.encode('utf-8'), body.otp.encode('utf-8'), hashlib.sha256).hexdigest()
 
     otp_record = db.query(EmailOtpVerification).filter(
