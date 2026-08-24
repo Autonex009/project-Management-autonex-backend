@@ -80,37 +80,50 @@ class RecommendationEngine:
         Matches by skills and checks they aren't already fully allocated.
         """
         required_skills = project.required_expertise or []
-        
-        # Get all active employees not already on this project
+
+        # 1 query: all active employees not already on this project
         candidates = self.db.query(Employee).filter(
             Employee.status == 'active',
             Employee.id.notin_(existing_employee_ids)
         ).all()
-        
+
+        if not candidates:
+            return []
+
+        candidate_ids = [c.id for c in candidates]
+
+        # 1 query: all active allocations for these candidates (fixes N+1)
+        all_allocations = self.db.query(Allocation).filter(
+            Allocation.employee_id.in_(candidate_ids),
+            Allocation.is_active == True
+        ).all()
+
+        # Group in memory: employee_id → list of allocations
+        allocations_by_employee = defaultdict(list)
+        for alloc in all_allocations:
+            allocations_by_employee[alloc.employee_id].append(alloc)
+
         suggestions = []
         for candidate in candidates:
             candidate_skills = candidate.skills or []
-            
-            # Check skill match
+
+            # Skill match
             matching_skills = [
                 skill for skill in required_skills
                 if any(cs.lower() == skill.lower() for cs in candidate_skills)
             ]
-            
+
             if not matching_skills and required_skills:
                 continue
-            
-            # Check current allocation load
-            current_allocations = self.db.query(Allocation).filter(
-                Allocation.employee_id == candidate.id,
-                Allocation.is_active == True
-            ).all()
+
+            # Look up allocations from the pre-fetched map (no extra query)
+            current_allocations = allocations_by_employee.get(candidate.id, [])
             total_allocated_hours = sum(
                 (a.total_daily_hours or 8) for a in current_allocations
             )
             max_capacity = candidate.working_hours_per_day or 8
             available_hours = max(0, max_capacity - total_allocated_hours)
-            
+
             if available_hours > 0:
                 suggestions.append({
                     "employee_id": candidate.id,
@@ -120,7 +133,7 @@ class RecommendationEngine:
                     "available_hours": available_hours,
                     "skill_match_ratio": len(matching_skills) / max(len(required_skills), 1)
                 })
-        
+
         # Sort by skill match ratio descending, then available hours descending
         suggestions.sort(key=lambda x: (-x["skill_match_ratio"], -x["available_hours"]))
         return suggestions[:5]  # Top 5 candidates

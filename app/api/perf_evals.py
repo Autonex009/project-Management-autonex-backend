@@ -220,7 +220,6 @@ class PerfEvalCreate(BaseModel):
     period: str
     parameter_values: List[EmployeeParamValue]
     overall_comment: Optional[str] = None
-    submitted_by: Optional[int] = None
 
     @field_validator("period")
     @classmethod
@@ -257,7 +256,6 @@ class PerfEvalReview(BaseModel):
     parameter_values: List[ReviewParamValue]
     bonus_suggested: bool = False
     bonus_note: Optional[str] = None
-    reviewed_by: Optional[int] = None
 
     @field_validator("parameter_values")
     @classmethod
