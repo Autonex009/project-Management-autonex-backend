@@ -15,7 +15,11 @@ from app.models.user import User
 from app.models.notification import Notification
 from types import SimpleNamespace
 from app.api.leaves import _get_pm_notification_targets, _get_admin_notification_targets
+from app.services.slack_service import try_send_pm_wfh_request_message, try_send_wfh_status_message
 from app.constants.leave_types import is_intern_or_contractor
+
+from sqlalchemy import or_
+from datetime import date as date_type
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/wfh", tags=["wfh"], dependencies=[Depends(get_current_user)])
@@ -170,6 +174,98 @@ def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
     )
 
 
+def _apply_wfh_privacy_filter(requests, current_user: User, db: Session):
+    """Identical privacy filter used by get_wfh_requests."""
+    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
+        manageable_cache = {current_user.employee_id: True}
+        filtered = []
+        for req in requests:
+            if req.employee_id not in manageable_cache:
+                manageable_cache[req.employee_id] = project_scope.can_manage_employee(
+                    db, current_user, req.employee_id
+                )
+            if manageable_cache.get(req.employee_id, False):
+                filtered.append(req)
+        return filtered
+    return requests
+
+@router.get("/page")
+def get_wfh_page(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: Optional[str] = Query(None, max_length=200),
+    status: Optional[str] = Query("all"),
+    today_only: bool = Query(False),
+    sort: Optional[str] = Query("", description="'' | 'asc' | 'desc'  (wfh_date)"),
+    employee_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Paginated WFH list. Same filters + privacy rules the frontend applies today.
+    Existing GET /api/wfh is unchanged.
+    """
+    if not has_team_read(current_user):
+        if employee_id is None:
+            employee_id = current_user.employee_id
+            if employee_id is None:
+                emp = db.query(Employee).filter(Employee.email == current_user.email).first()
+                if emp:
+                    employee_id = emp.id
+                else:
+                    raise HTTPException(status_code=403, detail="Access denied")
+        else:
+            is_self = current_user.employee_id == employee_id
+            if not is_self:
+                emp = db.query(Employee).filter(Employee.id == employee_id).first()
+                if not emp or emp.email != current_user.email:
+                    raise HTTPException(status_code=403, detail="Access denied")
+
+    q = db.query(WFHRequest)
+
+    if employee_id:
+        q = q.filter(WFHRequest.employee_id == employee_id)
+
+    if status and status != "all":
+        q = q.filter(WFHRequest.status == status)
+
+    if today_only:
+        today = date_type.today()
+        q = q.filter(WFHRequest.wfh_date == today)
+
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        q = q.outerjoin(Employee, Employee.id == WFHRequest.employee_id).filter(
+            or_(
+                Employee.name.ilike(term),
+                WFHRequest.reason.ilike(term),
+            )
+        )
+
+    candidates = q.order_by(WFHRequest.wfh_date.desc()).all()
+    candidates = _apply_wfh_privacy_filter(candidates, current_user, db)
+
+    if sort in ("asc", "desc"):
+        reverse = sort == "desc"
+        candidates.sort(
+            key=lambda r: (r.wfh_date.isoformat() if r.wfh_date else ""),
+            reverse=reverse,
+        )
+
+    total = len(candidates)
+    start = (page - 1) * page_size
+    page_items = candidates[start : start + page_size]
+
+    # Re-use the existing response builder (includes approved_by_name, employee_name …)
+    items = [_build_response(req, db) for req in page_items]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "pages": (total + page_size - 1) // page_size if page_size else 0,
+    }
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("", response_model=List[WFHResponse])
@@ -346,6 +442,8 @@ def create_wfh_request(
     notify_admins = escalates_to_admin or escalates_to_pm or not pm_targets
 
     notified_user_ids: set[int] = set()
+    duration_days = (end_date - req.wfh_date).days + 1
+
     for target in pm_targets:
         # In-app notification for PM
         pm_emp_id = getattr(target["pm_employee"], "id", None)
@@ -360,9 +458,45 @@ def create_wfh_request(
                     "wfh_applied",
                 )
 
+        # Slack DM for PM
+        pm_slack_id = target.get("pm_slack_user_id")
+        if pm_slack_id:
+            try_send_pm_wfh_request_message(
+                pm_slack_user_id=pm_slack_id,
+                pm_name=getattr(target["pm_employee"], "name", "PM"),
+                employee_name=employee.name,
+                employee_email=employee.email,
+                employee_designation=employee.designation,
+                start_date=req.wfh_date.isoformat(),
+                end_date=end_date.isoformat(),
+                duration_days=duration_days,
+                reason=req.reason,
+                impacted_projects=target.get("impacted_projects", []),
+                wfh_id=req.id,
+            )
+
     # Admins: as a fallback when nobody else resolved, and additionally for a team lead's
     # own request, which is theirs to countersign alongside the program manager.
     if notify_admins:
+        # FUTURE: To expand this to HR/Admins, simply uncomment this block:
+        # admin_targets = _get_admin_notification_targets(db)
+        # for target in admin_targets:
+        #     admin_slack_id = target.get("pm_slack_user_id")
+        #     if admin_slack_id:
+        #         try_send_pm_wfh_request_message(
+        #             pm_slack_user_id=admin_slack_id,
+        #             pm_name=getattr(target["pm_employee"], "name", "Admin"),
+        #             employee_name=employee.name,
+        #             employee_email=employee.email,
+        #             employee_designation=employee.designation,
+        #             start_date=req.wfh_date.isoformat(),
+        #             end_date=end_date.isoformat(),
+        #             duration_days=duration_days,
+        #             reason=req.reason,
+        #             impacted_projects=target.get("impacted_projects", []),
+        #             wfh_id=req.id,
+        #         )
+
         for admin_user in db.query(User).filter(User.role == "admin", User.is_active == True).all():
             if admin_user.id not in notified_user_ids:
                 notified_user_ids.add(admin_user.id)
@@ -442,6 +576,15 @@ def approve_wfh(
             "wfh_approved")
         db.commit()
 
+    try_send_wfh_status_message(
+        employee_email=employee.email if employee else "unknown",
+        employee_name=employee.name if employee else "unknown",
+        start_date=req.wfh_date.isoformat(),
+        end_date=req.end_date.isoformat() if req.end_date else req.wfh_date.isoformat(),
+        pm_name=approver_name,
+        approved=True,
+    )
+
     return {"message": "WFH request approved", "wfh_id": wfh_id, "status": "approved"}
 
 
@@ -500,6 +643,15 @@ def reject_wfh(
             f"Your WFH request for {req.wfh_date} was declined by {approver_name}.",
             "wfh_rejected")
         db.commit()
+
+    try_send_wfh_status_message(
+        employee_email=employee.email if employee else "unknown",
+        employee_name=employee.name if employee else "unknown",
+        start_date=req.wfh_date.isoformat(),
+        end_date=req.end_date.isoformat() if req.end_date else req.wfh_date.isoformat(),
+        pm_name=approver_name,
+        approved=False,
+    )
 
     return {"message": "WFH request rejected", "wfh_id": wfh_id, "status": "rejected"}
 

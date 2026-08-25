@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, status
 from app.services.auth_service import get_current_user, has_team_read, require_role
 from app.services import audit_service, project_scope
 from app.models.user import User
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 
 from app.db.database import get_db
 from app.models.allocation import Allocation
@@ -11,13 +11,21 @@ from app.models.project import SubProject, Project  # SubProject with Project al
 from app.models.employee import Employee
 from app.models.parent_project import MainProject
 from app.models.sub_project import SubProject as HierarchySubProject
+from datetime import date as date_cls
+from app.models.leave import Leave
+from app.models.wfh import WFHRequest
 from app.schemas.allocation import (
     AllocationCreate, 
     AllocationUpdate, 
     AllocationResponse,
     AllocationValidationRequest,
     AllocationValidationResponse,
-    EmployeeAllocationStatus
+    EmployeeAllocationStatus,
+    AllocationsPageResponse,
+    ProjectAllocationRow,
+    AllocatedEmployeePreview,
+    ProjectAllocationDetailResponse,
+    ProjectAllocationDetailItem,
 )
 from app.services.allocation_validator import (
     validate_time_distribution,
@@ -32,8 +40,289 @@ from app.services.slack_service import (
     try_get_or_cache_employee_slack_user_id,
 )
 
+TEAM_LEAD_TAG = "Team Lead"  # matches TEAM_LEAD_ROLE_TAG in sub_projects.py / TEAM_LEAD_TAG in frontend
+
 router = APIRouter(prefix="/api/allocations", tags=["Allocations"], dependencies=[Depends(get_current_user)])
 
+def _resolve_pm_ids(project: Project, main_project_map: dict, employee_map: dict) -> list[int]:
+    """A project's own PMs, falling back to its parent's program managers.
+    Archived employees never count as a filled PM slot.
+    """
+    def is_stale(eid: int) -> bool:
+        emp = employee_map.get(eid)
+        return emp is None or emp.status == "archived"
+
+    ids = [i for i in (project.assigned_employee_ids or []) if not is_stale(i)]
+    if ids:
+        return ids
+
+    mp = main_project_map.get(getattr(project, "main_project_id", None))
+    if mp:
+        fallback = getattr(mp, "program_manager_ids", None) or (
+            [mp.program_manager_id] if getattr(mp, "program_manager_id", None) else []
+        )
+        return [i for i in fallback if not is_stale(i)]
+    return []
+
+
+@router.get("/page", response_model=AllocationsPageResponse)
+def get_allocations_page(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=100),
+    search: Optional[str] = Query(None, max_length=200),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm", "team_lead")),
+):
+    """
+    Server-side paginated + pre-aggregated replacement for building the whole
+    Allocations board in the browser. Every batch query below is scoped to the
+    projects that exist at all (cheap column-only reads); the per-row math is
+    plain Python over already-fetched, already-narrow data — never a query per
+    project, and never the full allocation/employee/leave/WFH tables loaded
+    into React just to be summarised.
+    """
+    today = date_cls.today()
+
+    # 1) Same visibility rules as GET /api/sub-projects.
+    all_projects = db.query(Project).order_by(Project.id.asc()).all()
+    if current_user.role in ("pm", "hr", "team_lead") and not project_scope.has_full_access(current_user):
+        all_projects = [p for p in all_projects if project_scope.can_act_on_project(db, current_user, p)]
+
+    if not all_projects:
+        return AllocationsPageResponse(items=[], page=page, page_size=page_size, total_items=0, total_pages=0)
+
+    project_ids = [p.id for p in all_projects]
+
+    # 2) One query for every allocation on these projects (no N+1).
+    all_allocs = db.query(Allocation).filter(Allocation.sub_project_id.in_(project_ids)).all()
+    allocs_by_project: dict[int, list[Allocation]] = {}
+    for a in all_allocs:
+        allocs_by_project.setdefault(a.sub_project_id, []).append(a)
+
+    # 3) Roster + parent-project lookups, batched.
+    employee_ids_involved = {a.employee_id for a in all_allocs}
+    for p in all_projects:
+        employee_ids_involved.update(p.assigned_employee_ids or [])
+    employees = (
+        db.query(Employee).filter(Employee.id.in_(employee_ids_involved)).all()
+        if employee_ids_involved else []
+    )
+    employee_map = {e.id: e for e in employees}
+
+    main_project_ids = {p.main_project_id for p in all_projects if getattr(p, "main_project_id", None)}
+    main_projects = (
+        db.query(MainProject).filter(MainProject.id.in_(main_project_ids)).all()
+        if main_project_ids else []
+    )
+    main_project_map = {mp.id: mp for mp in main_projects}
+
+    def is_stale(eid: int) -> bool:
+        emp = employee_map.get(eid)
+        return emp is None or emp.status == "archived"
+
+    # 4) Today's leave / WFH, batched once for every employee involved.
+    leave_rows = (
+        db.query(Leave)
+        .filter(
+            Leave.employee_id.in_(employee_ids_involved),
+            Leave.status == "approved",
+            Leave.start_date <= today,
+            Leave.end_date >= today,
+        )
+        .all() if employee_ids_involved else []
+    )
+    on_leave_today = {l.employee_id for l in leave_rows}
+
+    wfh_rows = (
+        db.query(WFHRequest)
+        .filter(
+            WFHRequest.employee_id.in_(employee_ids_involved),
+            WFHRequest.status == "approved",
+            WFHRequest.wfh_date == today,
+        )
+        .all() if employee_ids_involved else []
+    )
+    wfh_today = {w.employee_id for w in wfh_rows}
+
+    def is_wfh_today(emp: Employee) -> bool:
+        return emp.id in wfh_today
+
+    # 5) Build one row per project + a search blob kept OUT of the response.
+    built: list[tuple[ProjectAllocationRow, str]] = []
+    for project in all_projects:
+        allocs = allocs_by_project.get(project.id, [])
+        if not allocs and not (project.required_manpower or 0):
+            continue  # mirrors the old client filter: only "active" rows
+
+        pm_ids = _resolve_pm_ids(project, main_project_map, employee_map)
+        lead_ids = list({
+            a.employee_id for a in allocs
+            if a.role_tags and TEAM_LEAD_TAG in a.role_tags and not is_stale(a.employee_id)
+        })
+        assigned_ids = set(pm_ids) | set(lead_ids)
+
+        def sort_key(a: Allocation):
+            emp = employee_map.get(a.employee_id)
+            return (
+                0 if a.employee_id in pm_ids else 1,
+                0 if a.employee_id in lead_ids else 1,
+                (emp.name if emp else "").lower(),
+            )
+
+        stale_count = wfo = wfh_c = on_leave = 0
+        preview: list[AllocatedEmployeePreview] = []
+        name_blob_parts = [project.name]
+
+        for a in sorted(allocs, key=sort_key):
+            stale = is_stale(a.employee_id)
+            emp = employee_map.get(a.employee_id)
+            name = emp.name if emp else "Former employee"
+            name_blob_parts.append(name)
+
+            if stale:
+                stale_count += 1
+            else:
+                assigned_ids.add(a.employee_id)
+                if a.employee_id in on_leave_today:
+                    on_leave += 1
+                elif is_wfh_today(emp):
+                    wfh_c += 1
+                else:
+                    wfo += 1
+
+            if len(preview) < 6:
+                preview.append(AllocatedEmployeePreview(
+                    allocation_id=a.id,
+                    employee_id=a.employee_id,
+                    name=name,
+                    avatar_url=(emp.avatar_url if emp else None),
+                    is_pm=a.employee_id in pm_ids,
+                    is_lead=a.employee_id in lead_ids,
+                    stale=stale,
+                ))
+
+        requested_manpower = (
+            (project.autonex_annotators or 0)
+            + (project.autonex_reviewers or 0)
+            + (project.others_count or 0)
+            + (project.developers_count or 0)
+        )
+
+        row = ProjectAllocationRow(
+            project_id=project.id,
+            project_name=project.name,
+            project_type=project.project_type,
+            required_manpower=project.required_manpower or 0,
+            pm_slots=len(pm_ids),
+            lead_slots=len(lead_ids),
+            requested_manpower=requested_manpower,
+            assigned_manpower=len(assigned_ids),
+            stale_count=stale_count,
+            wfo_count=wfo,
+            wfh_count=wfh_c,
+            on_leave_count=on_leave,
+            allocated_preview=preview,
+            total_allocated_count=len(allocs),
+        )
+        built.append((row, " ".join(name_blob_parts).lower()))
+
+    # 6) Search (project name OR any allocated employee's name — not just the preview).
+    if search and search.strip():
+        term = search.strip().lower()
+        built = [(r, blob) for (r, blob) in built if term in blob]
+
+    total_items = len(built)
+    total_pages = (total_items + page_size - 1) // page_size if page_size else 0
+    start = (page - 1) * page_size
+    page_rows = [r for (r, _blob) in built[start:start + page_size]]
+
+    return AllocationsPageResponse(
+        items=page_rows, page=page, page_size=page_size,
+        total_items=total_items, total_pages=total_pages,
+    )
+
+
+@router.get("/project/{project_id}/detail", response_model=ProjectAllocationDetailResponse)
+def get_project_allocation_detail(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm", "team_lead")),
+):
+    """Full per-employee allocation list for ONE project. Fetched on demand
+    (row expand / Create-Allocation modal / Edit modal) instead of every
+    project's roster being present in memory on every page load."""
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project_scope.require_project_scope(
+        db, current_user, project, action="view this project's allocations"
+    )
+
+    allocs = db.query(Allocation).filter(Allocation.sub_project_id == project_id).all()
+    employee_ids = {a.employee_id for a in allocs} | set(project.assigned_employee_ids or [])
+    employees = db.query(Employee).filter(Employee.id.in_(employee_ids)).all() if employee_ids else []
+    employee_map = {e.id: e for e in employees}
+
+    pm_ids = set(project.assigned_employee_ids or [])
+    if not pm_ids and getattr(project, "main_project_id", None):
+        mp = db.query(MainProject).filter(MainProject.id == project.main_project_id).first()
+        if mp:
+            pm_ids = set(getattr(mp, "program_manager_ids", None) or (
+                [mp.program_manager_id] if getattr(mp, "program_manager_id", None) else []
+            ))
+
+    items = []
+    for a in allocs:
+        emp = employee_map.get(a.employee_id)
+        stale = emp is None or emp.status == "archived"
+        items.append(ProjectAllocationDetailItem(
+            allocation_id=a.id,
+            employee_id=a.employee_id,
+            name=(emp.name if emp else "Former employee"),
+            email=(emp.email if emp else None),
+            avatar_url=(emp.avatar_url if emp else None),
+            total_daily_hours=a.total_daily_hours,
+            role_tags=a.role_tags or [],
+            is_pm=a.employee_id in pm_ids,
+            is_lead=bool(a.role_tags and TEAM_LEAD_TAG in a.role_tags),
+            stale=stale,
+        ))
+
+    return ProjectAllocationDetailResponse(
+        project_id=project.id,
+        project_name=project.name,
+        required_manpower=project.required_manpower or 0,
+        items=items,
+    )
+
+
+@router.get("/employee-projects", response_model=dict)
+def get_employee_current_projects(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm", "team_lead")),
+):
+    """employee_id -> [{project_id, project_name, hours}] for every active
+    allocation. Used only to tag 'Other Project' in the Create-Allocation
+    modal — fetched once when that modal opens, not on every page load."""
+    allocs = db.query(Allocation).filter(Allocation.is_active == True).all()
+    if not allocs:
+        return {}
+    project_ids = list({a.sub_project_id for a in allocs})
+    projects = db.query(Project).filter(Project.id.in_(project_ids)).all()
+    project_map = {p.id: p for p in projects}
+
+    result: dict[str, list[dict]] = {}
+    for a in allocs:
+        proj = project_map.get(a.sub_project_id)
+        if not proj:
+            continue
+        result.setdefault(str(a.employee_id), []).append({
+            "project_id": proj.id,
+            "project_name": proj.name,
+            "hours": a.total_daily_hours or 8,
+        })
+    return result
 
 def _format_avg_time_per_task(project: Project) -> str:
     return f"{project.estimated_time_per_task} hr/task"
