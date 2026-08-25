@@ -273,11 +273,40 @@ def list_employees(
     db: Session = Depends(get_db)
 ):
     query = db.query(Employee)
+    from app.models.leave import Leave
+    from datetime import date
+    
+    today = date.today()
+    on_leave_ids = db.query(Leave.employee_id).filter(
+        Leave.start_date <= today,
+        Leave.end_date >= today,
+        Leave.status != "rejected"
+    ).distinct()
+
+    allocated_employee_ids = db.query(Allocation.employee_id).filter(
+        Allocation.is_active == True,
+        Allocation.employee_id.isnot(None)
+    ).distinct()
+
     if status == "idle":
-        allocated_employee_ids = db.query(Allocation.employee_id).filter(Allocation.is_active == True).distinct()
-        query = query.filter(Employee.status == "active", Employee.id.notin_(allocated_employee_ids))
-    elif status:
-        query = query.filter(Employee.status == status)
+        query = query.filter(
+            Employee.status != "archived",
+            Employee.id.notin_(allocated_employee_ids),
+            Employee.id.notin_(on_leave_ids)
+        )
+    elif status == "inactive":
+        query = query.filter(
+            Employee.status != "archived",
+            Employee.id.in_(on_leave_ids)
+        )
+    elif status == "active":
+        query = query.filter(
+            Employee.status != "archived",
+            Employee.id.notin_(on_leave_ids),
+            Employee.id.in_(allocated_employee_ids)
+        )
+    elif status == "archived":
+        query = query.filter(Employee.status == "archived")
     elif not include_archived:
         query = query.filter(Employee.status != "archived")
     if search and search.strip():
@@ -428,6 +457,116 @@ def list_employees_paginated(
         Leave.status != "rejected"
     ).distinct()
 
+    allocated_employee_ids = db.query(Allocation.employee_id).filter(
+        Allocation.is_active == True,
+        Allocation.employee_id.isnot(None)
+    ).distinct()
+
+    if status == "idle":
+        query = query.filter(
+            Employee.status != "archived",
+            Employee.id.notin_(allocated_employee_ids),
+            Employee.id.notin_(on_leave_ids)
+        )
+    elif status == "inactive":
+        query = query.filter(
+            Employee.status != "archived",
+            Employee.id.in_(on_leave_ids)
+        )
+    elif status == "active":
+        query = query.filter(
+            Employee.status != "archived",
+            Employee.id.notin_(on_leave_ids),
+            Employee.id.in_(allocated_employee_ids)
+        )
+    elif status == "archived":
+        query = query.filter(Employee.status == "archived")
+    elif not include_archived:
+        query = query.filter(Employee.status != "archived")
+    
+    total = query.count()
+    if sort_by == "name-asc":
+        query = query.order_by(Employee.name.asc())
+    elif sort_by == "name-desc":
+        query = query.order_by(Employee.name.desc())
+    else:
+        query = query.order_by(Employee.id.desc())
+        
+    items = query.offset((page - 1) * limit).limit(limit).all()
+    
+    # Compute `assigned_projects` and `managers` for the 10 fetched items
+    emp_ids = [e.id for e in items]
+    emp_dict = {e.id: EmployeeResponse.model_validate(e).model_dump(mode='json') for e in items}
+    
+    if emp_ids:
+        from app.models.allocation import Allocation
+        from app.models.project import DailySheet
+        from app.models.parent_project import MainProject
+        from app.models.sub_project import SubProject as HierarchySubProject
+        
+        allocations = db.query(Allocation).filter(Allocation.employee_id.in_(emp_ids), Allocation.is_active == True).all()
+        ds_ids = list(set([a.sub_project_id for a in allocations if a.sub_project_id]))
+        
+        daily_sheets = db.query(DailySheet).filter(DailySheet.id.in_(ds_ids)).all()
+        ds_by_id = {ds.id: ds for ds in daily_sheets}
+        
+        mp_ids = list(set([ds.main_project_id for ds in daily_sheets if ds.main_project_id]))
+        main_projects = db.query(MainProject).filter(MainProject.id.in_(mp_ids)).all()
+        mp_by_id = {mp.id: mp for mp in main_projects}
+        
+        hsp_ids = list(set([ds.sub_project_id for ds in daily_sheets if ds.sub_project_id]))
+        hierarchy_sub_projects = db.query(HierarchySubProject).filter(HierarchySubProject.id.in_(hsp_ids)).all()
+        hsp_by_id = {hsp.id: hsp for hsp in hierarchy_sub_projects}
+        
+        manager_emp_ids = list(set(
+            [mp.program_manager_id for mp in main_projects if mp.program_manager_id] +
+            [hsp.pm_id for hsp in hierarchy_sub_projects if hsp.pm_id]
+        ))
+        managers = db.query(Employee).filter(Employee.id.in_(manager_emp_ids)).all()
+        manager_by_id = {m.id: m for m in managers}
+        
+        for alloc in allocations:
+            ds = ds_by_id.get(alloc.sub_project_id)
+            if not ds: continue
+            
+            proj_name = ds.name
+            pm_name = None
+            
+            if ds.main_project_id:
+                mp = mp_by_id.get(ds.main_project_id)
+                if mp and mp.program_manager_id:
+                    m = manager_by_id.get(mp.program_manager_id)
+                    if m: pm_name = m.name
+            
+            if not pm_name and ds.sub_project_id:
+                hsp = hsp_by_id.get(ds.sub_project_id)
+                if hsp and hsp.pm_id:
+                    m = manager_by_id.get(hsp.pm_id)
+                    if m: pm_name = m.name
+                    
+            if not pm_name:
+                pm_name = "Unassigned"
+                
+            e_dict = emp_dict[alloc.employee_id]
+            if "assigned_projects" not in e_dict or not e_dict["assigned_projects"]:
+                e_dict["assigned_projects"] = []
+            if proj_name not in e_dict["assigned_projects"]:
+                e_dict["assigned_projects"].append(proj_name)
+                
+            if "managers" not in e_dict or not e_dict["managers"]:
+                e_dict["managers"] = []
+            if pm_name not in e_dict["managers"]:
+                e_dict["managers"].append(pm_name)
+    
+    # Convert dict values to a sorted list to match the original `items` order
+    final_items = [emp_dict[e.id] for e in items]
+    
+    return {
+        "items": final_items,
+        "total": total,
+        "page": page,
+        "limit": limit
+    }
 
 
 @router.get("/status/active", response_model=list[EmployeeResponse], dependencies=[Depends(require_role("admin", "pm"))])
@@ -448,7 +587,228 @@ def get_idle_employees(db: Session = Depends(get_db)):
         Employee.id.notin_(allocated_employee_ids)
     ).all()
 
+# ✅ GET EMPLOYEE STATS
+@router.get("/stats", dependencies=[Depends(require_role("admin", "pm"))])
+def employee_stats(db: Session = Depends(get_db)):
+    by_designation = db.query(Employee.designation, func.count(Employee.id)).filter(Employee.status != "archived").group_by(Employee.designation).all()
+    by_type = db.query(Employee.employee_type, func.count(Employee.id)).filter(Employee.status != "archived").group_by(Employee.employee_type).all()
+    by_type_active = db.query(Employee.employee_type, func.count(Employee.id)).filter(Employee.status == "active").group_by(Employee.employee_type).all()
+    
+    today = date.today()
+    on_leave_ids = [r[0] for r in db.query(Leave.employee_id).filter(
+        Leave.start_date <= today,
+        Leave.end_date >= today,
+        Leave.status != "rejected"
+    ).distinct().all()]
+    
+    allocated_ids = [r[0] for r in db.query(Allocation.employee_id).filter(Allocation.is_active == True).distinct().all()]
+    
+    active_roster = db.query(Employee.id).filter(Employee.status != "archived").all()
+    active_roster_ids = [r[0] for r in active_roster]
+    
+    leave_count = sum(1 for eid in active_roster_ids if eid in on_leave_ids)
+    idle_count = sum(1 for eid in active_roster_ids if eid not in on_leave_ids and eid not in allocated_ids)
+    
+    total_roster = len(active_roster_ids)
+    active_count = total_roster - leave_count - idle_count
+    archived_count = db.query(Employee.id).filter(Employee.status == "archived").count()
+
+    by_status_dict = {
+        "active": active_count,
+        "inactive": leave_count,
+        "idle": idle_count,
+        "archived": archived_count
+    }
+
+    return {
+        "by_designation": dict(by_designation),
+        "by_status": by_status_dict,
+        "by_type": dict(by_type),
+        "by_type_active": dict(by_type_active),
+        "total": total_roster
+    }
+
 # ✅ GET EMPLOYEE BY ID
+@router.get("/team-kpi", response_model=dict, dependencies=[Depends(require_role("pm", "team_lead"))])
+def get_team_kpis(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from app.models.allocation import Allocation
+    from app.models.project import DailySheet
+    from app.models.leave import Leave
+    from app.services.project_scope import can_act_on_project, has_full_access
+    from datetime import date
+    
+    # 1. Get scoped projects
+    all_projects = db.query(DailySheet).all()
+    if has_full_access(current_user):
+        scoped_projects = all_projects
+    else:
+        scoped_projects = [p for p in all_projects if can_act_on_project(db, current_user, p)]
+    
+    scoped_project_ids = [p.id for p in scoped_projects]
+    
+    # Project Health
+    active_projects = sum(1 for p in scoped_projects if (p.project_status or "active").lower().strip() == "active")
+    on_hold_projects = sum(1 for p in scoped_projects if (p.project_status or "").lower().strip() == "on-hold")
+    completed_projects = sum(1 for p in scoped_projects if (p.project_status or "").lower().strip() == "completed")
+    
+    # 2. Get scoped employees & allocations
+    if not scoped_project_ids:
+        return {
+            "capacity": {"optimal": 0, "over": 0, "unassigned": 0},
+            "projects": {"active": active_projects, "on_hold": on_hold_projects, "completed": completed_projects},
+            "attendance": {"wfo": 0, "wfh": 0, "leave": 0},
+            "roles": {"tl": 0, "annotator": 0}
+        }
+        
+    allocations = db.query(Allocation).filter(
+        Allocation.sub_project_id.in_(scoped_project_ids),
+        Allocation.is_active == True
+    ).all()
+    
+    emp_hours = {}
+    emp_ids = set()
+    for a in allocations:
+        if a.employee_id:
+            emp_ids.add(a.employee_id)
+            emp_hours[a.employee_id] = emp_hours.get(a.employee_id, 0) + (a.total_daily_hours or 0)
+            
+    optimal = sum(1 for h in emp_hours.values() if 6 <= h <= 8)
+    over = sum(1 for h in emp_hours.values() if h > 8)
+    unassigned = sum(1 for h in emp_hours.values() if h == 0)
+    
+    # 3. Attendance
+    today = date.today().isoformat()
+    leaves = db.query(Leave).filter(
+        Leave.employee_id.in_(emp_ids),
+        Leave.start_date <= today,
+        Leave.end_date >= today,
+        Leave.status == "Approved"
+    ).all()
+    on_leave_ids = {l.employee_id for l in leaves}
+    
+    employees = db.query(Employee).filter(Employee.id.in_(emp_ids)).all()
+    wfo = 0
+    wfh = 0
+    for e in employees:
+        if e.id in on_leave_ids:
+            continue
+        wm = (e.work_model or "WFO").upper()
+        if "WFO" in wm or "OFFICE" in wm:
+            wfo += 1
+        else:
+            wfh += 1
+            
+    # 4. Roles
+    tl_count = sum(1 for e in employees if "lead" in (e.designation or "").lower() or "tl" in (e.designation or "").lower())
+    annotator_count = sum(1 for e in employees if "annotator" in (e.designation or "").lower() or "reviewer" in (e.designation or "").lower())
+    
+    return {
+        "capacity": {"optimal": optimal, "over": over, "unassigned": unassigned},
+        "projects": {"active": active_projects, "on_hold": on_hold_projects, "completed": completed_projects},
+        "attendance": {"wfo": wfo, "wfh": wfh, "leave": len(on_leave_ids)},
+        "roles": {"tl": tl_count, "annotator": annotator_count}
+    }
+
+
+@router.get("/team-data", response_model=dict, dependencies=[Depends(require_role("pm", "team_lead"))])
+def get_team_data(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    from app.models.allocation import Allocation
+    from app.models.project import DailySheet
+    from app.models.parent_project import MainProject
+    from app.schemas.employee import EmployeeResponse
+    from app.services.project_scope import can_act_on_project, has_full_access
+    
+    all_projects = db.query(DailySheet).all()
+    if has_full_access(current_user):
+        scoped_projects = all_projects
+    else:
+        scoped_projects = [p for p in all_projects if can_act_on_project(db, current_user, p)]
+        
+    scoped_project_ids = [p.id for p in scoped_projects]
+    
+    if not scoped_project_ids:
+        return {"projects": [], "allocations": [], "employees": []}
+        
+    allocations = db.query(Allocation).filter(
+        Allocation.sub_project_id.in_(scoped_project_ids),
+        Allocation.is_active == True
+    ).all()
+    
+    emp_ids = list(set([a.employee_id for a in allocations if a.employee_id]))
+    
+    employees = db.query(Employee).filter(Employee.id.in_(emp_ids)).all()
+    
+    # Fetch leaves and wfh requests for these employees
+    from app.models.leave import Leave
+    from app.models.wfh import WFHRequest
+    
+    leaves = db.query(Leave).filter(Leave.employee_id.in_(emp_ids)).all()
+    wfh_requests = db.query(WFHRequest).filter(WFHRequest.employee_id.in_(emp_ids)).all()
+
+    # We only return the specific fields the frontend needs to avoid sending huge payloads
+    return {
+        "projects": [
+            {
+                "id": p.id,
+                "name": p.name,
+                "client": p.client,
+                "project_status": p.project_status,
+                "main_project_id": p.main_project_id
+            } for p in scoped_projects
+        ],
+        "allocations": [
+            {
+                "id": a.id,
+                "employee_id": a.employee_id,
+                "sub_project_id": a.sub_project_id,
+                "total_daily_hours": a.total_daily_hours
+            } for a in allocations
+        ],
+        "employees": [EmployeeResponse.model_validate(e).model_dump(mode='json') for e in employees],
+        "leaves": [
+            {
+                "id": l.id,
+                "leave_id": l.id,
+                "employee_id": l.employee_id,
+                "start_date": l.start_date.isoformat() if l.start_date else None,
+                "end_date": l.end_date.isoformat() if l.end_date else None,
+                "status": l.status,
+                "leave_type": l.leave_type,
+                "reason": l.reason,
+                "is_half_day": l.is_half_day,
+                "half_day_slot": l.half_day_slot,
+                "is_emergency": getattr(l, "is_emergency", False),
+                "flagged": getattr(l, "flagged", False),
+                "approval_remark": getattr(l, "approval_remark", None),
+                "approved_by": l.approved_by,
+                "created_at": l.created_at.isoformat() if getattr(l, "created_at", None) else None,
+                "updated_at": l.updated_at.isoformat() if getattr(l, "updated_at", None) else None,
+            } for l in leaves
+        ],
+        "wfh_requests": [
+            {
+                "id": w.id,
+                "employee_id": w.employee_id,
+                "wfh_date": w.wfh_date.isoformat() if w.wfh_date else None,
+                "start_date": w.wfh_date.isoformat() if w.wfh_date else None,
+                "end_date": w.end_date.isoformat() if w.end_date else None,
+                "status": w.status,
+                "reason": w.reason,
+                "remark": w.remark,
+                "flagged": getattr(w, "flagged", False),
+                "approved_by": w.approved_by,
+                "created_at": w.created_at.isoformat() if w.created_at else None
+            } for w in wfh_requests
+        ]
+    }
+
+
 @router.get("/{employee_id}", response_model=EmployeeResponse)
 def get_employee(
     employee_id: int,
@@ -1241,3 +1601,5 @@ def delete_employee_avatar(
     # delete and is skipped.
     delete_from_bucket(AVATAR_BUCKET, old_url)
     return employee
+
+

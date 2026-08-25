@@ -67,11 +67,13 @@ class PerformanceReviewResponse(BaseModel):
         from_attributes = True
 
 
-@router.get("", response_model=list[PerformanceReviewResponse])
+@router.get("", response_model=dict)
 def list_reviews(
     employee_id: Optional[int] = None,
     reviewer_id: Optional[int] = None,
     review_type: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    limit: int = Query(25, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -82,12 +84,13 @@ def list_reviews(
         query = query.filter(PerformanceReview.reviewer_id == reviewer_id)
     if review_type:
         query = query.filter(PerformanceReview.review_type == review_type)
- 
+
+    all_reviews = query.order_by(PerformanceReview.created_at.desc()).all()
+
     # Same pattern as perf_eval.list_evals: admins/HR see everything; a PM only sees
     # reviews for employees they actually manage. Without this, `employee_id` filter
     # is optional and omitting it returned the whole company's reviews to any PM.
     if not project_scope.has_full_access(current_user):
-        all_reviews = query.order_by(PerformanceReview.created_at.desc()).all()
         manageable_cache: dict[int, bool] = {}
         filtered_reviews = []
         for review in all_reviews:
@@ -97,12 +100,17 @@ def list_reviews(
                 )
             if manageable_cache[review.employee_id]:
                 filtered_reviews.append(review)
- 
-        return filtered_reviews
-    else:
-        return query.order_by(PerformanceReview.created_at.desc()).all()
- 
+        all_reviews = filtered_reviews
 
+    total = len(all_reviews)
+    items = all_reviews[(page - 1) * limit : page * limit]
+
+    return {
+        "items": [PerformanceReviewResponse.model_validate(item).model_dump() for item in items],
+        "total": total,
+        "page": page,
+        "limit": limit
+    }
 
 
 @router.get("/{review_id}", response_model=PerformanceReviewResponse)

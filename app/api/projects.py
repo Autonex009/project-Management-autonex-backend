@@ -718,6 +718,200 @@ def get_projects_kpi(
     }
 
 
+# ✅ LIST PROJECTS (PAGINATED)
+def _get_filtered_enriched_projects(
+    db: Session,
+    current_user: User,
+    search: str | None = None,
+    project_view: str | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+    organization: str | None = None,
+    autonex_only: bool = False,
+    pm_id: int | None = None,
+    team_lead_id: int | None = None,
+    recommendation: str | None = None,
+    main_project_id: int | None = None
+):
+    query = db.query(Project).order_by(Project.id.asc())
+    
+    if search:
+        query = query.filter(Project.name.ilike(f"%{search}%"))
+    if priority and priority != "all":
+        query = query.filter(Project.priority == priority)
+    if main_project_id:
+        query = query.filter(Project.main_project_id == main_project_id)
+        
+    all_projects = query.all()
+    
+    if current_user.role in ("pm", "hr", "team_lead") and not project_scope.has_full_access(current_user):
+        all_projects = [p for p in all_projects if project_scope.can_act_on_project(db, current_user, p)]
+        
+    enriched = []
+    
+    for p in all_projects:
+        # Client / Organization
+        if organization and organization != "all":
+            if (p.client or "") != organization:
+                continue
+                
+        # Autonex only
+        if autonex_only:
+            ann = getattr(p, "autonex_annotators", 0) or 0
+            rev = getattr(p, "autonex_reviewers", 0) or 0
+            if (ann + rev) <= 0:
+                continue
+                
+        # Status and project_view
+        status_val = (p.project_status or "active").lower().strip()
+        archived_statuses = ["completed", "on-hold", "cancelled"]
+        is_archived = status_val in archived_statuses
+        
+        types = p.project_types or {}
+        is_dev = bool(types and "Development" in types)
+        
+        if project_view == "development":
+            if not is_dev: continue
+        elif project_view == "archived":
+            if is_dev or not is_archived: continue
+        elif project_view in ("active", "active_projects"):
+            if is_dev or is_archived: continue
+            
+        if status and status != "all":
+            if status == "active":
+                if status_val not in ("active", "in-progress", "in progress"):
+                    continue
+            elif status == "poc":
+                if status_val != "poc": continue
+            else:
+                if status_val != status.lower(): continue
+
+        # Enrich early for PM / Team Lead and recommendation
+        enriched_p = enrich_project_response(db, p)
+        
+        if pm_id and pm_id != "all":
+            # In frontend, PM is someone who escalates_to_admin and is allocated (or in assigned_employee_ids)
+            # Backend enrich_project_response calculates `allocated_pm_count`, but doesn't return list of PMs.
+            # To strictly match UI, check assigned_employee_ids or allocations. For simplicity, just check assigned_employee_ids:
+            assigned = p.assigned_employee_ids or []
+            if str(pm_id) not in [str(x) for x in assigned]:
+                continue
+                
+        if team_lead_id and team_lead_id != "all":
+            # To perfectly filter by team lead, we check allocations for this project
+            allocs = db.query(Allocation).filter(
+                Allocation.sub_project_id == p.id,
+                Allocation.employee_id == team_lead_id,
+                Allocation.is_active == True
+            ).first()
+            if not allocs or TEAM_LEAD_ROLE_TAG not in (allocs.role_tags or []):
+                continue
+                
+        if recommendation and recommendation != "all":
+            cap_status = enriched_p.get("capacity", {}).get("status", "")
+            if cap_status.lower() != recommendation.lower():
+                continue
+                
+        enriched.append(enriched_p)
+        
+    return enriched
+
+
+@router.get("/paginated", response_model=dict)
+def list_projects_paginated(
+    page: int = Query(1, ge=1),
+    limit: int = Query(5, ge=1, le=100),
+    search: str | None = None,
+    project_view: str | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+    organization: str | None = None,
+    autonex_only: bool = False,
+    pm_id: int | None = None,
+    team_lead_id: int | None = None,
+    recommendation: str | None = None,
+    main_project_id: int | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    enriched = _get_filtered_enriched_projects(
+        db, current_user, search, project_view, status, priority, 
+        organization, autonex_only, pm_id, team_lead_id, recommendation, main_project_id
+    )
+    
+    total = len(enriched)
+    paginated = enriched[(page - 1) * limit : page * limit]
+    
+    return {
+        "items": paginated,
+        "total": total,
+        "page": page,
+        "limit": limit
+    }
+
+# ✅ PROJECT KPI
+@router.get("/kpi", response_model=dict)
+def get_projects_kpi(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    # Fetch all enriched projects without filters to calculate global KPIs
+    enriched = _get_filtered_enriched_projects(db, current_user)
+    
+    metrics = {
+        "totalProjects": len(enriched),
+        "activeProjects": 0,
+        "overburdenedProjects": 0,
+        "balancedProjects": 0,
+        "onHoldProjects": 0,
+        "completedProjects": 0,
+        "cancelledProjects": 0
+    }
+    
+    tab_counts = {
+        "active": 0,
+        "archived": 0,
+        "development": 0
+    }
+    
+    for p in enriched:
+        status_val = (p.get("project_status") or "active").lower().strip()
+        archived_statuses = ["completed", "on-hold", "cancelled"]
+        is_archived = status_val in archived_statuses
+        
+        types = p.get("project_types") or {}
+        is_dev = bool(types and "Development" in types)
+        
+        # Tab counts
+        if is_dev:
+            tab_counts["development"] += 1
+        elif is_archived:
+            tab_counts["archived"] += 1
+        else:
+            tab_counts["active"] += 1
+            
+        # Metrics
+        if not is_archived and not is_dev:
+            metrics["activeProjects"] += 1
+            cap = p.get("capacity", {}).get("status", "")
+            if cap == "overburden":
+                metrics["overburdenedProjects"] += 1
+            elif cap == "balanced":
+                metrics["balancedProjects"] += 1
+                
+        if status_val == "completed":
+            metrics["completedProjects"] += 1
+        elif status_val == "on-hold":
+            metrics["onHoldProjects"] += 1
+        elif status_val == "cancelled":
+            metrics["cancelledProjects"] += 1
+            
+    return {
+        "metrics": metrics,
+        "tab_counts": tab_counts
+    }
+
+
 # ✅ UPDATE PROJECT
 @router.put("/{project_id}", response_model=ProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def update_project(

@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, status
 from app.services.auth_service import get_current_user, has_team_read, require_role
 from app.services import audit_service, project_scope
 from app.models.user import User
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 
 from app.db.database import get_db
 from app.models.allocation import Allocation
@@ -11,13 +11,21 @@ from app.models.project import SubProject, Project  # SubProject with Project al
 from app.models.employee import Employee
 from app.models.parent_project import MainProject
 from app.models.sub_project import SubProject as HierarchySubProject
+from datetime import date as date_cls
+from app.models.leave import Leave
+from app.models.wfh import WFHRequest
 from app.schemas.allocation import (
     AllocationCreate, 
     AllocationUpdate, 
     AllocationResponse,
     AllocationValidationRequest,
     AllocationValidationResponse,
-    EmployeeAllocationStatus
+    EmployeeAllocationStatus,
+    AllocationsPageResponse,
+    ProjectAllocationRow,
+    AllocatedEmployeePreview,
+    ProjectAllocationDetailResponse,
+    ProjectAllocationDetailItem,
 )
 from app.services.allocation_validator import (
     validate_time_distribution,
@@ -299,7 +307,7 @@ def get_project_allocation_detail(
             ))
 
     items = []
-    
+
     today = date_cls.today()
     leaves = db.query(Leave).filter(
         Leave.employee_id.in_(employee_ids),
@@ -323,7 +331,7 @@ def get_project_allocation_detail(
         
         is_wfh = emp and emp.id in wfh_ids
         location = "WFH" if is_wfh else ("WFO" if emp else None)
-        
+
         items.append(ProjectAllocationDetailItem(
             allocation_id=a.id,
             employee_id=a.employee_id,

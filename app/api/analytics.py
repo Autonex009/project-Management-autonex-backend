@@ -54,7 +54,7 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
         Leave.status == "approved"
     ).all()
     on_leave_ids = [r[0] for r in on_leave_today_query]
-    
+
     idle_count = db.query(Employee).filter(
         Employee.status == "active",
         Employee.id.notin_(allocated_employee_ids),
@@ -115,7 +115,6 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
     # 4. Projects
     project_stats = db.query(DailySheet.project_status, func.count(DailySheet.id)).group_by(DailySheet.project_status).all()
     proj_dict = dict(project_stats)
-    
 
     from app.models.parent_project import MainProject
     import json
@@ -914,7 +913,7 @@ def my_encord_activity(
     """
     days = max(1, min(int(days or 7), 90))
 
-    if employee_id and current_user.role in ("admin", "pm", "hr"):
+    if employee_id and current_user.role in ("admin", "pm", "hr", "team_lead"):
         emp = db.query(Employee).filter(Employee.id == employee_id).first()
     else:
         emp = _resolve_employee(db, current_user)
