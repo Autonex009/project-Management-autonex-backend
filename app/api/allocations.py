@@ -1,9 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from app.services.auth_service import get_current_user, has_team_read, require_role
 from app.services import audit_service, project_scope
 from app.models.user import User
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import List
 
 from app.db.database import get_db
 from app.models.allocation import Allocation
@@ -11,21 +11,13 @@ from app.models.project import SubProject, Project  # SubProject with Project al
 from app.models.employee import Employee
 from app.models.parent_project import MainProject
 from app.models.sub_project import SubProject as HierarchySubProject
-from datetime import date as date_cls
-from app.models.leave import Leave
-from app.models.wfh import WFHRequest
 from app.schemas.allocation import (
     AllocationCreate, 
     AllocationUpdate, 
     AllocationResponse,
     AllocationValidationRequest,
     AllocationValidationResponse,
-    EmployeeAllocationStatus,
-    AllocationsPageResponse,
-    ProjectAllocationRow,
-    AllocatedEmployeePreview,
-    ProjectAllocationDetailResponse,
-    ProjectAllocationDetailItem,
+    EmployeeAllocationStatus
 )
 from app.services.allocation_validator import (
     validate_time_distribution,

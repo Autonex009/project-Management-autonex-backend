@@ -212,7 +212,6 @@ def send_pm_leave_request_message(
     duration_days: int,
     reason: str | None,
     impacted_projects: list[str] | None = None,
-    leave_id: int,
 ) -> bool:
     channel_id = open_direct_message_channel(pm_slack_user_id)
     project_lines = impacted_projects or ["No active project mapping found"]
@@ -283,33 +282,6 @@ def send_pm_leave_request_message(
                         "text": f"*Impacted Projects*\n{projects_text}",
                     },
                 },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Approve",
-                                "emoji": True
-                            },
-                            "style": "primary",
-                            "value": json.dumps({"action": "approve", "type": "leave", "id": leave_id}),
-                            "action_id": "approve_leave"
-                        },
-                        {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Reject",
-                                "emoji": True
-                            },
-                            "style": "danger",
-                            "value": json.dumps({"action": "reject", "type": "leave", "id": leave_id}),
-                            "action_id": "reject_leave"
-                        }
-                    ]
-                }
             ],
         },
     )
@@ -325,130 +297,6 @@ def try_send_pm_leave_request_message(**kwargs) -> bool:
         return send_pm_leave_request_message(**kwargs)
     except Exception as exc:
         logger.warning("Slack PM leave request notification skipped: %s", exc)
-        return False
-
-
-def send_pm_wfh_request_message(
-    *,
-    pm_slack_user_id: str,
-    pm_name: str,
-    employee_name: str,
-    employee_email: str,
-    employee_designation: str | None,
-    start_date: str,
-    end_date: str,
-    duration_days: int,
-    reason: str | None,
-    impacted_projects: list[str] | None = None,
-    wfh_id: int,
-) -> bool:
-    channel_id = open_direct_message_channel(pm_slack_user_id)
-    project_lines = impacted_projects or ["No active project mapping found"]
-    projects_text = "\n".join(f"• {line}" for line in project_lines)
-    normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "No reason provided"
-
-    response = _slack_request(
-        "/chat.postMessage",
-        {
-            "channel": channel_id,
-            "text": f"New WFH request from {employee_name} ({start_date} to {end_date})",
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*New WFH request received*\n{employee_name} has submitted a WFH request in Autonex.",
-                    },
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*PM*\n{pm_name}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Employee*\n{employee_name}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Email*\n{employee_email}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Designation*\n{employee_designation or 'N/A'}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Duration*\n{duration_days} day(s)",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Start Date*\n{start_date}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*End Date*\n{end_date}",
-                        },
-                    ],
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Reason*\n{normalized_reason}",
-                    },
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Impacted Projects*\n{projects_text}",
-                    },
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Approve",
-                                "emoji": True
-                            },
-                            "style": "primary",
-                            "value": json.dumps({"action": "approve", "type": "wfh", "id": wfh_id}),
-                            "action_id": "approve_wfh"
-                        },
-                        {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Reject",
-                                "emoji": True
-                            },
-                            "style": "danger",
-                            "value": json.dumps({"action": "reject", "type": "wfh", "id": wfh_id}),
-                            "action_id": "reject_wfh"
-                        }
-                    ]
-                }
-            ],
-        },
-    )
-
-    if response.get("ok"):
-        return True
-
-    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
-
-
-def try_send_pm_wfh_request_message(**kwargs) -> bool:
-    try:
-        return send_pm_wfh_request_message(**kwargs)
-    except Exception as exc:
-        logger.warning("Slack PM WFH request notification skipped: %s", exc)
         return False
 
 
@@ -522,79 +370,6 @@ def try_send_leave_status_message(**kwargs) -> bool:
         return send_leave_status_message(**kwargs)
     except Exception as exc:
         logger.warning("Slack leave status notification skipped: %s", exc)
-        return False
-
-
-def send_wfh_status_message(*, employee_email: str, employee_name: str, start_date: str, end_date: str, pm_name: str, approved: bool) -> bool:
-    user_id = lookup_user_id_by_email(employee_email)
-    if not user_id:
-        return False
-    channel_id = open_direct_message_channel(user_id)
-
-    if approved:
-        plain_text = f"WFH Approved: Your WFH request from {start_date} to {end_date} has been approved by {pm_name}."
-        headline = f":white_check_mark: WFH Approved: Your WFH request from {start_date} to {end_date} has been approved by {pm_name}."
-        status_label = "Approved"
-        status_emoji = ":white_check_mark:"
-    else:
-        plain_text = f"WFH Update: Your WFH request from {start_date} to {end_date} has been declined by {pm_name}. Please reach out to them for more details."
-        headline = f":x: WFH Update: Your WFH request from {start_date} to {end_date} has been declined by {pm_name}. Please reach out to them for more details."
-        status_label = "Declined"
-        status_emoji = ":x:"
-
-    response = _slack_request(
-        "/chat.postMessage",
-        {
-            "channel": channel_id,
-            "text": plain_text,
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": headline,
-                    },
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Employee*\n{employee_name}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Status*\n{status_emoji} {status_label}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Start Date*\n{start_date}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*End Date*\n{end_date}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Approved By*\n{pm_name}",
-                        },
-                    ],
-                },
-            ],
-        },
-    )
-
-    if response.get("ok"):
-        return True
-
-    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
-
-
-def try_send_wfh_status_message(**kwargs) -> bool:
-    try:
-        return send_wfh_status_message(**kwargs)
-    except Exception as exc:
-        logger.warning("Slack WFH status notification skipped: %s", exc)
         return False
 
 

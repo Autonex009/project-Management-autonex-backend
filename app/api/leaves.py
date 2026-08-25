@@ -3,40 +3,6 @@ import os
 from datetime import timedelta, date as date_type, timezone, datetime, time as time_type
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from typing import List, Optional, Dict, Any
-
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
-from fastapi import Request as HTTPRequest
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
-from pydantic import BaseModel
-
-from app.db.database import get_db
-from app.constants.leave_types import (
-    RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type,
-    is_valid_floater_date, get_floater_dates_for_year,
-    is_weekend, is_fixed_holiday, get_fixed_holidays_for_year,
-    is_intern_or_contractor,
-)
-from app.models.allocation import Allocation
-from app.models.employee import Employee
-from app.models.leave import Leave
-from app.models.parent_project import MainProject
-from app.models.project import DailySheet
-from app.models.sub_project import SubProject
-from app.models.user import User
-from app.models.notification import Notification
-from app.models.wfh import WFHRequest
-from app.schemas.leave import Leave as LeaveSchema, LeaveCreate
-from app.services.slack_service import (
-    get_or_cache_employee_slack_user_id,
-    try_get_or_cache_employee_slack_user_id,
-    try_send_leave_applied_message,
-    try_send_pm_leave_request_message,
-    try_send_leave_status_message,
-)
-from app.services.auth_service import get_current_user, has_team_read, require_role
-from app.services import audit_service, project_scope
 
 
 def get_current_ist_datetime() -> datetime:
@@ -313,15 +279,11 @@ def _get_pm_notification_targets(db: Session, employee: Employee, leave: Leave) 
 
         allocation_start = allocation.active_start_date or project.start_date
         allocation_end = allocation.active_end_date or project.end_date
-        if not allocation_start:
+        if not allocation_start or not allocation_end:
             continue
 
-        if allocation_end:
-            if not _date_ranges_overlap(leave.start_date, leave.end_date, allocation_start, allocation_end):
-                continue
-        else:
-            if leave.end_date < allocation_start:
-                continue
+        if not _date_ranges_overlap(leave.start_date, leave.end_date, allocation_start, allocation_end):
+            continue
 
         sub_project = sub_project_map.get(project.sub_project_id) if project.sub_project_id else None
         main_project = main_project_map.get(project.main_project_id) if project.main_project_id else None
@@ -1120,7 +1082,6 @@ def create_leave(
             duration_days=duration_days,
             reason=leave.reason,
             impacted_projects=target["impacted_projects"],
-            leave_id=leave.id,
         )
         # In-app notification for PM (real PM only — admin fallback handled below)
         pm_emp_id = getattr(target["pm_employee"], "id", None)

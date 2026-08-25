@@ -914,7 +914,7 @@ def my_encord_activity(
     """
     days = max(1, min(int(days or 7), 90))
 
-    if employee_id and current_user.role in ("admin", "pm", "hr", "team_lead"):
+    if employee_id and current_user.role in ("admin", "pm", "hr"):
         emp = db.query(Employee).filter(Employee.id == employee_id).first()
     else:
         emp = _resolve_employee(db, current_user)

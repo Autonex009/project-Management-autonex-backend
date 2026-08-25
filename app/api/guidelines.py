@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from app.services.auth_service import get_current_user, require_role
 from app.services.storage_service import delete_guideline_file, upload_guideline_file
 from pydantic import BaseModel
@@ -17,9 +17,6 @@ from app.db.database import get_db
 from app.models.guideline import Guideline
 from app.models.user import User
 from app.services import audit_service
-
-from app.services import guideline_board_service
-from app.services.guideline_board_service import GuidelinesPageResponse
 
 router = APIRouter(prefix="/api/guidelines", tags=["Guidelines"], dependencies=[Depends(get_current_user)])
 
@@ -57,24 +54,6 @@ class GuidelineResponse(BaseModel):
 
     class Config:
         from_attributes = True
-
-@router.get("/page", response_model=GuidelinesPageResponse)
-def get_guidelines_page(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(12, ge=1, le=100),
-    search: Optional[str] = Query(None, max_length=200),
-    main_project_id: Optional[int] = Query(None),
-    sub_project_id: Optional[int] = Query(None),
-    uploaded_by: Optional[int] = Query(None),
-    db: Session = Depends(get_db),
-):
-    """Server-side paginated, joined, and searched Guidelines listing.
-    Must stay registered before /{guideline_id} — otherwise FastAPI tries to
-    parse 'page' as guideline_id: int and returns 422 instead of matching here.
-    """
-    return guideline_board_service.get_guidelines_page(
-        db, page, page_size, search, main_project_id, sub_project_id, uploaded_by
-    )
 
 
 @router.get("", response_model=List[GuidelineResponse])

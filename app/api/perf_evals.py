@@ -15,7 +15,7 @@ Flow:
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException
 from app.services.auth_service import get_current_user, has_team_read, require_role
 from app.services import project_scope
 from pydantic import BaseModel, field_validator
@@ -290,14 +290,12 @@ class PerfEvalResponse(BaseModel):
         from_attributes = True
 
 
-@router.get("", response_model=dict)
+@router.get("", response_model=List[PerfEvalResponse])
 def list_evals(
     project_id: Optional[int] = None,
     employee_id: Optional[int] = None,
     period: Optional[str] = None,
     status: Optional[str] = None,
-    page: int = Query(1, ge=1),
-    limit: int = Query(25, ge=1, le=100),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -326,34 +324,17 @@ def list_evals(
     if status:
         q = q.filter(PerfEvaluation.status == status)
     
-    # Filter by read privacy first
+    evals = q.order_by(PerfEvaluation.period.desc(), PerfEvaluation.created_at.desc()).all()
+    
+    # Filter by read privacy
     if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
-        # We need to filter the query itself rather than fetching all and filtering in-memory
-        # But for simplicity, if we have to do it in-memory, we can't easily paginate the db query.
-        # Let's fetch all, filter, then paginate.
-        all_evals = q.order_by(PerfEvaluation.period.desc(), PerfEvaluation.created_at.desc()).all()
         manageable_cache = {current_user.employee_id: True}
-        filtered_evals = []
-        for ev in all_evals:
+        for ev in evals:
             if ev.employee_id not in manageable_cache:
                 manageable_cache[ev.employee_id] = project_scope.can_manage_employee(db, current_user, ev.employee_id)
-            if manageable_cache.get(ev.employee_id, False):
-                filtered_evals.append(ev)
+        evals = [ev for ev in evals if manageable_cache.get(ev.employee_id, False)]
         
-        total = len(filtered_evals)
-        items = filtered_evals[(page - 1) * limit : page * limit]
-    else:
-        total = q.count()
-        items = q.order_by(PerfEvaluation.period.desc(), PerfEvaluation.created_at.desc())\
-                 .offset((page - 1) * limit)\
-                 .limit(limit).all()
-                 
-    return {
-        "items": [PerfEvalResponse.model_validate(item).model_dump() for item in items],
-        "total": total,
-        "page": page,
-        "limit": limit
-    }
+    return evals
 
 
 @router.get("/dashboard", response_model=dict)
