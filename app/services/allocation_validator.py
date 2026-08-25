@@ -13,7 +13,9 @@ from typing import List, Optional, Dict, Any
 from app.models.allocation import Allocation
 from app.models.employee import Employee
 from app.models.leave import Leave
-
+from collections import defaultdict
+from datetime import date
+from typing import List, Dict, Any, Optional
 
 class AllocationValidationError(Exception):
     """Custom exception for allocation validation failures."""
@@ -325,89 +327,121 @@ def check_double_booking(
 
 def get_employee_allocation_status(
     db: Session,
-    employee_id: int
-) -> Dict[str, Any]:
+    employee_id: int,
+    *,
+    employee: Optional[Employee] = None,
+    allocations: Optional[List[Allocation]] = None,
+) -> Optional[Dict[str, Any]]:
     """
-    Get current allocation status for an employee.
-    Used for UI grouping (Unallocated/Partial/Full).
-    
-    Returns:
-        {
-            'employee_id': int,
-            'employee_name': str,
-            'status': 'unallocated' | 'partial' | 'full',
-            'total_allocated': int,
-            'max_capacity': int,
-            'utilization_percent': float
-        }
+    Get current allocation status for one employee.
+    When called from the bulk path, pass the already-loaded employee and
+    their allocations to avoid extra queries.
     """
-    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if employee is None:
+        employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
         return None
-    
-    today = date.today()
-    allocations = db.query(Allocation).filter(
-        Allocation.employee_id == employee_id,
-        Allocation.is_active == True,
-        or_(
-            Allocation.active_start_date.is_(None),
-            Allocation.active_start_date <= today
-        ),
-        or_(
-            Allocation.active_end_date.is_(None),
-            Allocation.active_end_date >= today
+
+    if allocations is None:
+        today = date.today()
+        allocations = (
+            db.query(Allocation)
+            .filter(
+                Allocation.employee_id == employee_id,
+                Allocation.is_active == True,
+                or_(
+                    Allocation.active_start_date.is_(None),
+                    Allocation.active_start_date <= today,
+                ),
+                or_(
+                    Allocation.active_end_date.is_(None),
+                    Allocation.active_end_date >= today,
+                ),
+            )
+            .all()
         )
-    ).all()
-    
+
     max_capacity = int(employee.working_hours_per_day or 8)
     total_allocated = sum(
         alloc.total_daily_hours or alloc.weekly_hours_allocated or 0
         for alloc in allocations
     )
-    
-    utilization_percent = (total_allocated / max_capacity * 100) if max_capacity > 0 else 0
-    
-    # Determine status
-    if total_allocated == 0:
-        status = 'unallocated'
-    elif total_allocated >= max_capacity:
-        status = 'full'
-    else:
-        status = 'partial'
-    
-    return {
-        'employee_id': employee_id,
-        'employee_name': employee.name,
-        'status': status,
-        'total_allocated': total_allocated,
-        'max_capacity': max_capacity,
-        'utilization_percent': round(utilization_percent, 1)
-    }
 
+    utilization_percent = (
+        (total_allocated / max_capacity * 100) if max_capacity > 0 else 0
+    )
+
+    if total_allocated == 0:
+        status = "unallocated"
+    elif total_allocated >= max_capacity:
+        status = "full"
+    else:
+        status = "partial"
+
+    return {
+        "employee_id": employee.id,
+        "employee_name": employee.name,
+        "status": status,
+        "total_allocated": total_allocated,
+        "max_capacity": max_capacity,
+        "utilization_percent": round(utilization_percent, 1),
+    }
 
 def get_all_employees_allocation_status(
     db: Session,
-    active_only: bool = True
-) -> List[Dict[str, Any]]:
+    active_only: bool = True,
+) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Get allocation status for all employees.
-    Returns employees grouped by allocation status.
+    Get allocation status for all (or all active) employees.
+    Two queries total regardless of employee count.
     """
     query = db.query(Employee)
     if active_only:
-        query = query.filter(Employee.status == 'active')
-    
+        query = query.filter(Employee.status == "active")
     employees = query.all()
-    
-    results = {
-        'unallocated': [],
-        'partial': [],
-        'full': []
+    if not employees:
+        return {"unallocated": [], "partial": [], "full": []}
+
+    employee_ids = [e.id for e in employees]
+    today = date.today()
+
+    # One query for every relevant allocation
+    all_allocations = (
+        db.query(Allocation)
+        .filter(
+            Allocation.employee_id.in_(employee_ids),
+            Allocation.is_active == True,
+            or_(
+                Allocation.active_start_date.is_(None),
+                Allocation.active_start_date <= today,
+            ),
+            or_(
+                Allocation.active_end_date.is_(None),
+                Allocation.active_end_date >= today,
+            ),
+        )
+        .all()
+    )
+
+    # Group by employee_id
+    allocs_by_employee: Dict[int, List[Allocation]] = defaultdict(list)
+    for alloc in all_allocations:
+        allocs_by_employee[alloc.employee_id].append(alloc)
+
+    results: Dict[str, List[Dict[str, Any]]] = {
+        "unallocated": [],
+        "partial": [],
+        "full": [],
     }
-    
+
     for emp in employees:
-        status = get_employee_allocation_status(db, emp.id)
+        status = get_employee_allocation_status(
+            db,
+            emp.id,
+            employee=emp,
+            allocations=allocs_by_employee.get(emp.id, []),
+        )
         if status:
-            results[status['status']].append(status)
-    
+            results[status["status"]].append(status)
+
     return results

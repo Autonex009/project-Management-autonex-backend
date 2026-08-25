@@ -35,6 +35,36 @@ class NotificationResponse(BaseModel):
         from_attributes = True
 
 
+
+@router.get("/unread-summary")
+def get_unread_summary(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return the unread count and the 5 most recent notifications for the bell dropdown."""
+    count = db.query(Notification).filter(
+        Notification.user_id == current_user.id,
+        Notification.is_read == False,
+    ).count()
+
+    latest = db.query(Notification).filter(
+        Notification.user_id == current_user.id
+    ).order_by(Notification.created_at.desc()).limit(5).all()
+
+    return {
+        "unread_count": count,
+        "latest": [
+            {
+                "id": n.id,
+                "title": n.title,
+                "message": n.message,
+                "type": n.type,
+                "is_read": n.is_read,
+                "created_at": n.created_at.isoformat() if n.created_at else None
+            } for n in latest
+        ]
+    }
+
 @router.get("", response_model=List[NotificationResponse])
 def get_notifications(
     user_id: Optional[int] = Query(default=None, deprecated=True),

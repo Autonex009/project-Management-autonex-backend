@@ -102,7 +102,43 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
-DEFAULT_EMPLOYEE_PASSWORD = "emp123"
+@router.get("/slim")
+def get_employees_slim(
+    status: Optional[str] = None,
+    team_only: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Ultra-lightweight endpoint for dropdowns."""
+    query = db.query(
+        Employee.id, Employee.name, Employee.designation, 
+        Employee.status, Employee.employee_type, Employee.skills, Employee.email
+    )
+
+    if status:
+        query = query.filter(Employee.status == status)
+
+    if team_only and current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
+        from app.services import project_scope
+        all_emp_ids = {r[0] for r in db.query(Employee.id).all()}
+        manageable = {
+            eid for eid in all_emp_ids
+            if project_scope.can_manage_employee(db, current_user, eid) or eid == current_user.employee_id
+        }
+        if not manageable:
+            return []
+        query = query.filter(Employee.id.in_(manageable))
+
+    emps = query.all()
+    return [{"id": e[0], "name": e[1], "designation": e[2], "status": e[3], "employee_type": e[4], "skills": e[5], "email": e[6]} for e in emps]
+
+import secrets
+from app.services.email_service import try_send_signup_approved_email
+from app.schemas.employee import EmployeeCreateResponse
+
+def _gen_temp_password(length: int = 8) -> str:
+    """Generate a URL-safe random temporary password."""
+    return secrets.token_urlsafe(length)
 
 # Self-service email changes are confined to the company domain — an employee can
 # move their login onto their real work address, but not onto an arbitrary one.
@@ -139,7 +175,7 @@ def check_employee_access(employee: Employee, current_user: User):
 
 
 # ✅ CREATE EMPLOYEE
-@router.post("", response_model=EmployeeResponse)
+@router.post("", response_model=EmployeeCreateResponse)
 def create_employee(
     payload: EmployeeCreate,
     http_request: Request,
@@ -158,14 +194,16 @@ def create_employee(
     db.add(employee)
     db.flush()
 
+    temp_password = _gen_temp_password()
     user = User(
         email=employee.email,
-        password_hash=hash_password(DEFAULT_EMPLOYEE_PASSWORD),
+        password_hash=hash_password(temp_password),
         name=employee.name,
         role=get_user_role_from_designation(employee.designation),
         employee_id=employee.id,
         skills=employee.skills or [],
         is_active=True,
+        must_change_password=True,
     )
     db.add(user)
 
@@ -201,7 +239,25 @@ def create_employee(
 
     db.commit()
     db.refresh(employee)
-    return employee
+
+    # Deliver welcome email with credentials to employee
+    portal_url = (
+        "https://pmportal.autonexai360.com/login/admin" if user.role in ("admin", "hr")
+        else "https://pmportal.autonexai360.com/login/pm" if user.role in ("pm", "team_lead")
+        else EMPLOYEE_PORTAL_URL
+    )
+    try_send_signup_approved_email(
+        to_email=employee.email,
+        to_name=employee.name,
+        temp_password=temp_password,
+        portal_url=portal_url,
+    )
+
+    response_data = EmployeeCreateResponse.model_validate(employee)
+    response_data.temp_password = temp_password
+    response_data.portal_url = portal_url
+    return response_data
+
 
 
 # ✅ LIST EMPLOYEES
@@ -350,35 +406,45 @@ def list_employees_paginated(
         query = query.distinct(Employee.id)
 
     if col_type:
-        t = col_type.lower()
-        if t == "full-time":
-            query = query.filter(Employee.employee_type.ilike("%full%"))
-        elif t == "intern":
-            query = query.filter(Employee.employee_type.ilike("%intern%"))
-        elif t == "contract":
-            query = query.filter(or_(Employee.employee_type.ilike("%contract%"), Employee.employee_type.ilike("%part%")))
-        else:
-            query = query.filter(func.lower(Employee.employee_type) == t)
+        type_conditions = []
+        for t in [x.strip().lower() for x in col_type.split(",")]:
+            if t == "full-time":
+                type_conditions.append(Employee.employee_type.ilike("%full%"))
+            elif t == "intern":
+                type_conditions.append(Employee.employee_type.ilike("%intern%"))
+            elif t == "contract":
+                type_conditions.append(or_(Employee.employee_type.ilike("%contract%"), Employee.employee_type.ilike("%part%")))
+            else:
+                type_conditions.append(func.lower(Employee.employee_type) == t)
+        if type_conditions:
+            query = query.filter(or_(*type_conditions))
 
     if col_designation:
-        d = col_designation.lower()
-        if d == "manager":
-            query = query.filter(or_(Employee.designation.ilike("%manager%"), Employee.designation.ilike("%pm%")))
-        elif d == "annotator":
-            query = query.filter(or_(Employee.designation.ilike("%annotator%"), Employee.designation.ilike("%reviewer%")))
-        elif d == "tl":
-            query = query.filter(or_(Employee.designation.ilike("%lead%"), Employee.designation.ilike("%tl%")))
-        else:
-            query = query.filter(func.lower(Employee.designation) == d)
+        desig_conditions = []
+        for d in [x.strip().lower() for x in col_designation.split(",")]:
+            if d == "manager":
+                desig_conditions.append(or_(Employee.designation.ilike("%manager%"), Employee.designation.ilike("%pm%"), Employee.designation.ilike("%admin%")))
+            elif d == "annotator":
+                desig_conditions.append(or_(Employee.designation.ilike("%annotator%"), Employee.designation.ilike("%reviewer%")))
+            elif d == "tl":
+                desig_conditions.append(or_(Employee.designation.ilike("%lead%"), Employee.designation.ilike("%tl%"), Employee.designation.ilike("%admin%")))
+            else:
+                desig_conditions.append(func.lower(Employee.designation) == d)
+        if desig_conditions:
+            query = query.filter(or_(*desig_conditions))
 
     if designation:
         # Exact match for the designation tab filter
-        query = query.filter(Employee.designation == designation)
+        desigs = [d.strip() for d in designation.split(",")]
+        query = query.filter(Employee.designation.in_(desigs))
 
     if skill:
-        # Cast JSON to string to search within the array
         from sqlalchemy import cast, String
-        query = query.filter(cast(Employee.skills, String).ilike(f'%"{skill}"%'))
+        skill_conditions = []
+        for s in [x.strip() for x in skill.split(",")]:
+            skill_conditions.append(cast(Employee.skills, String).ilike(f'%"{s}"%'))
+        if skill_conditions:
+            query = query.filter(or_(*skill_conditions))
 
     from app.models.leave import Leave
     from app.models.allocation import Allocation
@@ -904,7 +970,9 @@ def request_employee_email_change(
 
     otp = ''.join(random.choices(string.digits, k=6))
     
-    secret_key = os.getenv("OTP_SECRET_KEY", "fallback_dev_secret")
+    secret_key = os.getenv("OTP_SECRET_KEY")
+    if not secret_key:
+        raise HTTPException(status_code=500, detail="Server misconfiguration: Missing OTP_SECRET_KEY")
     encrypted_otp = hmac.new(secret_key.encode('utf-8'), otp.encode('utf-8'), hashlib.sha256).hexdigest()
 
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
@@ -941,7 +1009,9 @@ def verify_employee_email_change(
 
     check_employee_access(employee, current_user)
 
-    secret_key = os.getenv("OTP_SECRET_KEY", "fallback_dev_secret")
+    secret_key = os.getenv("OTP_SECRET_KEY")
+    if not secret_key:
+        raise HTTPException(status_code=500, detail="Server misconfiguration: Missing OTP_SECRET_KEY")
     provided_hash = hmac.new(secret_key.encode('utf-8'), body.otp.encode('utf-8'), hashlib.sha256).hexdigest()
 
     otp_record = db.query(EmailOtpVerification).filter(

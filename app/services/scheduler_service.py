@@ -40,15 +40,140 @@ def _scheduled_hiring_sync() -> None:
 def _scheduled_encord_sync() -> None:
     db = SessionLocal()
     try:
-        # Daily end-of-day pull: cover the full current day (00:00 → now) plus
-        # yesterday to capture late edits. Upsert makes repeated pulls idempotent.
         now = datetime.now()
         start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         result = run_encord_sync(db, start=start, end=now)
         logger.info(
-            "[scheduler] Encord sync complete — projects=%s inserted=%s updated=%s errors=%s",
-            result["projects"], result["inserted"], result["updated"], result["errors"],
+            "[scheduler] Encord sync complete",
         )
+        
+        # --- NEW CODE ADDED: SLACK LEADERBOARD ---
+        from app.models.encord_analytics import EncordDailyTimeSpent
+        from app.api.analytics import is_autonex_email, _names_for, _hours
+        from app.services.slack_service import send_channel_message
+        from collections import defaultdict
+        
+        today = now.date()
+        
+        def get_top_users(db_session, start_date, end_date, limit=10):
+            rows = db_session.query(EncordDailyTimeSpent).filter(
+                EncordDailyTimeSpent.metric_date >= start_date,
+                EncordDailyTimeSpent.metric_date <= end_date,
+            ).all()
+            user_seconds = defaultdict(int)
+            for r in rows:
+                if is_autonex_email(r.user_email):
+                    user_seconds[r.user_email] += (r.time_spent_seconds or 0)
+            name_by_email = _names_for(db_session, user_seconds.keys())
+            top = [
+                {"user_email": u, "employee_name": name_by_email.get(u), "hours": _hours(s)}
+                for u, s in sorted(user_seconds.items(), key=lambda kv: kv[1], reverse=True)
+            ]
+            return top[:limit]
+        
+        # Monthly Top 10
+        month_start = today.replace(day=1)
+        monthly_users = get_top_users(db, month_start, today)
+        
+        # Weekly Top 10 (Last 7 Days)
+        # Weekly Top 10 (Current Calendar Week: Monday to Today)
+        week_start = today - timedelta(days=today.weekday()) # Monday
+        weekly_users = get_top_users(db, week_start, today)
+        
+        # Daily Top 10 (Today)
+        yesterday = today - timedelta(days=1)
+        daily_users = get_top_users(db, yesterday, yesterday)
+        
+        def users_to_table_rows(users):
+            def make_cell(text):
+                return {"type": "raw_text", "text": str(text)}
+
+            rows = [[make_cell("Rank"), make_cell("Employee Name"), make_cell("Hours")]]
+            medals = ["🥇", "🥈", "🥉"]
+            for index, user in enumerate(users):
+                if index < 3:
+                    rank = medals[index]
+                else:
+                    rank = str(index + 1)
+                    
+                name = user.get("employee_name") or user.get("user_email") or "Unknown"
+                hours = f"{user.get('hours', 0)}h"
+                
+                rows.append([make_cell(rank), make_cell(name), make_cell(hours)])
+            
+            if len(rows) == 1:
+                rows.append([make_cell("-"), make_cell("No data available"), make_cell("-")])
+                
+            return rows
+
+        display_date = yesterday.strftime("%d %b")
+        
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"Autonex Leaderboard Update as of {display_date}",
+                    "emoji": True
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Monthly Top 10*"
+                }
+            },
+            {
+                "type": "table",
+                "rows": users_to_table_rows(monthly_users),
+                "column_settings": [
+                    {"align": "center"},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "right"}
+                ]
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Weekly Top 10 (This Week)*"
+                }
+            },
+            {
+                "type": "table",
+                "rows": users_to_table_rows(weekly_users),
+                "column_settings": [
+                    {"align": "center"},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "right"}
+                ]
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "*Daily Top 10 (Previous Day)*"
+                }
+            },
+            {
+                "type": "table",
+                "rows": users_to_table_rows(daily_users),
+                "column_settings": [
+                    {"align": "center"},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "right"}
+                ]
+            }
+        ]
+        
+        send_channel_message(
+            channel="#encord-leaderboard",
+            text="Autonex Leaderboard Update",
+            blocks=blocks
+        )
+        logger.info("[scheduler] Successfully posted daily leaderboard to Slack.")
+            
     except Exception as exc:
         logger.error("[scheduler] Encord sync failed: %s", exc)
     finally:

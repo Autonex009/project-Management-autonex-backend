@@ -75,3 +75,8 @@ test_slack_trial.py
 leaves_backup.csv
 sync_leaves_from_sheet.py   
 autonex.db.bak
+
+# Local reference audit docs & generator scripts
+*.pdf
+generate_audit_doc.py
+

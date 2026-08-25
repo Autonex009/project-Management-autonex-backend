@@ -9,6 +9,8 @@ Flow:
   own 1-5 rating, leaves feedback on rejected ones, and may suggest a bonus.
   PM ratings drive overall_rating and status becomes "reviewed".
 - Admin views all evaluations (GET, optional status filter).
+- GET /dashboard: pre-scoped, pre-aggregated view for the Performance Reviews page —
+  see the scoping helpers below.
 """
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -20,6 +22,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 from app.models.user import User
 from app.models.employee import Employee
+from app.models.allocation import Allocation
 
 from app.constants.perf_params import PERF_PARAM_NAME_SET, RATING_MIN, RATING_MAX
 from app.db.database import get_db
@@ -112,6 +115,92 @@ def _mean(values: List[float]) -> Optional[float]:
     return round(sum(vals) / len(vals), 2)
 
 
+# ── Dashboard scoping — mirrors frontend/src/utils/pmScope.js and roleAccess.js ─────────
+# Ported 1:1 rather than reused from app/services/project_scope.py: the Performance
+# Reviews page has always used the pmScope.js algorithm (assigned_employee_ids /
+# allocation / org-fallback), which is a DIFFERENT algorithm from
+# project_scope.can_act_on_project (PM + lead-tag based, used by team-kpi/team-data).
+# Keep these two helpers in step with pmScope.js and roleAccess.js, not with
+# project_scope.py — the two scoping systems are not currently reconciled.
+
+_ADMIN_ONLY_SUBJECT_DESIGNATIONS_UI = {"program manager", "project manager", "hr"}
+_FULL_ACCESS_ROLES_UI = {"admin", "hr"}
+
+
+def _normalise_designation(value: Optional[str]) -> str:
+    return (value or "").strip().lower()
+
+
+def _subject_is_admin_only(employee: Optional[Employee]) -> bool:
+    return _normalise_designation(getattr(employee, "designation", None)) in _ADMIN_ONLY_SUBJECT_DESIGNATIONS_UI
+
+
+def _is_team_lead_designation(designation: Optional[str]) -> bool:
+    return "team lead" in _normalise_designation(designation)
+
+
+def _can_decide_for_employee(
+    viewer_role: str, viewer_employee_id: Optional[int], employee: Optional[Employee]
+) -> bool:
+    """Direct port of canDecideForEmployee (roleAccess.js). A tier check only — the
+    caller is expected to have already scoped by project, exactly as the frontend does
+    (this runs only on evaluations belonging to already-scoped projects)."""
+    if viewer_role in _FULL_ACCESS_ROLES_UI:
+        return True
+    if employee is None:
+        return False
+    if viewer_employee_id is not None and employee.id == viewer_employee_id:
+        return False
+    if _subject_is_admin_only(employee):
+        return False
+    if _is_team_lead_designation(employee.designation):
+        return viewer_role == "pm"
+    return True
+
+
+def _get_pm_project_ids(main_projects: List[MainProject], pm_employee_id: Optional[int]) -> set[int]:
+    """Direct port of getPmProjectIds (pmScope.js)."""
+    if not pm_employee_id:
+        return set()
+    ids: set[int] = set()
+    for mp in main_projects:
+        pm_ids = getattr(mp, "program_manager_ids", None) or []
+        if getattr(mp, "program_manager_id", None) == pm_employee_id or pm_employee_id in pm_ids:
+            ids.add(mp.id)
+    return ids
+
+
+def _get_pm_sub_projects(
+    daily_sheets: List[DailySheet],
+    main_projects: List[MainProject],
+    pm_employee_id: Optional[int],
+    allocations: List[Allocation],
+) -> List[DailySheet]:
+    """Direct port of getPmSubProjects (pmScope.js). ``daily_sheets`` is what the
+    frontend calls "sub projects" — PerfEvaluation.project_id points at these rows."""
+    if not pm_employee_id:
+        return []
+    project_ids = _get_pm_project_ids(main_projects, pm_employee_id)
+    allocated_ids = {
+        a.sub_project_id for a in allocations
+        if a.employee_id == pm_employee_id and a.sub_project_id is not None
+    }
+    result = []
+    for sp in daily_sheets:
+        project_pms = getattr(sp, "assigned_employee_ids", None) or []
+        directly_assigned = pm_employee_id in project_pms
+        directly_allocated = sp.id in allocated_ids
+        has_project_pm = len(project_pms) > 0
+        org_fallback = (
+            not has_project_pm
+            and getattr(sp, "main_project_id", None)
+            and sp.main_project_id in project_ids
+        )
+        if directly_assigned or directly_allocated or org_fallback:
+            result.append(sp)
+    return result
+
+
 # ── Employee submission ──────────────────────────────────────────────────────
 class EmployeeParamValue(BaseModel):
     name: str
@@ -131,7 +220,6 @@ class PerfEvalCreate(BaseModel):
     period: str
     parameter_values: List[EmployeeParamValue]
     overall_comment: Optional[str] = None
-    submitted_by: Optional[int] = None
 
     @field_validator("period")
     @classmethod
@@ -168,7 +256,6 @@ class PerfEvalReview(BaseModel):
     parameter_values: List[ReviewParamValue]
     bonus_suggested: bool = False
     bonus_note: Optional[str] = None
-    reviewed_by: Optional[int] = None
 
     @field_validator("parameter_values")
     @classmethod
@@ -266,6 +353,95 @@ def list_evals(
         "total": total,
         "page": page,
         "limit": limit
+    }
+
+
+@router.get("/dashboard", response_model=dict)
+def get_review_dashboard(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm", "hr")),
+):
+    """Pre-scoped, pre-aggregated data for the Performance Reviews page.
+
+    Replaces separately fetching parent-projects/sub-projects/employees/allocations/
+    evaluations in full and filtering them client-side. Scoping matches
+    getPmSubProjects + canDecideForEmployee exactly (see the helpers above) — this is a
+    server-side port of the existing frontend logic, not a new policy.
+
+    Gated the same as the mutating endpoints below (admin/pm/hr) rather than adding
+    team_lead here: review_eval/delete_eval don't allow team_lead today, so granting
+    them read access to an "approve" dashboard would be misleading.
+    """
+    pm_employee_id = current_user.employee_id
+    role = current_user.role
+
+    main_projects = db.query(MainProject).all()
+    daily_sheets = db.query(DailySheet).all()
+    allocations = (
+        db.query(Allocation).filter(Allocation.employee_id == pm_employee_id).all()
+        if pm_employee_id else []
+    )
+
+    scoped_projects = sorted(
+        _get_pm_sub_projects(daily_sheets, main_projects, pm_employee_id, allocations),
+        key=lambda p: (p.name or ""),
+    )
+
+    empty_summary = {"projects_in_scope": 0, "submissions_count": 0, "pending_count": 0}
+    if not scoped_projects:
+        return {"projects": [], "summary": empty_summary}
+
+    scoped_ids = [p.id for p in scoped_projects]
+    evals = (
+        db.query(PerfEvaluation)
+        .filter(PerfEvaluation.project_id.in_(scoped_ids))
+        .order_by(PerfEvaluation.created_at.desc())
+        .all()
+    )
+
+    employee_ids = {e.employee_id for e in evals}
+    employees_by_id = (
+        {e.id: e for e in db.query(Employee).filter(Employee.id.in_(employee_ids)).all()}
+        if employee_ids else {}
+    )
+
+    reviewable_by_project: Dict[int, list] = {p.id: [] for p in scoped_projects}
+    for ev in evals:
+        employee = employees_by_id.get(ev.employee_id)
+        if not _can_decide_for_employee(role, pm_employee_id, employee):
+            continue
+        reviewable_by_project.setdefault(ev.project_id, []).append(ev)
+
+    projects_out = []
+    submissions_count = 0
+    pending_count = 0
+    for project in scoped_projects:
+        project_evals = reviewable_by_project.get(project.id, [])
+        pending = sum(1 for e in project_evals if e.status == "submitted")
+        submissions_count += len(project_evals)
+        pending_count += pending
+        projects_out.append({
+            "id": project.id,
+            "name": project.name,
+            "client": getattr(project, "client", None),
+            "submissions": len(project_evals),
+            "pending": pending,
+            "evaluations": [
+                {
+                    **PerfEvalResponse.model_validate(ev).model_dump(),
+                    "employee_name": getattr(employees_by_id.get(ev.employee_id), "name", None),
+                }
+                for ev in project_evals
+            ],
+        })
+
+    return {
+        "projects": projects_out,
+        "summary": {
+            "projects_in_scope": len(scoped_projects),
+            "submissions_count": submissions_count,
+            "pending_count": pending_count,
+        },
     }
 
 

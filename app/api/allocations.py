@@ -42,6 +42,40 @@ from app.services.slack_service import (
 
 TEAM_LEAD_TAG = "Team Lead"  # matches TEAM_LEAD_ROLE_TAG in sub_projects.py / TEAM_LEAD_TAG in frontend
 
+
+def sync_project_allocations(db, project_id: int):
+    from app.models.project import Project
+    from app.models.allocation import Allocation
+    from app.services import project_scope
+    from app.api.projects import _autonex_headcount
+
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project: return
+
+    allocs = db.query(Allocation).filter(
+        Allocation.sub_project_id == project_id,
+        Allocation.is_active == True
+    ).all()
+
+    project.allocated_employees = len(allocs)
+
+    lead_count = 0
+    pm_ids = set()
+
+    for a in allocs:
+        if a.role_tags and "Team Lead" in a.role_tags:
+            lead_count += 1
+        elif project_scope.escalates_to_admin(db, a.employee_id):
+            pm_ids.add(a.employee_id)
+
+    project.team_lead_count = lead_count
+    project.team_manager_count = len(pm_ids)
+    
+    # Strictly sync assigned_employee_ids to the active PM allocations
+    project.assigned_employee_ids = list(pm_ids)
+    
+    project.required_manpower = _autonex_headcount(project)
+
 router = APIRouter(prefix="/api/allocations", tags=["Allocations"], dependencies=[Depends(get_current_user)])
 
 def _resolve_pm_ids(project: Project, main_project_map: dict, employee_map: dict) -> list[int]:
@@ -273,15 +307,40 @@ def get_project_allocation_detail(
             ))
 
     items = []
+
+    today = date_cls.today()
+    leaves = db.query(Leave).filter(
+        Leave.employee_id.in_(employee_ids),
+        Leave.status == "approved",
+        Leave.start_date <= today,
+        Leave.end_date >= today
+    ).all() if employee_ids else []
+    on_leave_ids = {leave.employee_id for leave in leaves}
+
+    wfhs = db.query(WFHRequest).filter(
+        WFHRequest.employee_id.in_(employee_ids),
+        WFHRequest.status == "approved",
+        WFHRequest.wfh_date <= today,
+        (WFHRequest.end_date >= today) | (WFHRequest.end_date.is_(None))
+    ).all() if employee_ids else []
+    wfh_ids = {wfh.employee_id for wfh in wfhs}
+
     for a in allocs:
         emp = employee_map.get(a.employee_id)
         stale = emp is None or emp.status == "archived"
+        
+        is_wfh = emp and emp.id in wfh_ids
+        location = "WFH" if is_wfh else ("WFO" if emp else None)
+
         items.append(ProjectAllocationDetailItem(
             allocation_id=a.id,
             employee_id=a.employee_id,
             name=(emp.name if emp else "Former employee"),
             email=(emp.email if emp else None),
             avatar_url=(emp.avatar_url if emp else None),
+            designation=(emp.designation if emp else None),
+            location=location,
+            is_on_leave=bool(emp and emp.id in on_leave_ids),
             total_daily_hours=a.total_daily_hours,
             role_tags=a.role_tags or [],
             is_pm=a.employee_id in pm_ids,
@@ -410,11 +469,12 @@ def _send_employee_allocation_removed_notification(db: Session, allocation: Allo
     )
 
 
-def enrich_allocation_response(allocation: Allocation, db: Session) -> dict:
-    """Add employee and sub-project names to allocation response."""
-    employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
-    sub_project = db.query(SubProject).filter(SubProject.id == allocation.sub_project_id).first()
-    
+def _allocation_to_dict(
+    allocation: Allocation,
+    employee: Optional[Employee] = None,
+    sub_project: Optional[SubProject] = None,
+) -> dict:
+    """Single source of truth for the allocation response shape."""
     return {
         "id": allocation.id,
         "employee_id": allocation.employee_id,
@@ -435,8 +495,15 @@ def enrich_allocation_response(allocation: Allocation, db: Session) -> dict:
         "updated_at": allocation.updated_at,
         "employee_name": employee.name if employee else None,
         "project_name": sub_project.name if sub_project else None,
-        "sub_project_name": sub_project.name if sub_project else None
+        "sub_project_name": sub_project.name if sub_project else None,
     }
+
+
+def enrich_allocation_response(allocation: Allocation, db: Session) -> dict:
+    """Add employee and sub-project names (single-row path; does its own lookups)."""
+    employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
+    sub_project = db.query(SubProject).filter(SubProject.id == allocation.sub_project_id).first()
+    return _allocation_to_dict(allocation, employee, sub_project)
 
 
 @router.post("/validate", response_model=AllocationValidationResponse, dependencies=[Depends(require_role("admin", "pm"))])
@@ -559,14 +626,14 @@ def create_allocation(
     db.add(allocation)
     db.flush()  # Flush to include the new allocation in the count query
 
-    # Sync project allocated_employees count from actual allocation records
-    actual_count = 0
-    if project:
-        actual_count = db.query(Allocation).filter(
-            Allocation.sub_project_id == data.sub_project_id,
-            Allocation.is_active == True
-        ).count()
-        project.allocated_employees = actual_count
+    # Sync project allocated_employees and role counts dynamically
+    sync_project_allocations(db, data.sub_project_id)
+
+    # Count active allocations on this project (includes the one just flushed)
+    actual_count = db.query(Allocation).filter(
+        Allocation.sub_project_id == data.sub_project_id,
+        Allocation.is_active == True,
+    ).count()
 
     allocated_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
     allocated_name = allocated_employee.name if allocated_employee else None
@@ -620,6 +687,14 @@ def create_allocation(
     return response
 
 
+@router.get("/slim")
+def get_allocations_slim(db: Session = Depends(get_db)):
+    """Ultra-lightweight endpoint for popovers and UI counting."""
+    allocs = db.query(Allocation.id, Allocation.employee_id, Allocation.sub_project_id, Allocation.role_tags).filter(
+        Allocation.is_active == True
+    ).all()
+    return [{"id": a[0], "employee_id": a[1], "sub_project_id": a[2], "role_tags": a[3]} for a in allocs]
+
 @router.get("", response_model=List[dict], dependencies=[Depends(require_role("admin", "pm"))])
 def get_allocations(db: Session = Depends(get_db)):
     """Get all allocations with enriched data (optimized to avoid N+1 queries)."""
@@ -644,28 +719,7 @@ def get_allocations(db: Session = Depends(get_db)):
     for allocation in allocations:
         emp = employee_map.get(allocation.employee_id)
         proj = project_map.get(allocation.sub_project_id)
-        result.append({
-            "id": allocation.id,
-            "employee_id": allocation.employee_id,
-            "sub_project_id": allocation.sub_project_id,
-            "project_id": allocation.sub_project_id,
-            "total_daily_hours": allocation.total_daily_hours or 8,
-            "active_start_date": allocation.active_start_date,
-            "active_end_date": allocation.active_end_date,
-            "role_tags": allocation.role_tags or [],
-            "time_distribution": allocation.time_distribution or {},
-            "override_flag": allocation.override_flag or False,
-            "override_reason": allocation.override_reason,
-            "productivity_override": allocation.productivity_override or 1.0,
-            "weekly_hours_allocated": allocation.weekly_hours_allocated,
-            "weekly_tasks_allocated": allocation.weekly_tasks_allocated,
-            "effective_week": allocation.effective_week,
-            "created_at": allocation.created_at,
-            "updated_at": allocation.updated_at,
-            "employee_name": emp.name if emp else None,
-            "project_name": proj.name if proj else None,
-            "sub_project_name": proj.name if proj else None
-        })
+        result.append(_allocation_to_dict(allocation, emp, proj))
     
     return result
 
@@ -763,27 +817,50 @@ def update_allocation(
                 detail=time_check['message']
             )
     
-    # Double-booking check if hours are changing
-    if data.total_daily_hours:
-        booking_check = check_double_booking(
-            db=db,
-            employee_id=data.employee_id or allocation.employee_id,
-            new_hours=data.total_daily_hours,
-            active_start=data.active_start_date or allocation.active_start_date,
-            active_end=data.active_end_date or allocation.active_end_date,
-            exclude_allocation_id=allocation_id
+    # Double-booking check — always re-validate on update.
+    # Moving an allocation to a new project / date range / employee without
+    # changing hours can still create overlaps that the previous range avoided.
+    # (Previously the check only ran when data.total_daily_hours was truthy.)
+    resolved_employee_id = data.employee_id if data.employee_id is not None else allocation.employee_id
+    resolved_hours = (
+        data.total_daily_hours
+        if data.total_daily_hours is not None
+        else (allocation.total_daily_hours or 8)
+    )
+    resolved_start = (
+        data.active_start_date
+        if data.active_start_date is not None
+        else allocation.active_start_date
+    )
+    resolved_end = (
+        data.active_end_date
+        if data.active_end_date is not None
+        else allocation.active_end_date
+    )
+
+    booking_check = check_double_booking(
+        db=db,
+        employee_id=resolved_employee_id,
+        new_hours=resolved_hours,
+        active_start=resolved_start,
+        active_end=resolved_end,
+        exclude_allocation_id=allocation_id,
+    )
+
+    override_flag = (
+        data.override_flag
+        if data.override_flag is not None
+        else allocation.override_flag
+    )
+    if booking_check.get("is_overbooked") and not override_flag:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": booking_check["message"],
+                "requires_override": True,
+                "booking_details": booking_check,
+            },
         )
-        
-        override_flag = data.override_flag if data.override_flag is not None else allocation.override_flag
-        if booking_check.get('is_overbooked') and not override_flag:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "message": booking_check['message'],
-                    "requires_override": True,
-                    "booking_details": booking_check
-                }
-            )
 
     # Leave-overlap check on update: informational only.
     resolved_employee_id = data.employee_id or allocation.employee_id
@@ -935,13 +1012,9 @@ def delete_allocation(
     db.delete(allocation)
     db.flush()
 
-    # Sync project allocated_employees count from actual allocation records
+    # Sync project allocated_employees and role counts dynamically
     if project:
-        actual_count = db.query(Allocation).filter(
-            Allocation.sub_project_id == sub_project_id,
-            Allocation.is_active == True
-        ).count()
-        project.allocated_employees = actual_count
+        sync_project_allocations(db, sub_project_id)
 
     db.commit()
 

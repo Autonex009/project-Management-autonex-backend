@@ -24,6 +24,17 @@ from datetime import date as date_type
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/wfh", tags=["wfh"], dependencies=[Depends(get_current_user)])
 
+@router.get("/today-ids")
+def get_wfh_today_ids(db: Session = Depends(get_db)):
+    """Ultra-lightweight endpoint returning only employee IDs WFH today."""
+    from datetime import date
+    today = date.today()
+    wfh = db.query(WFHRequest.employee_id).filter(
+        WFHRequest.status == "approved",
+        WFHRequest.wfh_date == today
+    ).all()
+    return [w[0] for w in wfh if w[0]]
+
 
 def check_wfh_access(wfh_employee_id: int, current_user: User, db: Session):
     if not has_team_read(current_user):
