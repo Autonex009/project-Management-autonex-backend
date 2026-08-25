@@ -132,7 +132,13 @@ def get_employees_slim(
     emps = query.all()
     return [{"id": e[0], "name": e[1], "designation": e[2], "status": e[3], "employee_type": e[4], "skills": e[5], "email": e[6]} for e in emps]
 
-DEFAULT_EMPLOYEE_PASSWORD = "emp123"
+import secrets
+from app.services.email_service import try_send_signup_approved_email
+from app.schemas.employee import EmployeeCreateResponse
+
+def _gen_temp_password(length: int = 8) -> str:
+    """Generate a URL-safe random temporary password."""
+    return secrets.token_urlsafe(length)
 
 # Self-service email changes are confined to the company domain — an employee can
 # move their login onto their real work address, but not onto an arbitrary one.
@@ -169,7 +175,7 @@ def check_employee_access(employee: Employee, current_user: User):
 
 
 # ✅ CREATE EMPLOYEE
-@router.post("", response_model=EmployeeResponse)
+@router.post("", response_model=EmployeeCreateResponse)
 def create_employee(
     payload: EmployeeCreate,
     http_request: Request,
@@ -188,14 +194,16 @@ def create_employee(
     db.add(employee)
     db.flush()
 
+    temp_password = _gen_temp_password()
     user = User(
         email=employee.email,
-        password_hash=hash_password(DEFAULT_EMPLOYEE_PASSWORD),
+        password_hash=hash_password(temp_password),
         name=employee.name,
         role=get_user_role_from_designation(employee.designation),
         employee_id=employee.id,
         skills=employee.skills or [],
         is_active=True,
+        must_change_password=True,
     )
     db.add(user)
 
@@ -231,7 +239,25 @@ def create_employee(
 
     db.commit()
     db.refresh(employee)
-    return employee
+
+    # Deliver welcome email with credentials to employee
+    portal_url = (
+        "https://pmportal.autonexai360.com/login/admin" if user.role in ("admin", "hr")
+        else "https://pmportal.autonexai360.com/login/pm" if user.role in ("pm", "team_lead")
+        else EMPLOYEE_PORTAL_URL
+    )
+    try_send_signup_approved_email(
+        to_email=employee.email,
+        to_name=employee.name,
+        temp_password=temp_password,
+        portal_url=portal_url,
+    )
+
+    response_data = EmployeeCreateResponse.model_validate(employee)
+    response_data.temp_password = temp_password
+    response_data.portal_url = portal_url
+    return response_data
+
 
 
 # ✅ LIST EMPLOYEES
@@ -944,7 +970,9 @@ def request_employee_email_change(
 
     otp = ''.join(random.choices(string.digits, k=6))
     
-    secret_key = os.getenv("OTP_SECRET_KEY", "fallback_dev_secret")
+    secret_key = os.getenv("OTP_SECRET_KEY")
+    if not secret_key:
+        raise HTTPException(status_code=500, detail="Server misconfiguration: Missing OTP_SECRET_KEY")
     encrypted_otp = hmac.new(secret_key.encode('utf-8'), otp.encode('utf-8'), hashlib.sha256).hexdigest()
 
     expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
@@ -981,7 +1009,9 @@ def verify_employee_email_change(
 
     check_employee_access(employee, current_user)
 
-    secret_key = os.getenv("OTP_SECRET_KEY", "fallback_dev_secret")
+    secret_key = os.getenv("OTP_SECRET_KEY")
+    if not secret_key:
+        raise HTTPException(status_code=500, detail="Server misconfiguration: Missing OTP_SECRET_KEY")
     provided_hash = hmac.new(secret_key.encode('utf-8'), body.otp.encode('utf-8'), hashlib.sha256).hexdigest()
 
     otp_record = db.query(EmailOtpVerification).filter(

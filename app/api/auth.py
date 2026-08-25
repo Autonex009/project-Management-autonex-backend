@@ -50,6 +50,11 @@ class ResetPasswordRequest(BaseModel):
     password: str
 
 
+class ChangePasswordRequest(BaseModel):
+    current_password: Optional[str] = None
+    new_password: str
+
+
 class UserResponse(BaseModel):
     id: int
     name: str
@@ -60,6 +65,7 @@ class UserResponse(BaseModel):
     employee_type: Optional[str] = None
     avatar_url: Optional[str] = None
     skills: Optional[list] = None
+    must_change_password: bool = False
 
     class Config:
         from_attributes = True
@@ -130,6 +136,7 @@ def build_user_response(user: User, db: Session) -> UserResponse:
         employee_type=employee.employee_type if employee else None,
         avatar_url=employee.avatar_url if employee else None,
         skills=user.skills,
+        must_change_password=bool(user.must_change_password),
     )
 
 
@@ -148,6 +155,16 @@ def _dev_mode() -> bool:
 
 
 # ── Endpoints ───────────────────────────────────────────────────────
+
+import re
+
+def validate_password_strength(password: str):
+    if len(password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
+    if not re.search(r"\d", password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one number.")
+    if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
+        raise HTTPException(status_code=400, detail="Password must contain at least one special character.")
 
 @router.post("/login", response_model=LoginResponse)
 def login(body: LoginRequest, db: Session = Depends(get_db)):
@@ -282,6 +299,7 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         "role": response_user.role,
         "designation": response_user.designation,
         "employee_id": user.employee_id,
+        "must_change_password": bool(user.must_change_password),
     })
     refresh_token = create_refresh_token(user.id, db)
 
@@ -416,8 +434,7 @@ def reset_password(
     """
     logger.info("[reset-password] Attempt with token (first 12 chars): %s...", token[:12])
 
-    if len(body.password) < 6:
-        raise HTTPException(status_code=400, detail="Password must be at least 6 characters long")
+    validate_password_strength(body.password)
 
     # Decode and validate JWT
     try:
@@ -562,3 +579,53 @@ def verify_token(request: Request):
     #     return {"valid": False, "reason": "Token invalidated"}
         
     return {"valid": True}
+
+
+@router.post("/change-password", response_model=UserResponse)
+def change_password(
+    body: ChangePasswordRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Allow an authenticated user to change their password.
+    If must_change_password is False, current_password is required and verified.
+    """
+    validate_password_strength(body.new_password)
+
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # If the user is NOT in forced first-time reset mode, verify current password
+    if not user.must_change_password:
+        if not body.current_password:
+            raise HTTPException(
+                status_code=400,
+                detail="Current password is required.",
+            )
+        if not verify_password(body.current_password, user.password_hash):
+            raise HTTPException(
+                status_code=400,
+                detail="Current password does not match.",
+            )
+    else:
+        # If current_password is provided in forced reset, verify it
+        if body.current_password and not verify_password(body.current_password, user.password_hash):
+            raise HTTPException(
+                status_code=400,
+                detail="Current password does not match.",
+            )
+
+    user.password_hash = hash_password(body.new_password)
+    user.must_change_password = False
+    user.password_reset_token_hash = None
+    user.password_reset_expires_at = None
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    logger.info("[change-password] User id=%s changed password successfully", user.id)
+    return build_user_response(user, db)
+
+

@@ -229,6 +229,12 @@ def update_employee_note(
         db, current_user, note.employee_id, action="update notes"
     )
 
+    if current_user.role not in ("admin", "hr") and note.issued_by != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only modify notes that you issued."
+        )
+
     if note.status != "open":
         raise HTTPException(status_code=400, detail="Only open notes can be updated")
 
@@ -290,6 +296,12 @@ def resolve_employee_note(
         db, current_user, note.employee_id, action="resolve notes"
     )
 
+    if current_user.role not in ("admin", "hr") and note.issued_by != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only resolve notes that you issued."
+        )
+
     if note.status == "resolved":
         raise HTTPException(status_code=400, detail="Note is already resolved")
 
@@ -338,6 +350,12 @@ def delete_employee_note(
     project_scope.require_employee_scope(
         db, current_user, note.employee_id, action="delete notes"
     )
+
+    if current_user.role not in ("admin", "hr") and note.issued_by != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="You can only delete notes that you issued."
+        )
 
     employee = db.query(Employee).filter(Employee.id == note.employee_id).first()
 
