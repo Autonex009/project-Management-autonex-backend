@@ -14,14 +14,14 @@ from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.models.user import User
+from app.models.user import User, RefreshToken
 
 # ── Config ──────────────────────────────────────────────────────────
 SECRET_KEY = os.environ.get("JWT_SECRET_KEY")
 if not SECRET_KEY:
     raise ValueError("FATAL ERROR: JWT_SECRET_KEY environment variable is missing. Refusing to start.")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # 24 hours
+ACCESS_TOKEN_EXPIRE_MINUTES = 15  # reduced to 15 min for refresh token strategy
 PASSWORD_RESET_EXPIRE_MINUTES = int(os.getenv("PASSWORD_RESET_EXPIRE_MINUTES", "15"))
 
 # ── Password hashing ───────────────────────────────────────────────
@@ -66,14 +66,41 @@ def create_password_reset_token(user_id: int, expires_delta: Optional[timedelta]
 def hash_reset_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
-# ── In-memory blacklist (use Redis in production) ──────────────────
-_blacklisted_tokens: set = set()
+import secrets
 
-def blacklist_token(token: str):
-    _blacklisted_tokens.add(token)
+def create_refresh_token(user_id: int, db: Session, expires_days: int = 7) -> str:
+    """Generates a secure random refresh token and saves it to the database."""
+    token = secrets.token_urlsafe(64)
+    expires_at = datetime.utcnow() + timedelta(days=expires_days)
+    db_token = RefreshToken(user_id=user_id, token=token, expires_at=expires_at)
+    db.add(db_token)
+    db.commit()
+    return token
 
-def is_token_blacklisted(token: str) -> bool:
-    return token in _blacklisted_tokens
+def verify_and_delete_refresh_token(token: str, db: Session) -> Optional[int]:
+    """Verifies a refresh token. If valid, deletes it (to prevent reuse) and returns the user_id.
+    The caller must immediately issue a new refresh token (token rotation)."""
+    db_token = db.query(RefreshToken).filter(RefreshToken.token == token).first()
+    if not db_token:
+        return None
+    user_id = db_token.user_id
+    expires_at = db_token.expires_at
+    # Delete the token immediately (Rotation)
+    db.delete(db_token)
+    db.commit()
+
+    if datetime.utcnow() > expires_at:
+        return None
+    return user_id
+
+# ── In-memory blacklist (will be replaced by Redis if needed) ──────────────────
+# _blacklisted_tokens: set = set()
+#
+# def blacklist_token(token: str):
+#     _blacklisted_tokens.add(token)
+#
+# def is_token_blacklisted(token: str) -> bool:
+#     return token in _blacklisted_tokens
 
 # ── Dependencies ────────────────────────────────────────────────────
 def get_current_user(
@@ -97,8 +124,8 @@ def get_current_user(
     if token is None:
         raise credentials_exception
 
-    if is_token_blacklisted(token):
-        raise credentials_exception
+    # if is_token_blacklisted(token):
+    #     raise credentials_exception
 
     try:
         payload = decode_token(token)

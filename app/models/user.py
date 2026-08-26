@@ -38,3 +38,14 @@ class User(Base):
         server_default=func.now(),
         onupdate=func.now()
     )
+
+
+class RefreshToken(Base):
+    __tablename__ = "refresh_tokens"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    token = Column(String(255), unique=True, nullable=False, index=True)
+    expires_at = Column(TIMESTAMP, nullable=False)
+    created_at = Column(TIMESTAMP, server_default=func.now())
+

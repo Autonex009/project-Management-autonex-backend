@@ -12,7 +12,7 @@ from typing import Optional, List, Literal
 from jose import ExpiredSignatureError, JWTError
 
 from app.db.database import get_db
-from app.models.user import User
+from app.models.user import User, RefreshToken
 from app.models.employee import Employee
 # Aliased: the Pydantic request schema below is also called SignupRequest.
 from app.models.signup_request import SignupRequest as SignupRequestRecord
@@ -23,9 +23,9 @@ from app.services.auth_service import (
     create_password_reset_token,
     decode_token,
     hash_reset_token,
-    blacklist_token,
-    is_token_blacklisted,
     get_current_user,
+    create_refresh_token,
+    verify_and_delete_refresh_token,
 )
 from app.services.email_service import send_password_reset_email
 from app.services.identity_validator import check_duplicate_identity, check_duplicate_user_for_employee
@@ -301,6 +301,7 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         "employee_id": user.employee_id,
         "must_change_password": bool(user.must_change_password),
     })
+    refresh_token = create_refresh_token(user.id, db)
 
     # Return JSONResponse to include both cookie and JSON body
     response = JSONResponse(content={
@@ -315,7 +316,16 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         httponly=True,
         secure=is_prod,
         samesite="lax",
-        max_age=60 * 60 * 24,  # 24 hours
+        max_age=15 * 60,  # 15 mins
+        path="/",
+    )
+    response.set_cookie(
+        key="refresh_token",
+        value=refresh_token,
+        httponly=True,
+        secure=is_prod,
+        samesite="lax",
+        max_age=7 * 24 * 60 * 60,  # 7 days
         path="/",
     )
     return response
@@ -487,20 +497,66 @@ def reset_password(
 
 
 @router.post("/logout")
-def logout(request: Request):
-    """Invalidate current token."""
-    token = request.cookies.get("access_token")
-    if not token:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            token = auth_header[7:]
-            
-    if token:
-        blacklist_token(token)
-        logger.info("[logout] Token blacklisted")
+def logout(request: Request, db: Session = Depends(get_db)):
+    """Invalidate current tokens."""
+    # Delete refresh token from DB if present
+    refresh_token = request.cookies.get("refresh_token")
+    if refresh_token:
+        verify_and_delete_refresh_token(refresh_token, db)
         
     response = JSONResponse(content={"message": "Logged out successfully"})
     response.delete_cookie("access_token", path="/")
+    response.delete_cookie("refresh_token", path="/")
+    return response
+
+@router.post("/refresh")
+def refresh_access_token(request: Request, db: Session = Depends(get_db)):
+    refresh_token = request.cookies.get("refresh_token")
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="Refresh token missing")
+    
+    user_id = verify_and_delete_refresh_token(refresh_token, db)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
+        
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User inactive or deleted")
+        
+    response_user = build_user_response(user, db)
+    
+    access_token = create_access_token({
+        "sub": str(user.id),
+        "role": response_user.role,
+        "designation": response_user.designation,
+        "employee_id": user.employee_id,
+    })
+    new_refresh_token = create_refresh_token(user.id, db)
+    
+    response = JSONResponse(content={
+        "token": access_token,
+        "user": response_user.model_dump(),
+    })
+    
+    is_prod = os.getenv("ENVIRONMENT", "development") != "development"
+    response.set_cookie(
+        key="access_token",
+        value=access_token,
+        httponly=True,
+        secure=is_prod,
+        samesite="lax",
+        max_age=15 * 60,  # 15 mins
+        path="/",
+    )
+    response.set_cookie(
+        key="refresh_token",
+        value=new_refresh_token,
+        httponly=True,
+        secure=is_prod,
+        samesite="lax",
+        max_age=7 * 24 * 60 * 60,  # 7 days
+        path="/",
+    )
     return response
 
 
@@ -517,8 +573,11 @@ def verify_token(request: Request):
     if not auth_header.startswith("Bearer "):
         return {"valid": False, "reason": "No token provided"}
     token = auth_header[7:]
-    if is_token_blacklisted(token):
-        return {"valid": False, "reason": "Token invalidated"}
+    
+    # TODO: Check if token is blacklisted in Redis (Memory blacklist was removed)
+    # if is_token_blacklisted(token):
+    #     return {"valid": False, "reason": "Token invalidated"}
+        
     return {"valid": True}
 
 

@@ -185,10 +185,10 @@ def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
     )
 
 
-def _apply_wfh_privacy_filter(requests, current_user: User, db: Session):
+def _apply_wfh_privacy_filter(requests, current_user: User, db: Session, exclude_self: bool = False):
     """Identical privacy filter used by get_wfh_requests."""
     if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
-        manageable_cache = {current_user.employee_id: True}
+        manageable_cache = {current_user.employee_id: not exclude_self}
         filtered = []
         for req in requests:
             if req.employee_id not in manageable_cache:
@@ -254,7 +254,8 @@ def get_wfh_page(
         )
 
     candidates = q.order_by(WFHRequest.wfh_date.desc()).all()
-    candidates = _apply_wfh_privacy_filter(candidates, current_user, db)
+    exclude_self_flag = (employee_id is None) and current_user.role in ('pm', 'team_lead')
+    candidates = _apply_wfh_privacy_filter(candidates, current_user, db, exclude_self=exclude_self_flag)
 
     if sort in ("asc", "desc"):
         reverse = sort == "desc"
@@ -319,8 +320,9 @@ def get_wfh_requests(
     requests = q.order_by(WFHRequest.wfh_date.desc()).all()
     
     # Filter by read privacy
-    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
-        manageable_cache = {current_user.employee_id: True}
+    if current_user.role in ('pm', 'team_lead') and not project_scope.has_full_access(current_user):
+        exclude_self = (employee_id is None)
+        manageable_cache = {current_user.employee_id: not exclude_self}
         for req in requests:
             if req.employee_id not in manageable_cache:
                 manageable_cache[req.employee_id] = project_scope.can_manage_employee(db, current_user, req.employee_id)
@@ -922,3 +924,5 @@ def delete_wfh(
     db.delete(req)
     db.commit()
     return {"message": "WFH request deleted"}
+
+

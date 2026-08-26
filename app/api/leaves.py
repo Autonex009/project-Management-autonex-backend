@@ -483,8 +483,9 @@ def get_all_leaves(
     leaves = query.order_by(Leave.id.desc()).all()
     
     # Filter by read privacy
-    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
-        manageable_cache = {current_user.employee_id: True}
+    if current_user.role in ('pm', 'team_lead') and not project_scope.has_full_access(current_user):
+        exclude_self = (employee_id is None)
+        manageable_cache = {current_user.employee_id: not exclude_self}
         for lv in leaves:
             if lv.employee_id not in manageable_cache:
                 manageable_cache[lv.employee_id] = project_scope.can_manage_employee(db, current_user, lv.employee_id)
@@ -538,13 +539,11 @@ def get_calendar(
         raise HTTPException(status_code=400, detail="month must be YYYY-MM format")
 
     leaves = db.query(Leave).filter(
-        Leave.status != "rejected",
         Leave.start_date < month_end,
         Leave.end_date >= month_start,
     ).all()
 
     wfh_requests = db.query(WFHRequest).filter(
-        WFHRequest.status != "rejected",
         WFHRequest.wfh_date >= month_start,
         WFHRequest.wfh_date < month_end,
     ).all()
@@ -556,6 +555,8 @@ def get_calendar(
     manageable_cache: dict[int, bool] = {}
 
     def can_view_sensitive_details(target_employee_id: int) -> bool:
+        if current_user.role in ("pm", "team_lead") and current_user.employee_id == target_employee_id:
+            return False
         if is_admin:
             return True
         if current_user.employee_id and current_user.employee_id == target_employee_id:
@@ -575,6 +576,9 @@ def get_calendar(
     for leave in leaves:
         emp = employees.get(leave.employee_id)
         has_detail_access = can_view_sensitive_details(leave.employee_id)
+        if not has_detail_access:
+            continue
+            
         leave_events.append({
             "id": leave.id,
             "type": "leave",
@@ -584,8 +588,8 @@ def get_calendar(
             "start_date": leave.start_date.isoformat(),
             "end_date": leave.end_date.isoformat(),
             "status": leave.status,
-            "reason": leave.reason if has_detail_access else None,
-            "flagged": (leave.flagged or False) if has_detail_access else False,
+            "reason": leave.reason,
+            "flagged": leave.flagged or False,
             "is_half_day": leave.is_half_day or False,
             "half_day_slot": leave.half_day_slot,
         })
@@ -594,6 +598,9 @@ def get_calendar(
     for wfh in wfh_requests:
         emp = employees.get(wfh.employee_id)
         has_detail_access = can_view_sensitive_details(wfh.employee_id)
+        if not has_detail_access:
+            continue
+            
         wfh_events.append({
             "id": wfh.id,
             "type": "wfh",
@@ -601,15 +608,15 @@ def get_calendar(
             "employee_name": emp.name if emp else "Unknown",
             "date": wfh.wfh_date.isoformat(),
             "status": wfh.status,
-            "reason": wfh.reason if has_detail_access else None,
+            "reason": wfh.reason,
         })
 
     return {"month": month, "leaves": leave_events, "wfh": wfh_events}
 
-def _apply_leave_privacy_filter(leaves, current_user: User, db: Session):
+def _apply_leave_privacy_filter(leaves, current_user: User, db: Session, exclude_self: bool = False):
     """Same privacy rules used by get_all_leaves — extracted so page endpoint reuses them."""
     if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
-        manageable_cache = {current_user.employee_id: True}
+        manageable_cache = {current_user.employee_id: not exclude_self}
         filtered = []
         for lv in leaves:
             if lv.employee_id not in manageable_cache:
@@ -714,7 +721,8 @@ def get_leaves_page(
         lv for lv in candidates
         if lv.start_date is not None and lv.end_date is not None
     ]
-    candidates = _apply_leave_privacy_filter(candidates, current_user, db)
+    exclude_self_flag = (employee_id is None) and current_user.role in ('pm', 'team_lead')
+    candidates = _apply_leave_privacy_filter(candidates, current_user, db, exclude_self=exclude_self_flag)
 
     if sort in ("asc", "desc"):
         reverse = sort == "desc"
@@ -820,10 +828,10 @@ def get_leaves_kpi(
         "wfh_approved_this_month": wfh_approved_this_month,
     }
 
-def _apply_leave_privacy_filter(leaves, current_user: User, db: Session):
+def _apply_leave_privacy_filter(leaves, current_user: User, db: Session, exclude_self: bool = False):
     """Same privacy rules used by get_all_leaves — extracted so page endpoint reuses them."""
     if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
-        manageable_cache = {current_user.employee_id: True}
+        manageable_cache = {current_user.employee_id: not exclude_self}
         filtered = []
         for lv in leaves:
             if lv.employee_id not in manageable_cache:
@@ -928,7 +936,8 @@ def get_leaves_page(
         lv for lv in candidates
         if lv.start_date is not None and lv.end_date is not None
     ]
-    candidates = _apply_leave_privacy_filter(candidates, current_user, db)
+    exclude_self_flag = (employee_id is None) and current_user.role in ('pm', 'team_lead')
+    candidates = _apply_leave_privacy_filter(candidates, current_user, db, exclude_self=exclude_self_flag)
 
     if sort in ("asc", "desc"):
         reverse = sort == "desc"
@@ -2017,3 +2026,7 @@ def delete_leave(
     db.delete(leave)
     db.commit()
     return {"message": "Leave deleted successfully"}
+
+
+
+
