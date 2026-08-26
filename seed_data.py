@@ -4,6 +4,7 @@ Usage: python seed_data.py
 """
 import os
 import sys
+import secrets
 from datetime import date, timedelta
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
@@ -41,15 +42,9 @@ from app.models.user import User
 from app.models.guideline import Guideline
 from app.services.auth_service import hash_password
 
-print("🔧 Dropping and recreating all tables...")
-if engine.dialect.name == "postgresql":
-    with engine.begin() as conn:
-        conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE;"))
-        conn.execute(text("CREATE SCHEMA public;"))
-else:
-    Base.metadata.drop_all(bind=engine)
+print("🔧 Ensuring all tables exist...")
 Base.metadata.create_all(bind=engine)
-print("✅ Tables created!\n")
+print("✅ Tables are ready!\n")
 
 db = Session()
 
@@ -383,30 +378,34 @@ try:
     # Step 8: Seed Users (Authentication)
     # ────────────────────────────────────────────────────
     print("🔐 Seeding users...")
+    admin_pass = os.getenv("SEED_ADMIN_PASSWORD", secrets.token_urlsafe(12))
+    pm_pass = os.getenv("SEED_PM_PASSWORD", secrets.token_urlsafe(12))
+    emp_pass = os.getenv("SEED_EMP_PASSWORD", secrets.token_urlsafe(12))
+
     users_data = [
         # Admin user
         {"name": "Admin User", "email": "admin@autonex.com",
-         "password_hash": hash_password("admin123"), "role": "admin",
+         "password_hash": hash_password(admin_pass), "role": "admin",
          "employee_id": None, "skills": []},
         # PM users (linked to PM employees)
         {"name": "Arjun Mehta", "email": "arjun.mehta@autonex.com",
-         "password_hash": hash_password("pm123"), "role": "pm",
+         "password_hash": hash_password(pm_pass), "role": "pm",
          "employee_id": employees[0].id, "skills": ["Project Management", "Product Management"]},
         {"name": "Priya Sharma", "email": "priya.sharma@autonex.com",
-         "password_hash": hash_password("pm123"), "role": "pm",
+         "password_hash": hash_password(pm_pass), "role": "pm",
          "employee_id": employees[1].id, "skills": ["Project Management", "Machine Learning"]},
         {"name": "Test Manager", "email": "vinayak.shukla@autonexai360.com",
-         "password_hash": hash_password("pm123"), "role": "pm",
+         "password_hash": hash_password(pm_pass), "role": "pm",
          "employee_id": employees[-1].id, "skills": ["Project Management", "QA Testing", "Data Analysis"]},
         # Employee users
         {"name": "Rahul Verma", "email": "rahul.verma@autonex.com",
-         "password_hash": hash_password("emp123"), "role": "employee",
+         "password_hash": hash_password(emp_pass), "role": "employee",
          "employee_id": employees[2].id, "skills": ["Python", "React"]},
         {"name": "Anjali Gupta", "email": "anjali.gupta@autonex.com",
-         "password_hash": hash_password("emp123"), "role": "employee",
+         "password_hash": hash_password(emp_pass), "role": "employee",
          "employee_id": employees[5].id, "skills": ["Data Annotation", "NLP"]},
         {"name": "Amit Deshmukh", "email": "amit.deshmukh@autonex.com",
-         "password_hash": hash_password("emp123"), "role": "employee",
+         "password_hash": hash_password(emp_pass), "role": "employee",
          "employee_id": employees[10].id, "skills": ["QA Testing", "Python"]},
     ]
 
@@ -417,10 +416,10 @@ try:
         users.append(u)
     db.flush()
     print(f"   ✓ {len(users)} users added")
-    print(f"     Admin:    admin@autonex.com / admin123")
-    print(f"     PM:       arjun.mehta@autonex.com / pm123")
-    print(f"     PM:       vinayak.shukla@autonexai360.com / pm123")
-    print(f"     Employee: rahul.verma@autonex.com / emp123\n")
+    print(f"     Admin:    admin@autonex.com / {admin_pass}")
+    print(f"     PM:       arjun.mehta@autonex.com / {pm_pass}")
+    print(f"     PM:       vinayak.shukla@autonexai360.com / {pm_pass}")
+    print(f"     Employee: rahul.verma@autonex.com / {emp_pass}\n")
 
     # ────────────────────────────────────────────────────
     # Commit everything

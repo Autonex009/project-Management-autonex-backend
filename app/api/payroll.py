@@ -72,7 +72,8 @@ def require_payroll_passcode(
         raise HTTPException(status_code=401, detail="Invalid or missing payroll passcode")
 
 
-from app.services.auth_service import require_role
+from app.services.auth_service import require_role, get_current_user
+from app.services import audit_service
 
 # Role gate + passcode applies to ALL routes on this router.
 # require_role("admin") ensures identity + admin role; passcode ensures elevated authorization.
@@ -609,11 +610,14 @@ class SavePayrollBody(BaseModel):
     adjustments: List[LeaveAdjustmentIn]
     bonuses: List[BonusIn] = []
     additional_payments: List[AdditionalPaymentIn] = []
-    processed_by: Optional[int] = None
 
 
 @router.post("/save")
-def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
+def save_payroll(
+    body: SavePayrollBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """
     Upsert a payroll run and its leave adjustments.
     Calling with status='finalized' locks the run.
@@ -638,7 +642,7 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
         run.status = body.status
         run.working_days = working_days
         run.notes = body.notes
-        run.processed_by = body.processed_by
+        run.processed_by = current_user.id
         # Delete existing adjustments + bonuses and re-insert
         db.query(PayrollLeaveAdjustment).filter(
             PayrollLeaveAdjustment.payroll_run_id == run.id
@@ -655,7 +659,7 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
             status=body.status,
             working_days=working_days,
             notes=body.notes,
-            processed_by=body.processed_by,
+            processed_by=current_user.id,
         )
         db.add(run)
         db.flush()
@@ -664,7 +668,7 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
     # any earlier reopen marker, so the audit fields always describe the CURRENT state.
     if body.status == "finalized":
         run.finalized_at = datetime.utcnow()
-        run.finalized_by = body.processed_by
+        run.finalized_by = current_user.id
         run.reopened_at = None
         run.reopened_by = None
 
@@ -711,6 +715,18 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
             amount=round(amount, 2),
         ))
 
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="payroll.save",
+        category="Payroll",
+        action_type="Updated",
+        entity_type="payroll_run",
+        entity_id=run.id,
+        entity_name=run.month,
+        summary=f"Saved payroll run for {body.month} as {body.status}",
+    )
+
     db.commit()
     db.refresh(run)
     return {"message": f"Payroll {body.status} for {body.month}", "run_id": run.id, "status": run.status}
@@ -718,11 +734,14 @@ def save_payroll(body: SavePayrollBody, db: Session = Depends(get_db)):
 
 class ReopenPayrollBody(BaseModel):
     month: str
-    reopened_by: Optional[int] = None
 
 
 @router.post("/reopen")
-def reopen_payroll(body: ReopenPayrollBody, db: Session = Depends(get_db)):
+def reopen_payroll(
+    body: ReopenPayrollBody,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Undo a finalize: unlock the month back to draft, changing NO figures.
 
     This is deliberately the *only* thing it does. Every PayrollLeaveAdjustment,
@@ -745,7 +764,20 @@ def reopen_payroll(body: ReopenPayrollBody, db: Session = Depends(get_db)):
 
     run.status = "draft"
     run.reopened_at = datetime.utcnow()
-    run.reopened_by = body.reopened_by
+    run.reopened_by = current_user.id
+    
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="payroll.reopen",
+        category="Payroll",
+        action_type="Updated",
+        entity_type="payroll_run",
+        entity_id=run.id,
+        entity_name=run.month,
+        summary=f"Reopened (undid finalize) payroll run for {body.month}",
+    )
+
     db.commit()
     db.refresh(run)
     return {
@@ -761,6 +793,7 @@ def reopen_payroll(body: ReopenPayrollBody, db: Session = Depends(get_db)):
 def discard_payroll_run(
     month: str = Query(..., description="YYYY-MM"),
     db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """Discard a payroll run entirely — DESTRUCTIVE, and not the undo.
 
@@ -789,6 +822,19 @@ def discard_payroll_run(
         ).delete(),
     }
     db.delete(run)
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="payroll.discard",
+        category="Payroll",
+        action_type="Deleted",
+        entity_type="payroll_run",
+        entity_id=run.id,
+        entity_name=run.month,
+        summary=f"Discarded payroll run for {month}",
+    )
+
     db.commit()
     return {
         "message": f"Payroll run for {month} discarded — the month will recompute from scratch.",
@@ -921,7 +967,12 @@ class SalaryUpdateIn(BaseModel):
 
 
 @router.put("/salaries/{employee_id}")
-def update_salary(employee_id: int, body: SalaryUpdateIn, db: Session = Depends(get_db)):
+def update_salary(
+    employee_id: int, 
+    body: SalaryUpdateIn, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Set an employee's monthly base salary (the ground-truth Pay record).
 
     Mirrors the employee API's salary handling: the value is encrypted into
@@ -1076,7 +1127,11 @@ class SalaryRecordCreateIn(BaseModel):
 
 
 @router.post("/salary-records")
-def create_salary_record(body: SalaryRecordCreateIn, db: Session = Depends(get_db)):
+def create_salary_record(
+    body: SalaryRecordCreateIn, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Create a salary row for an active employee who doesn't have one yet.
 
     Only needed for employees the Pay tab surfaces as "unset" (no matching row
@@ -1116,6 +1171,21 @@ def create_salary_record(body: SalaryRecordCreateIn, db: Session = Depends(get_d
         optional_bonus_annual=encrypt_salary(body.opt_bonus_monthly * 12) if body.opt_bonus_monthly else None,
     )
     db.add(row)
+
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="salary_record.created",
+        category="Payroll",
+        action_type="Created",
+        entity_type="salary",
+        entity_id=row.id,
+        entity_name=row.full_name,
+        subject_employee_id=emp.id,
+        subject_name=emp.name,
+        summary=f"Created salary record for {emp.name}",
+    )
+
     db.commit()
     db.refresh(row)
     record = _salary_table_record(row)
@@ -1129,7 +1199,12 @@ class SalaryRecordUpdateIn(BaseModel):
 
 
 @router.put("/salary-records/{record_id}")
-def update_salary_record(record_id: int, body: SalaryRecordUpdateIn, db: Session = Depends(get_db)):
+def update_salary_record(
+    record_id: int, 
+    body: SalaryRecordUpdateIn, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Edit a salary row's monthly base pay (and optional bonus).
 
     Amounts come in as plain numbers and are stored ENCRYPTED at rest (Fernet),
@@ -1164,7 +1239,12 @@ class SalaryStatusIn(BaseModel):
 
 
 @router.patch("/salary-records/{record_id}/status")
-def set_salary_record_status(record_id: int, body: SalaryStatusIn, db: Session = Depends(get_db)):
+def set_salary_record_status(
+    record_id: int, 
+    body: SalaryStatusIn, 
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     """Toggle a salary row Active/Inactive. Inactive rows drop out of Monthly Pay."""
     normalized = (body.status or "").strip().lower()
     if normalized not in ("active", "inactive"):
@@ -1175,6 +1255,19 @@ def set_salary_record_status(record_id: int, body: SalaryStatusIn, db: Session =
         raise HTTPException(status_code=404, detail="Salary record not found")
 
     row.status = "Active" if normalized == "active" else "Inactive"
+    
+    audit_service.record(
+        db,
+        actor=current_user,
+        action="salary_record.status_updated",
+        category="Payroll",
+        action_type="Updated",
+        entity_type="salary",
+        entity_id=row.id,
+        entity_name=row.full_name,
+        summary=f"Changed salary record status to {row.status} for {row.full_name}",
+    )
+
     db.commit()
     db.refresh(row)
     return _salary_table_record(row)

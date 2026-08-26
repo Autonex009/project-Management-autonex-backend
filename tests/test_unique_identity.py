@@ -97,7 +97,7 @@ def client_and_db():
     Base.metadata.drop_all(bind=engine)
 
 
-def test_signup_request_duplicate_email(client_and_db):
+def test_signup_request_duplicate_email_multiple_requests(client_and_db):
     client, db = client_and_db
     
     # 1. Submit initial signup request
@@ -219,7 +219,7 @@ def test_update_employee_duplicate(client_and_db):
     assert resp_update_phone.status_code == 409
 
 
-def test_signup_request_duplicate_email(client_and_db):
+def test_signup_request_duplicate_email_existing_employee(client_and_db):
     client, db = client_and_db
     
     # 1. Create Employee A

@@ -18,10 +18,10 @@ Unlike test_hiring_sync.py (which mocks everything), this script makes REAL call
 to Neon DB and Brevo — use it to verify a new environment is wired up correctly.
 
 Run:
-    venv/Scripts/python tests/test_email_flow.py
+    venv/Scripts/python tests/manual_email_flow.py
 
 Clean up test account afterwards:
-    venv/Scripts/python tests/test_email_flow.py --cleanup
+    venv/Scripts/python tests/manual_email_flow.py --cleanup
 """
 
 import os
@@ -139,7 +139,7 @@ def run():
             print(f"   2. Find {TEST_EMAIL} → click Approve")
             print(f"   3. Welcome email with temp password will be sent via Brevo")
             print(f"\n   To remove this test request afterwards:")
-            print(f"        venv/Scripts/python tests/test_email_flow.py --cleanup")
+            print(f"        venv/Scripts/python tests/manual_email_flow.py --cleanup")
 
         elif result["skipped"]:
             print(f"\n⏭  Skipped: {result['details']['skipped'][0]['reason']}")
