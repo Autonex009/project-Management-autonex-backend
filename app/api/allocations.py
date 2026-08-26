@@ -307,7 +307,7 @@ def get_project_allocation_detail(
             ))
 
     items = []
-    
+
     today = date_cls.today()
     leaves = db.query(Leave).filter(
         Leave.employee_id.in_(employee_ids),
@@ -331,7 +331,7 @@ def get_project_allocation_detail(
         
         is_wfh = emp and emp.id in wfh_ids
         location = "WFH" if is_wfh else ("WFO" if emp else None)
-        
+
         items.append(ProjectAllocationDetailItem(
             allocation_id=a.id,
             employee_id=a.employee_id,

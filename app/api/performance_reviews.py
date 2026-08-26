@@ -85,11 +85,12 @@ def list_reviews(
     if review_type:
         query = query.filter(PerformanceReview.review_type == review_type)
 
+    all_reviews = query.order_by(PerformanceReview.created_at.desc()).all()
+
     # Same pattern as perf_eval.list_evals: admins/HR see everything; a PM only sees
     # reviews for employees they actually manage. Without this, `employee_id` filter
     # is optional and omitting it returned the whole company's reviews to any PM.
     if not project_scope.has_full_access(current_user):
-        all_reviews = query.order_by(PerformanceReview.created_at.desc()).all()
         manageable_cache: dict[int, bool] = {}
         filtered_reviews = []
         for review in all_reviews:
@@ -99,14 +100,10 @@ def list_reviews(
                 )
             if manageable_cache[review.employee_id]:
                 filtered_reviews.append(review)
+        all_reviews = filtered_reviews
 
-        total = len(filtered_reviews)
-        items = filtered_reviews[(page - 1) * limit : page * limit]
-    else:
-        total = query.count()
-        items = query.order_by(PerformanceReview.created_at.desc())\
-                      .offset((page - 1) * limit)\
-                      .limit(limit).all()
+    total = len(all_reviews)
+    items = all_reviews[(page - 1) * limit : page * limit]
 
     return {
         "items": [PerformanceReviewResponse.model_validate(item).model_dump() for item in items],

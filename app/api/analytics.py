@@ -54,7 +54,7 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
         Leave.status == "approved"
     ).all()
     on_leave_ids = [r[0] for r in on_leave_today_query]
-    
+
     idle_count = db.query(Employee).filter(
         Employee.status == "active",
         Employee.id.notin_(allocated_employee_ids),
@@ -115,7 +115,6 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
     # 4. Projects
     project_stats = db.query(DailySheet.project_status, func.count(DailySheet.id)).group_by(DailySheet.project_status).all()
     proj_dict = dict(project_stats)
-    
 
     from app.models.parent_project import MainProject
     import json
