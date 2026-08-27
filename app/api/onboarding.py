@@ -11,7 +11,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import func, or_
 from pydantic import BaseModel
-
+from app.utils.business_time import today_ist
 from app.db.database import get_db
 from app.models.user import User
 from app.models.employee import Employee
@@ -86,7 +86,7 @@ def get_onboarding_candidates(db: Session) -> List[User]:
 def _actively_allocated_employee_ids(db: Session) -> set:
     """Employee ids that have at least one allocation active as of today
     (allocation window includes today; null start/end counts as open-ended/active)."""
-    today = date.today()
+    today = today_ist()
     allocations = db.query(Allocation.employee_id).filter(
         or_(Allocation.active_start_date.is_(None), Allocation.active_start_date <= today),
         or_(Allocation.active_end_date.is_(None), Allocation.active_end_date >= today),
@@ -830,7 +830,17 @@ def get_analytics_dashboard(
 ):
     """Retrieve high-level onboarding KPIs and recent registrations."""
     candidates = get_onboarding_candidates(db)
-    modules_count = db.query(OnboardingModule).filter(OnboardingModule.status.ilike("PUBLISHED")).count()
+    modules_count = db.query(OnboardingModule).filter(
+        OnboardingModule.status.ilike("PUBLISHED")
+    ).count()
+
+    # Constant — compute once outside any loop
+    total_sections = (
+        db.query(OnboardingSection)
+        .join(OnboardingModule)
+        .filter(OnboardingModule.status.ilike("PUBLISHED"))
+        .count()
+    )
 
     recent = []
     for c in candidates[:5]:
@@ -840,18 +850,41 @@ def get_analytics_dashboard(
             "name": c.name,
             "email": c.email,
             "department": employee.designation if employee else "Annotator",
-            "createdAt": c.created_at
+            "createdAt": c.created_at,
         })
 
-    # Average progress computation
+    if not candidates:
+        return {
+            "metrics": {
+                "totalCandidates": 0,
+                "avgProgress": 0,
+                "modulesCompleted": 0,
+                "totalModules": modules_count,
+            },
+            "recentCandidates": recent,
+        }
+
+    candidate_ids = [c.id for c in candidates]
+
+    # One query: completed-section counts per user
+    progress_counts = dict(
+        db.query(
+            OnboardingProgress.user_id,
+            func.count(OnboardingProgress.id),
+        )
+        .filter(OnboardingProgress.user_id.in_(candidate_ids))
+        .group_by(OnboardingProgress.user_id)
+        .all()
+    )
+
     total_progress = 0
+    modules_completed = 0
     for c in candidates:
-        completed_sections = db.query(OnboardingProgress).filter(OnboardingProgress.user_id == c.id).count()
-        total_sections = db.query(OnboardingSection).join(OnboardingModule).filter(
-            OnboardingModule.status.ilike("PUBLISHED")
-        ).count()
-        progress = int((completed_sections / total_sections) * 100) if total_sections > 0 else 0
+        completed = progress_counts.get(c.id, 0)
+        progress = int((completed / total_sections) * 100) if total_sections > 0 else 0
         total_progress += progress
+        if completed > 0:
+            modules_completed += 1
 
     avg_progress = int(total_progress / len(candidates)) if candidates else 0
 
@@ -859,13 +892,11 @@ def get_analytics_dashboard(
         "metrics": {
             "totalCandidates": len(candidates),
             "avgProgress": avg_progress,
-            "modulesCompleted": len([c for c in candidates if db.query(OnboardingProgress).filter(OnboardingProgress.user_id == c.id).count() > 0]),
-            "totalModules": modules_count
+            "modulesCompleted": modules_completed,
+            "totalModules": modules_count,
         },
-        "recentCandidates": recent
+        "recentCandidates": recent,
     }
-
-
 @router.get("/analytics/full")
 def get_full_analytics(
     db: Session = Depends(get_db),
@@ -873,18 +904,68 @@ def get_full_analytics(
 ):
     """Retrieve full analytics data distributions and weekly metrics."""
     candidates = get_onboarding_candidates(db)
-    modules = db.query(OnboardingModule).filter(OnboardingModule.status.ilike("PUBLISHED")).all()
+
+    total_sections = (
+        db.query(OnboardingSection)
+        .join(OnboardingModule)
+        .filter(OnboardingModule.status.ilike("PUBLISHED"))
+        .count()
+    )
+
+    if not candidates:
+        return {
+            "kpis": [
+                {"label": "Avg Quiz Score", "value": "0%", "trend": "+2.4%"},
+                {"label": "Completion Rate", "value": "0%", "trend": "+5.1%"},
+                {"label": "Avg Time to Complete", "value": "14 Days", "trend": "-1.2 Days"},
+            ],
+            "weeklyData": [
+                {"name": "Mon", "completion": 2},
+                {"name": "Tue", "completion": 3},
+                {"name": "Wed", "completion": 1},
+                {"name": "Thu", "completion": 5},
+                {"name": "Fri", "completion": 4},
+                {"name": "Sat", "completion": 0},
+                {"name": "Sun", "completion": 1},
+            ],
+            "distribution": [
+                {"name": "0-25%", "value": 0},
+                {"name": "26-50%", "value": 0},
+                {"name": "51-75%", "value": 0},
+                {"name": "76-100%", "value": 0},
+            ],
+        }
+
+    candidate_ids = [c.id for c in candidates]
+
+    # Batch progress counts
+    progress_counts = dict(
+        db.query(
+            OnboardingProgress.user_id,
+            func.count(OnboardingProgress.id),
+        )
+        .filter(OnboardingProgress.user_id.in_(candidate_ids))
+        .group_by(OnboardingProgress.user_id)
+        .all()
+    )
+
+    # Batch all quiz attempts for these candidates
+    all_attempts = (
+        db.query(OnboardingQuizAttempt)
+        .filter(OnboardingQuizAttempt.user_id.in_(candidate_ids))
+        .all()
+    )
+    attempts_by_user: dict = {}
+    for a in all_attempts:
+        attempts_by_user.setdefault(a.user_id, []).append(a)
 
     total_progress_sum = 0
     total_score_sum = 0
     distribution = {"0-25%": 0, "26-50%": 0, "51-75%": 0, "76-100%": 0}
 
     for c in candidates:
-        completed_sections = db.query(OnboardingProgress).filter(OnboardingProgress.user_id == c.id).count()
-        total_sections = db.query(OnboardingSection).join(OnboardingModule).filter(
-            OnboardingModule.status.ilike("PUBLISHED")
-        ).count()
-        progress = int((completed_sections / total_sections) * 100) if total_sections > 0 else 0
+        completed = progress_counts.get(c.id, 0)
+        progress = int((completed / total_sections) * 100) if total_sections > 0 else 0
         total_progress_sum += progress
 
         if progress <= 25:
@@ -896,9 +977,8 @@ def get_full_analytics(
         else:
             distribution["76-100%"] += 1
 
-        # Quiz calculations
-        attempts = db.query(OnboardingQuizAttempt).filter(OnboardingQuizAttempt.user_id == c.id).all()
-        correct = len([a for a in attempts if a.is_correct])
+        attempts = attempts_by_user.get(c.id, [])
+        correct = sum(1 for a in attempts if a.is_correct)
         score = int((correct / len(attempts)) * 100) if attempts else 0
         total_score_sum += score
 
@@ -910,7 +990,7 @@ def get_full_analytics(
         "kpis": [
             {"label": "Avg Quiz Score", "value": f"{avg_score}%", "trend": "+2.4%"},
             {"label": "Completion Rate", "value": f"{completion_rate}%", "trend": "+5.1%"},
-            {"label": "Avg Time to Complete", "value": "14 Days", "trend": "-1.2 Days"}
+            {"label": "Avg Time to Complete", "value": "14 Days", "trend": "-1.2 Days"},
         ],
         "weeklyData": [
             {"name": "Mon", "completion": 2},
@@ -919,16 +999,15 @@ def get_full_analytics(
             {"name": "Thu", "completion": 5},
             {"name": "Fri", "completion": 4},
             {"name": "Sat", "completion": 0},
-            {"name": "Sun", "completion": 1}
+            {"name": "Sun", "completion": 1},
         ],
         "distribution": [
             {"name": "0-25%", "value": distribution["0-25%"]},
             {"name": "26-50%", "value": distribution["26-50%"]},
             {"name": "51-75%", "value": distribution["51-75%"]},
-            {"name": "76-100%", "value": distribution["76-100%"]}
-        ]
+            {"name": "76-100%", "value": distribution["76-100%"]},
+        ],
     }
-
 
 # ── Audit Progress Reports Endpoints ───────────────────────────────────
 
@@ -1082,7 +1161,7 @@ def get_newly_onboarded(
         sheets = {
             s.id: s for s in db.query(DailySheet).filter(DailySheet.id.in_(sheet_ids)).all()
         } if sheet_ids else {}
-        today = date.today()
+        today = today_ist()
         for a in allocs:
             sheet = sheets.get(a.sub_project_id)
             sd, ed = a.active_start_date, a.active_end_date
@@ -1216,16 +1295,39 @@ def get_mentees(
         user_map[u.id] = u
     final_users = list(user_map.values())
 
+    if not final_users:
+        return []
+
+    user_ids = [m.id for m in final_users]
+    emp_ids = [m.employee_id for m in final_users if m.employee_id]
+
+    progress_by_user: dict = {}
+    for p in db.query(OnboardingProgress).filter(
+        OnboardingProgress.user_id.in_(user_ids)
+    ).all():
+        progress_by_user.setdefault(p.user_id, []).append(p)
+
+    attempts_by_user: dict = {}
+    for a in db.query(OnboardingQuizAttempt).filter(
+        OnboardingQuizAttempt.user_id.in_(user_ids)
+    ).all():
+        attempts_by_user.setdefault(a.user_id, []).append(a)
+
+    employees_by_id = {
+        e.id: e
+        for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()
+    } if emp_ids else {}
+
     results = []
     for m in final_users:
-        progress_records = db.query(OnboardingProgress).filter(OnboardingProgress.user_id == m.id).all()
+        progress_records = progress_by_user.get(m.id, [])
         completed_modules_count = len({p.module_id for p in progress_records})
 
-        attempts = db.query(OnboardingQuizAttempt).filter(OnboardingQuizAttempt.user_id == m.id).all()
-        correct = len([a for a in attempts if a.is_correct])
+        attempts = attempts_by_user.get(m.id, [])
+        correct = sum(1 for a in attempts if a.is_correct)
         score = int((correct / len(attempts)) * 100) if attempts else 0
 
-        employee = db.query(Employee).filter(Employee.id == m.employee_id).first()
+        employee = employees_by_id.get(m.employee_id)
 
         results.append({
             "id": m.id,
@@ -1235,8 +1337,6 @@ def get_mentees(
             "isActive": m.is_active,
             "completedModulesCount": completed_modules_count,
             "quizScorePercent": score,
-            # Profile picture for the mentorship table; the employee row is already
-            # loaded above, so this costs no extra query.
             "avatarUrl": employee.avatar_url if employee else None,
         })
 

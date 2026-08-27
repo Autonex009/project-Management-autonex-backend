@@ -4,7 +4,7 @@ from typing import Optional
 from uuid import uuid4
 import logging
 import os
-
+from app.utils.business_time import today_ist
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 
 import hmac
@@ -274,9 +274,7 @@ def list_employees(
 ):
     query = db.query(Employee)
     from app.models.leave import Leave
-    from datetime import date
-    
-    today = date.today()
+    today = today_ist()
     on_leave_ids = db.query(Leave.employee_id).filter(
         Leave.start_date <= today,
         Leave.end_date >= today,
@@ -448,9 +446,7 @@ def list_employees_paginated(
 
     from app.models.leave import Leave
     from app.models.allocation import Allocation
-    from datetime import date
-    
-    today = date.today()
+    today = today_ist()
     on_leave_ids = db.query(Leave.employee_id).filter(
         Leave.start_date <= today,
         Leave.end_date >= today,
@@ -680,12 +676,12 @@ def get_team_kpis(
     unassigned = sum(1 for h in emp_hours.values() if h == 0)
     
     # 3. Attendance
-    today = date.today().isoformat()
+    today = today_ist()
     leaves = db.query(Leave).filter(
         Leave.employee_id.in_(emp_ids),
         Leave.start_date <= today,
         Leave.end_date >= today,
-        Leave.status == "Approved"
+        Leave.status == "approved"
     ).all()
     on_leave_ids = {l.employee_id for l in leaves}
     
@@ -1301,7 +1297,7 @@ def get_employee_availability(employee_id: int, db: Session = Depends(get_db)):
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    today = date.today()
+    today = today_ist()
     next_30 = today + timedelta(days=30)
     past_30 = today - timedelta(days=30)
 

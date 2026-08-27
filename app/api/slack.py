@@ -88,18 +88,18 @@ async def slack_interactions(request: Request, payload: str = Form(...), db: Ses
         if req_type == "wfh":
             body = WFHApproveBody(remark="")
             if action_type == "approve":
-                approve_wfh(wfh_id=req_id, http_request=request, approved_by=0, body=body, db=db, current_user=user)
+                approve_wfh(wfh_id=req_id, http_request=request, approved_by=user.id, body=body, db=db, current_user=user)
                 _respond_to_slack(response_url, f":white_check_mark: You approved this WFH request.")
             elif action_type == "reject":
-                reject_wfh(wfh_id=req_id, http_request=request, approved_by=0, body=body, db=db, current_user=user)
+                reject_wfh(wfh_id=req_id, http_request=request, approved_by=user.id, body=body, db=db, current_user=user)
                 _respond_to_slack(response_url, f":x: You rejected this WFH request.")
         elif req_type == "leave":
             body = LeaveApproveBody(remark="")
             if action_type == "approve":
-                approve_leave(leave_id=req_id, http_request=request, approved_by=0, body=body, db=db, current_user=user)
+                approve_leave(leave_id=req_id, http_request=request, approved_by=user.id, body=body, db=db, current_user=user)
                 _respond_to_slack(response_url, f":white_check_mark: You approved this leave request.")
             elif action_type == "reject":
-                reject_leave(leave_id=req_id, http_request=request, approved_by=0, body=body, db=db, current_user=user)
+                reject_leave(leave_id=req_id, http_request=request, approved_by=user.id, body=body, db=db, current_user=user)
                 _respond_to_slack(response_url, f":x: You rejected this leave request.")
     except HTTPException as e:
         _respond_to_slack(response_url, f"Error: {e.detail}")
