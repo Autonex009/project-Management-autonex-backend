@@ -161,13 +161,13 @@ def _approver_names(db: Session, requests) -> dict:
     return {row[0]: row[1] for row in rows}
 
 
-def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
-    employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
-    approver = (
-        db.query(User.name).filter(User.id == req.approved_by).scalar()
-        if req.approved_by
-        else None
-    )
+def _build_response(req: WFHRequest, db: Session = None, employee_name: str = None, approver_name: str = None) -> WFHResponse:
+    if employee_name is None and db is not None:
+        employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
+        employee_name = employee.name if employee else None
+    if approver_name is None and db is not None and req.approved_by:
+        approver_name = db.query(User.name).filter(User.id == req.approved_by).scalar()
+        
     return WFHResponse(
         id=req.id,
         employee_id=req.employee_id,
@@ -176,13 +176,28 @@ def _build_response(req: WFHRequest, db: Session) -> WFHResponse:
         reason=req.reason,
         status=req.status,
         approved_by=req.approved_by,
-        approved_by_name=approver,
+        approved_by_name=approver_name,
         remark=req.remark,
-        employee_name=employee.name if employee else None,
+        employee_name=employee_name,
         created_at=req.created_at.isoformat() if req.created_at else None,
         flagged=getattr(req, "flagged", False),
     )
 
+
+
+def _apply_wfh_privacy_query_filter(query, current_user: User, db: Session, exclude_self: bool = False):
+    """Applies privacy rules directly to the SQLAlchemy query to prevent N+1."""
+    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
+        manageable = project_scope.get_manageable_employee_ids(db, current_user)
+        if manageable is not None:
+            if exclude_self and current_user.employee_id in manageable:
+                manageable.remove(current_user.employee_id)
+            if not manageable:
+                from app.models.wfh import WFHRequest
+                return query.filter(WFHRequest.id == -1)
+            from app.models.wfh import WFHRequest
+            return query.filter(WFHRequest.employee_id.in_(manageable))
+    return query
 
 def _apply_wfh_privacy_filter(requests, current_user: User, db: Session, exclude_self: bool = False):
     """Identical privacy filter used by get_wfh_requests."""
@@ -252,9 +267,9 @@ def get_wfh_page(
             )
         )
 
-    candidates = q.order_by(WFHRequest.wfh_date.desc()).all()
     exclude_self_flag = (employee_id is None) and current_user.role in ('pm', 'team_lead')
-    candidates = _apply_wfh_privacy_filter(candidates, current_user, db, exclude_self=exclude_self_flag)
+    q = _apply_wfh_privacy_query_filter(q, current_user, db, exclude_self=exclude_self_flag)
+    candidates = q.order_by(WFHRequest.wfh_date.desc()).all()
 
     if sort in ("asc", "desc"):
         reverse = sort == "desc"
@@ -267,8 +282,18 @@ def get_wfh_page(
     start = (page - 1) * page_size
     page_items = candidates[start : start + page_size]
 
-    # Re-use the existing response builder (includes approved_by_name, employee_name …)
-    items = [_build_response(req, db) for req in page_items]
+    emp_ids = list({r.employee_id for r in page_items})
+    employees = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
+    approver_names = _approver_names(db, page_items)
+
+    items = [
+        _build_response(
+            req, 
+            employee_name=employees[req.employee_id].name if req.employee_id in employees else "Unknown",
+            approver_name=approver_names.get(req.approved_by)
+        ) 
+        for req in page_items
+    ]
 
     return {
         "items": items,
@@ -316,16 +341,9 @@ def get_wfh_requests(
             q = q.filter(WFHRequest.wfh_date >= start, WFHRequest.wfh_date < end)
         except Exception:
             pass
+    exclude_self_flag = (employee_id is None) and current_user.role in ('pm', 'team_lead')
+    q = _apply_wfh_privacy_query_filter(q, current_user, db, exclude_self=exclude_self_flag)
     requests = q.order_by(WFHRequest.wfh_date.desc()).all()
-    
-    # Filter by read privacy
-    if current_user.role in ('pm', 'team_lead') and not project_scope.has_full_access(current_user):
-        exclude_self = (employee_id is None)
-        manageable_cache = {current_user.employee_id: not exclude_self}
-        for req in requests:
-            if req.employee_id not in manageable_cache:
-                manageable_cache[req.employee_id] = project_scope.can_manage_employee(db, current_user, req.employee_id)
-        requests = [req for req in requests if manageable_cache.get(req.employee_id, False)]
 
     emp_ids = list({r.employee_id for r in requests})
     employees = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
