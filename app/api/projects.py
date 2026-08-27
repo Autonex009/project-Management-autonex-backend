@@ -637,7 +637,12 @@ def list_projects_paginated(
             "sentiment": p.sentiment,
             "encord_project_hash": p.encord_project_hash,
             "autonex_annotators": p.autonex_annotators,
-            "autonex_reviewers": p.autonex_reviewers
+            "autonex_reviewers": p.autonex_reviewers,
+            "project_status": p.project_status,
+            "required_manpower": p.required_manpower,
+            "allocated_employees": p.allocated_employees,
+            "end_date": p.end_date,
+            "is_at_risk": (p.allocated_employees or 0) < (p.required_manpower or 0)
         } for p in paginated_projects]
     else:
         items = enrich_projects_bulk(db, paginated_projects)

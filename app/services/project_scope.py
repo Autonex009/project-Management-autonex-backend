@@ -307,6 +307,54 @@ def escalates_to_pm(db: Session, employee_id: Optional[int]) -> bool:
     return _subject_designation(db, employee_id) in PM_ONLY_SUBJECT_DESIGNATIONS
 
 
+def get_manageable_employee_ids(db: Session, user: Optional[User]) -> Optional[set[int]]:
+    """Returns a set of employee IDs the user can manage, or None if they have full access.
+    This resolves the PM/Lead's allocated employees efficiently without N+1 queries.
+    """
+    if has_full_access(user):
+        return None
+        
+    actor_id = _actor_employee_id(user)
+    if not actor_id:
+        return set()
+
+    all_projects = db.query(DailySheet).filter(
+        DailySheet.project_status.in_(["active", "in-progress", "in progress", "poc"])
+    ).all()
+    
+    main_pm_rows = db.query(MainProject.id, MainProject.program_manager_ids).all()
+    actor_main_proj_ids = {m.id for m in main_pm_rows if str(actor_id) in [str(x) for x in (m.program_manager_ids or [])]}
+    
+    actor_allocations = db.query(Allocation.sub_project_id).filter(
+        Allocation.employee_id == actor_id,
+        Allocation.is_active == True
+    ).all()
+    actor_alloc_proj_ids = {r[0] for r in actor_allocations if r[0]}
+    
+    scoped_project_ids = []
+    for p in all_projects:
+        assigned = p.assigned_employee_ids or []
+        if str(actor_id) in [str(x) for x in assigned]:
+            scoped_project_ids.append(p.id)
+            continue
+        if p.main_project_id in actor_main_proj_ids:
+            scoped_project_ids.append(p.id)
+            continue
+        if p.id in actor_alloc_proj_ids:
+            scoped_project_ids.append(p.id)
+            
+    emp_ids = {actor_id}
+    if scoped_project_ids:
+        allocated_emp_ids = db.query(Allocation.employee_id).filter(
+            Allocation.sub_project_id.in_(scoped_project_ids),
+            Allocation.is_active == True
+        ).distinct().all()
+        for r in allocated_emp_ids:
+            if r[0]:
+                emp_ids.add(r[0])
+                
+    return emp_ids
+
 def can_manage_employee(db: Session, user: Optional[User], employee_id: Optional[int]) -> bool:
     """True when ``user`` may act on requests belonging to ``employee_id``.
 

@@ -85,6 +85,59 @@ def get_leaves_today_ids(db: Session = Depends(get_db)):
     ).all()
     return [l[0] for l in leaves if l[0]]
 
+@router.get("/team-summary")
+def get_team_leaves_summary(pm_id: int, db: Session = Depends(get_db)):
+    """
+    Returns only upcoming/active leaves for a specific PM's team members.
+    Drastically cuts down payload size for the PM Dashboard.
+    """
+    from app.models.project import DailySheet
+    from app.models.allocation import Allocation
+    
+    # 1. Get all active projects for this PM
+    all_projects = db.query(DailySheet).filter(
+        DailySheet.project_status.in_(["active", "in-progress", "in progress", "poc"])
+    ).all()
+    
+    pm_project_ids = []
+    for p in all_projects:
+        assigned = p.assigned_employee_ids or []
+        if str(pm_id) in [str(x) for x in assigned]:
+            pm_project_ids.append(p.id)
+            
+    if not pm_project_ids:
+        return []
+        
+    # 2. Get unique employees allocated to these projects
+    allocated_emp_ids = db.query(Allocation.employee_id).filter(
+        Allocation.sub_project_id.in_(pm_project_ids),
+        Allocation.is_active == True
+    ).distinct().all()
+    
+    emp_ids = [row[0] for row in allocated_emp_ids if row[0]]
+    
+    if not emp_ids:
+        return []
+        
+    # 3. Query only leaves ending today or in the future that are not rejected
+    today = date_type.today()
+    leaves = db.query(Leave).filter(
+        Leave.employee_id.in_(emp_ids),
+        Leave.end_date >= today,
+        Leave.status != "rejected"
+    ).all()
+    
+    return [{
+        "id": l.id,
+        "employee_id": l.employee_id,
+        "start_date": l.start_date,
+        "end_date": l.end_date,
+        "status": l.status,
+        "leave_type": l.leave_type,
+        "is_emergency": getattr(l, "is_emergency", False)
+    } for l in leaves]
+
+
 
 def check_leave_access(leave_employee_id: int, current_user: User, db: Session):
     if not has_team_read(current_user):
@@ -442,16 +495,11 @@ def get_all_leaves(
     if end_date:
         query = query.filter(Leave.start_date <= end_date)
 
-    leaves = query.order_by(Leave.id.desc()).all()
     
-    # Filter by read privacy
-    if current_user.role in ('pm', 'team_lead') and not project_scope.has_full_access(current_user):
-        exclude_self = (employee_id is None)
-        manageable_cache = {current_user.employee_id: not exclude_self}
-        for lv in leaves:
-            if lv.employee_id not in manageable_cache:
-                manageable_cache[lv.employee_id] = project_scope.can_manage_employee(db, current_user, lv.employee_id)
-        leaves = [lv for lv in leaves if manageable_cache.get(lv.employee_id, False)]
+    # Filter by read privacy AT THE DB LEVEL
+    exclude_self_flag = (employee_id is None) and current_user.role in ('pm', 'team_lead')
+    query = _apply_leave_privacy_query_filter(query, current_user, db, exclude_self=exclude_self_flag)
+    leaves = query.order_by(Leave.id.desc()).all()
 
     approver_names = _approver_names(db, leaves)
     return [
@@ -494,7 +542,7 @@ def get_calendar(
     employees = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()}
 
     is_admin = project_scope.has_full_access(current_user)
-    manageable_cache: dict[int, bool] = {}
+    manageable_ids = project_scope.get_manageable_employee_ids(db, current_user) if not is_admin else None
 
     def can_view_sensitive_details(target_employee_id: int) -> bool:
         if current_user.role in ("pm", "team_lead") and current_user.employee_id == target_employee_id:
@@ -506,12 +554,8 @@ def get_calendar(
         emp = employees.get(target_employee_id)
         if emp and emp.email and current_user.email and emp.email.strip().lower() == current_user.email.strip().lower():
             return True
-        if current_user.role in ("pm", "team_lead"):
-            if target_employee_id not in manageable_cache:
-                manageable_cache[target_employee_id] = project_scope.can_manage_employee(
-                    db, current_user, target_employee_id
-                )
-            return manageable_cache[target_employee_id]
+        if manageable_ids is not None:
+            return target_employee_id in manageable_ids
         return False
 
     leave_events = []
@@ -555,6 +599,21 @@ def get_calendar(
 
     return {"month": month, "leaves": leave_events, "wfh": wfh_events}
 
+
+def _apply_leave_privacy_query_filter(query, current_user: User, db: Session, exclude_self: bool = False):
+    """Applies privacy rules directly to the SQLAlchemy query to prevent N+1."""
+    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
+        manageable = project_scope.get_manageable_employee_ids(db, current_user)
+        if manageable is not None:
+            if exclude_self and current_user.employee_id in manageable:
+                manageable.remove(current_user.employee_id)
+            if not manageable:
+                from app.models.leave import Leave
+                return query.filter(Leave.id == -1)
+            from app.models.leave import Leave
+            return query.filter(Leave.employee_id.in_(manageable))
+    return query
+
 def _apply_leave_privacy_filter(leaves, current_user: User, db: Session, exclude_self: bool = False):
     """Same privacy rules used by get_all_leaves — extracted so page endpoint reuses them."""
     if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
@@ -646,7 +705,7 @@ def get_leaves_page(
     # today_only — native date comparison
     if today_only:
         today = date_type.today()
-        query = query.filter(Leave.start_date == today)
+        query = query.filter(Leave.start_date <= today, Leave.end_date >= today)
 
     # Search: employee name OR leave_type
     if search and search.strip():
@@ -658,13 +717,10 @@ def get_leaves_page(
             )
         )
 
-    candidates = query.order_by(Leave.id.desc()).all()
-    candidates = [
-        lv for lv in candidates
-        if lv.start_date is not None and lv.end_date is not None
-    ]
     exclude_self_flag = (employee_id is None) and current_user.role in ('pm', 'team_lead')
-    candidates = _apply_leave_privacy_filter(candidates, current_user, db, exclude_self=exclude_self_flag)
+    query = _apply_leave_privacy_query_filter(query, current_user, db, exclude_self=exclude_self_flag)
+    query = query.filter(Leave.start_date.isnot(None), Leave.end_date.isnot(None))
+    candidates = query.order_by(Leave.id.desc()).all()
 
     if sort in ("asc", "desc"):
         reverse = sort == "desc"
@@ -741,7 +797,8 @@ def get_leaves_kpi(
         leave_q.filter(or_(Leave.status == "pending", Leave.status.is_(None))).count()
     )
     leaves_today = leave_q.filter(
-        Leave.start_date == today,
+        Leave.start_date <= today,
+        Leave.end_date >= today,
         Leave.status != "rejected",
     ).count()
     leaves_approved_this_month = leave_q.filter(
@@ -770,6 +827,21 @@ def get_leaves_kpi(
         "wfh_approved_this_month": wfh_approved_this_month,
     }
 
+
+def _apply_leave_privacy_query_filter(query, current_user: User, db: Session, exclude_self: bool = False):
+    """Applies privacy rules directly to the SQLAlchemy query to prevent N+1."""
+    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
+        manageable = project_scope.get_manageable_employee_ids(db, current_user)
+        if manageable is not None:
+            if exclude_self and current_user.employee_id in manageable:
+                manageable.remove(current_user.employee_id)
+            if not manageable:
+                from app.models.leave import Leave
+                return query.filter(Leave.id == -1)
+            from app.models.leave import Leave
+            return query.filter(Leave.employee_id.in_(manageable))
+    return query
+
 def _apply_leave_privacy_filter(leaves, current_user: User, db: Session, exclude_self: bool = False):
     """Same privacy rules used by get_all_leaves — extracted so page endpoint reuses them."""
     if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
@@ -861,7 +933,7 @@ def get_leaves_page(
     # today_only — native date comparison
     if today_only:
         today = date_type.today()
-        query = query.filter(Leave.start_date == today)
+        query = query.filter(Leave.start_date <= today, Leave.end_date >= today)
 
     # Search: employee name OR leave_type
     if search and search.strip():
@@ -873,13 +945,10 @@ def get_leaves_page(
             )
         )
 
-    candidates = query.order_by(Leave.id.desc()).all()
-    candidates = [
-        lv for lv in candidates
-        if lv.start_date is not None and lv.end_date is not None
-    ]
     exclude_self_flag = (employee_id is None) and current_user.role in ('pm', 'team_lead')
-    candidates = _apply_leave_privacy_filter(candidates, current_user, db, exclude_self=exclude_self_flag)
+    query = _apply_leave_privacy_query_filter(query, current_user, db, exclude_self=exclude_self_flag)
+    query = query.filter(Leave.start_date.isnot(None), Leave.end_date.isnot(None))
+    candidates = query.order_by(Leave.id.desc()).all()
 
     if sort in ("asc", "desc"):
         reverse = sort == "desc"
@@ -956,7 +1025,8 @@ def get_leaves_kpi(
         leave_q.filter(or_(Leave.status == "pending", Leave.status.is_(None))).count()
     )
     leaves_today = leave_q.filter(
-        Leave.start_date == today,
+        Leave.start_date <= today,
+        Leave.end_date >= today,
         Leave.status != "rejected",
     ).count()
     leaves_approved_this_month = leave_q.filter(

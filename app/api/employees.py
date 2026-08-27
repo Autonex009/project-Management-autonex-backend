@@ -120,14 +120,11 @@ def get_employees_slim(
 
     if team_only and current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
         from app.services import project_scope
-        all_emp_ids = {r[0] for r in db.query(Employee.id).all()}
-        manageable = {
-            eid for eid in all_emp_ids
-            if project_scope.can_manage_employee(db, current_user, eid) or eid == current_user.employee_id
-        }
-        if not manageable:
-            return []
-        query = query.filter(Employee.id.in_(manageable))
+        manageable = project_scope.get_manageable_employee_ids(db, current_user)
+        if manageable is not None:
+            if not manageable:
+                return []
+            query = query.filter(Employee.id.in_(manageable))
 
     emps = query.all()
     return [{"id": e[0], "name": e[1], "designation": e[2], "status": e[3], "employee_type": e[4], "skills": e[5], "email": e[6]} for e in emps]
@@ -270,9 +267,20 @@ def list_employees(
         max_length=200,
         description="Substring match on name, email or Encord ID (case-insensitive).",
     ),
-    db: Session = Depends(get_db)
+    team_only: bool = False,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     query = db.query(Employee)
+
+    if team_only:
+        from app.services import project_scope
+        manageable = project_scope.get_manageable_employee_ids(db, current_user)
+        if manageable is not None:
+            if not manageable:
+                return []
+            query = query.filter(Employee.id.in_(manageable))
+
     from app.models.leave import Leave
     today = today_ist()
     on_leave_ids = db.query(Leave.employee_id).filter(

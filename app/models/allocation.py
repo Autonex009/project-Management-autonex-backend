@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, Date, ForeignKey, Boolean, Text, JSON, TIMESTAMP, String
+from sqlalchemy import Column, Integer, Float, Date, ForeignKey, Boolean, Text, JSON, TIMESTAMP, String, Index
 from sqlalchemy.sql import func
 from app.db.database import Base
 
@@ -12,6 +12,7 @@ class Allocation(Base):
     Links to DailySheet (daily_sheets table) via sub_project_id for backward compat.
     """
     __tablename__ = "allocations"
+    __table_args__ = (Index('ix_allocations_sub_project_active', 'sub_project_id', 'is_active'),)
 
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, nullable=False)

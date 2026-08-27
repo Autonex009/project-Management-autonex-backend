@@ -30,6 +30,43 @@ from app.models.wfh import WFHRequest
 
 router = APIRouter(prefix="/api/analytics", tags=["Analytics"], dependencies=[Depends(require_role("admin", "pm"))])
 
+@router.get("/pm/{pm_id}/team-summary")
+def get_pm_team_summary(pm_id: int, db: Session = Depends(get_db)):
+    """
+    Returns a slimmed-down list of employees allocated to any project managed by this PM.
+    Replaces the fat /api/allocations and /api/employees payloads for the PM dashboard.
+    """
+    # 1. Get all active projects to filter by PM
+    all_projects = db.query(DailySheet).filter(
+        DailySheet.project_status.in_(["active", "in-progress", "in progress", "poc"])
+    ).all()
+    
+    pm_project_ids = []
+    for p in all_projects:
+        assigned = p.assigned_employee_ids or []
+        # JSON arrays might store as strings or ints
+        if str(pm_id) in [str(x) for x in assigned]:
+            pm_project_ids.append(p.id)
+            
+    # 2. Get unique employees allocated to these projects
+    if not pm_project_ids:
+        return {"totalMembers": 0, "teamIds": [], "teamMembers": []}
+        
+    team_members = db.query(
+        Employee.id, Employee.name, Employee.designation
+    ).join(
+        Allocation, Allocation.employee_id == Employee.id
+    ).filter(
+        Allocation.sub_project_id.in_(pm_project_ids),
+        Allocation.is_active == True
+    ).distinct().all()
+    
+    return {
+        "totalMembers": len(team_members),
+        "teamIds": [tm.id for tm in team_members],
+        "teamMembers": [{"id": tm.id, "name": tm.name, "designation": tm.designation} for tm in team_members]
+    }
+
 @router.get("/dashboard-kpis")
 def get_dashboard_kpis(db: Session = Depends(get_db)):
     from app.models.employee import Employee
