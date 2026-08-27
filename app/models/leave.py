@@ -1,9 +1,10 @@
-from sqlalchemy import Boolean, Column, Integer, String, Date, Text, TIMESTAMP
+from sqlalchemy import Boolean, Column, Integer, String, Date, Text, TIMESTAMP, Index
 from sqlalchemy.sql import func
 from app.db.database import Base
 
 class Leave(Base):
     __tablename__ = "leaves"
+    __table_args__ = (Index('ix_leaves_emp_end_date', 'employee_id', 'end_date'),)
 
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, nullable=False)

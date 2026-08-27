@@ -296,6 +296,9 @@ def list_evals(
     employee_id: Optional[int] = None,
     period: Optional[str] = None,
     status: Optional[str] = None,
+    search: Optional[str] = None,
+    role_filter: Optional[str] = None,
+    type: Optional[str] = None,  # 'employee' (exclude pm self evals), 'pm' (only pm self evals), 'bonus'
     page: int = Query(1, ge=1),
     limit: int = Query(25, ge=1, le=500),
     db: Session = Depends(get_db),
@@ -325,6 +328,28 @@ def list_evals(
         q = q.filter(PerfEvaluation.period == period)
     if status:
         q = q.filter(PerfEvaluation.status == status)
+
+    if type == "pm":
+        q = q.filter(PerfEvaluation.project_id == 0)
+    elif type == "employee":
+        q = q.filter(PerfEvaluation.project_id != 0)
+    elif type == "bonus":
+        q = q.filter(PerfEvaluation.bonus_suggested == True)
+
+    if search or role_filter:
+        q = q.outerjoin(Employee, Employee.id == PerfEvaluation.employee_id)
+        if search and search.strip():
+            q = q.filter(Employee.name.ilike(f"%{search.strip()}%"))
+        if role_filter and role_filter != "all":
+            if role_filter == "admin":
+                q = q.filter(Employee.designation.ilike("%admin%"))
+            elif role_filter == "pm":
+                q = q.filter(Employee.designation.ilike("%manager%"))
+            elif role_filter == "team_lead":
+                q = q.filter(Employee.designation.ilike("%lead%"))
+            elif role_filter == "annotator":
+                q = q.filter(Employee.designation.ilike("%annotator%"))
+
     
     # Filter by read privacy first
     if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
@@ -363,7 +388,49 @@ def list_evals(
     }
 
 
+
+from sqlalchemy import func
+
+@router.get("/admin-kpi", response_model=dict)
+def get_admin_perf_kpi(
+    period: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "hr", "pm"))
+):
+    q = db.query(PerfEvaluation).filter(PerfEvaluation.project_id != 0)
+    if period:
+        q = q.filter(PerfEvaluation.period == period)
+    
+    # KPIs for the admin dashboard
+    total = q.count()
+    pending = q.filter(PerfEvaluation.status == "submitted").count()
+    reviewed = q.filter(PerfEvaluation.status == "reviewed").count()
+    
+    # Bonus evaluations
+    bonus = q.filter(PerfEvaluation.bonus_suggested == True).count()
+    
+    # Avg rating
+    # overall_rating might be null, so we avg only non-nulls
+    avg_rating = db.query(func.avg(PerfEvaluation.overall_rating)).filter(
+        PerfEvaluation.project_id != 0,
+        PerfEvaluation.overall_rating.isnot(None)
+    )
+    if period:
+        avg_rating = avg_rating.filter(PerfEvaluation.period == period)
+    
+    avg_val = avg_rating.scalar()
+    
+    return {
+        "total": total,
+        "pending": pending,
+        "reviewed": reviewed,
+        "completionRate": round((reviewed / total) * 100) if total > 0 else 0,
+        "bonusCount": bonus,
+        "avgRating": float(avg_val) if avg_val else None,
+    }
+
 @router.get("/dashboard", response_model=dict)
+
 def get_review_dashboard(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm", "hr")),
