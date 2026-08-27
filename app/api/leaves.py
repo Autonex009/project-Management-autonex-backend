@@ -3,8 +3,8 @@ import os
 from datetime import timedelta, date as date_type, timezone, datetime, time as time_type
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-from typing import List, Optional, Dict, Any
-
+from typing import List, Optional
+from app.utils.business_time import now_ist, today_ist
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from fastapi import Request as HTTPRequest
 from sqlalchemy.orm import Session
@@ -40,9 +40,7 @@ from app.services import audit_service, project_scope
 
 
 def get_current_ist_datetime() -> datetime:
-    utc_now = datetime.now(timezone.utc)
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-    return utc_now.astimezone(ist_tz)
+    return now_ist()
 
 
 def validate_half_day_timing(start_date: date_type, half_day_slot: str) -> None:
@@ -74,49 +72,12 @@ def validate_half_day_timing(start_date: date_type, half_day_slot: str) -> None:
             detail="Invalid half-day slot. Must be 'first_half' or 'second_half'.",
         )
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
-from sqlalchemy.orm import Session
-from typing import List, Optional
-from pydantic import BaseModel
-
-from app.db.database import get_db
-from app.constants.leave_types import (
-    RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type,
-    is_valid_floater_date, get_floater_dates_for_year,
-    is_weekend, is_fixed_holiday, get_fixed_holidays_for_year,
-    is_intern_or_contractor,
-)
-from app.models.allocation import Allocation
-from app.models.employee import Employee
-from app.models.leave import Leave
-from app.models.parent_project import MainProject
-from app.models.project import DailySheet
-from app.models.sub_project import SubProject
-from app.models.user import User
-from app.models.notification import Notification
-from app.schemas.leave import Leave as LeaveSchema, LeaveCreate
-from app.services.slack_service import (
-    get_or_cache_employee_slack_user_id,
-    try_get_or_cache_employee_slack_user_id,
-    try_send_leave_applied_message,
-    try_send_pm_leave_request_message,
-    try_send_leave_status_message,
-)
-
-from app.services.auth_service import get_current_user, has_team_read, require_role
-from app.services import audit_service, project_scope
-
-# NOTE: ``Request`` at the top of this module is urllib's, used for the Razorpay
-# calls. FastAPI's request object is aliased so the two never get confused — a bare
-# ``Request`` annotation here would silently break request parsing.
-from fastapi import Request as HTTPRequest
-
 router = APIRouter(prefix="/api/leaves", tags=["Leaves"], dependencies=[Depends(get_current_user)])
 
 @router.get("/today-ids")
 def get_leaves_today_ids(db: Session = Depends(get_db)):
     """Ultra-lightweight endpoint returning only employee IDs on leave today."""
-    today = date_type.today()
+    today = today_ist()
     leaves = db.query(Leave.employee_id).filter(
         Leave.status == "approved",
         Leave.start_date <= today,
@@ -414,7 +375,7 @@ def _get_admin_notification_targets(db: Session) -> list[dict]:
     return targets
 
 
-def _leave_to_schema(leave: Leave) -> LeaveSchema:
+def _leave_to_schema(leave: Leave, approver_name: Optional[str] = None) -> LeaveSchema:
     return LeaveSchema(
         leave_id=leave.id,
         employee_id=leave.employee_id,
@@ -424,6 +385,7 @@ def _leave_to_schema(leave: Leave) -> LeaveSchema:
         reason=leave.reason,
         status=leave.status or "pending",
         approved_by=leave.approved_by,
+        approved_by_name=approver_name,
         razorpay_applied=leave.razorpay_applied or False,
         flagged=leave.flagged or False,
         approval_remark=leave.approval_remark,
@@ -493,28 +455,9 @@ def get_all_leaves(
 
     approver_names = _approver_names(db, leaves)
     return [
-        LeaveSchema(
-            leave_id=leave.id,
-            employee_id=leave.employee_id,
-            start_date=leave.start_date,
-            end_date=leave.end_date,
-            leave_type=leave.leave_type,
-            reason=leave.reason,
-            status=leave.status or "pending",
-            approved_by=leave.approved_by,
-            approved_by_name=approver_names.get(leave.approved_by),
-            razorpay_applied=leave.razorpay_applied or False,
-            flagged=leave.flagged or False,
-            approval_remark=leave.approval_remark,
-            is_emergency=leave.is_emergency or False,
-            is_half_day=leave.is_half_day or False,
-            half_day_slot=leave.half_day_slot,
-            created_at=str(leave.created_at) if leave.created_at else None,
-            updated_at=str(leave.updated_at) if leave.updated_at else None,
-        )
+        _leave_to_schema(leave, approver_name=approver_names.get(leave.approved_by))
         for leave in leaves
     ]
-
 
 @router.get("/calendar", response_model=dict)
 def get_calendar(
@@ -528,7 +471,6 @@ def get_calendar(
     - Managers / Team Leads see reasons and flags for employees in their project scope; reasons are redacted for others.
     - Regular employees only see reasons and flags for their own requests; other employees' reasons are redacted.
     """
-    from app.models.wfh import WFHRequest
     try:
         year, mo = int(month[:4]), int(month[5:7])
         month_start = date_type(year, mo, 1)
@@ -1053,22 +995,7 @@ def get_leave(
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
     check_leave_access(leave.employee_id, current_user, db)
-    return LeaveSchema(
-        leave_id=leave.id,
-        employee_id=leave.employee_id,
-        start_date=leave.start_date,
-        end_date=leave.end_date,
-        leave_type=leave.leave_type,
-        reason=leave.reason,
-        status=leave.status or "pending",
-        approved_by=leave.approved_by,
-        razorpay_applied=leave.razorpay_applied or False,
-        is_emergency=leave.is_emergency or False,
-        is_half_day=leave.is_half_day or False,
-        half_day_slot=leave.half_day_slot,
-        created_at=str(leave.created_at) if leave.created_at else None,
-        updated_at=str(leave.updated_at) if leave.updated_at else None,
-    )
+    return _leave_to_schema(leave)
 
 
 def validate_consecutive_leaves(
@@ -1371,24 +1298,7 @@ def create_leave(
     db.commit()
     db.refresh(leave)
 
-    return LeaveSchema(
-        leave_id=leave.id,
-        employee_id=leave.employee_id,
-        start_date=leave.start_date,
-        end_date=leave.end_date,
-        leave_type=leave.leave_type,
-        reason=leave.reason,
-        status=leave.status or "pending",
-        approved_by=leave.approved_by,
-        razorpay_applied=leave.razorpay_applied or False,
-        flagged=leave.flagged or False,
-        approval_remark=leave.approval_remark,
-        is_emergency=leave.is_emergency or False,
-        is_half_day=leave.is_half_day or False,
-        half_day_slot=leave.half_day_slot,
-        created_at=str(leave.created_at) if leave.created_at else None,
-        updated_at=str(leave.updated_at) if leave.updated_at else None,
-    )
+    return _leave_to_schema(leave)
 
 
 class ApproveBody(BaseModel):
@@ -1587,24 +1497,7 @@ def update_leave(
 
     db.commit()
     db.refresh(leave)
-    return LeaveSchema(
-        leave_id=leave.id,
-        employee_id=leave.employee_id,
-        start_date=leave.start_date,
-        end_date=leave.end_date,
-        leave_type=leave.leave_type,
-        reason=leave.reason,
-        status=leave.status or "pending",
-        approved_by=leave.approved_by,
-        razorpay_applied=leave.razorpay_applied or False,
-        flagged=leave.flagged or False,
-        approval_remark=leave.approval_remark,
-        is_emergency=leave.is_emergency or False,
-        is_half_day=leave.is_half_day or False,
-        half_day_slot=leave.half_day_slot,
-        created_at=str(leave.created_at) if leave.created_at else None,
-        updated_at=str(leave.updated_at) if leave.updated_at else None,
-    )
+    return _leave_to_schema(leave)
 
 
 # ── Approve / Reject ───────────────────────────────────────────────

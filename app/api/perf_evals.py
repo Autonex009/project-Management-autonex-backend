@@ -297,7 +297,7 @@ def list_evals(
     period: Optional[str] = None,
     status: Optional[str] = None,
     page: int = Query(1, ge=1),
-    limit: int = Query(25, ge=1, le=100),
+    limit: int = Query(25, ge=1, le=500),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -335,6 +335,13 @@ def list_evals(
         manageable_cache = {current_user.employee_id: True}
         filtered_evals = []
         for ev in all_evals:
+            # Already reviewed by this PM: a permanent historical fact, so it must stay
+            # visible even after the employee moves to a project this PM no longer runs —
+            # `can_manage_employee` only reflects *current* assignment and would otherwise
+            # make a PM's own past decision disappear out from under them.
+            if ev.reviewed_by == current_user.id:
+                filtered_evals.append(ev)
+                continue
             if ev.employee_id not in manageable_cache:
                 manageable_cache[ev.employee_id] = project_scope.can_manage_employee(db, current_user, ev.employee_id)
             if manageable_cache.get(ev.employee_id, False):

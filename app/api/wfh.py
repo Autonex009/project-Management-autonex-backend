@@ -7,7 +7,7 @@ from app.services.auth_service import get_current_user, has_team_read, require_r
 from app.services import audit_service, project_scope
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field, validator
-
+from app.utils.business_time import today_ist
 from app.db.database import get_db
 from app.models.wfh import WFHRequest
 from app.models.employee import Employee
@@ -27,8 +27,7 @@ router = APIRouter(prefix="/api/wfh", tags=["wfh"], dependencies=[Depends(get_cu
 @router.get("/today-ids")
 def get_wfh_today_ids(db: Session = Depends(get_db)):
     """Ultra-lightweight endpoint returning only employee IDs WFH today."""
-    from datetime import date
-    today = date.today()
+    today = today_ist()
     wfh = db.query(WFHRequest.employee_id).filter(
         WFHRequest.status == "approved",
         WFHRequest.wfh_date == today
@@ -241,7 +240,7 @@ def get_wfh_page(
         q = q.filter(WFHRequest.status == status)
 
     if today_only:
-        today = date_type.today()
+        today = today_ist()
         q = q.filter(WFHRequest.wfh_date == today)
 
     if search and search.strip():
