@@ -129,6 +129,37 @@ def get_employees_slim(
     emps = query.all()
     return [{"id": e[0], "name": e[1], "designation": e[2], "status": e[3], "employee_type": e[4], "skills": e[5], "email": e[6]} for e in emps]
 
+
+@router.get("/{employee_id}/active-projects")
+def get_employee_active_projects(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Fetches the active main projects a specific employee (e.g., Team Lead) is allocated to."""
+    from app.models.allocation import Allocation
+    from app.models.project import DailySheet
+    from app.models.parent_project import MainProject
+    
+    allocations = db.query(Allocation).filter(
+        Allocation.employee_id == employee_id,
+        Allocation.is_active == True
+    ).all()
+    
+    sub_project_ids = [a.sub_project_id for a in allocations if a.sub_project_id]
+    if not sub_project_ids:
+        return []
+        
+    daily_sheets = db.query(DailySheet).filter(DailySheet.id.in_(sub_project_ids)).all()
+    main_project_ids = list(set([ds.main_project_id for ds in daily_sheets if ds.main_project_id]))
+    
+    if not main_project_ids:
+        return []
+        
+    main_projects = db.query(MainProject).filter(MainProject.id.in_(main_project_ids)).all()
+    
+    return [{"id": mp.id, "name": mp.name} for mp in main_projects]
+
 import secrets
 from app.services.email_service import try_send_signup_approved_email
 from app.schemas.employee import EmployeeCreateResponse
