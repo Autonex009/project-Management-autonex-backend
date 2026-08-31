@@ -112,7 +112,7 @@ def get_employees_slim(
     """Ultra-lightweight endpoint for dropdowns."""
     query = db.query(
         Employee.id, Employee.name, Employee.designation, 
-        Employee.status, Employee.employee_type, Employee.skills, Employee.email
+        Employee.status, Employee.employee_type, Employee.skills, Employee.email, Employee.avatar_url
     )
 
     if status:
@@ -127,7 +127,7 @@ def get_employees_slim(
             query = query.filter(Employee.id.in_(manageable))
 
     emps = query.all()
-    return [{"id": e[0], "name": e[1], "designation": e[2], "status": e[3], "employee_type": e[4], "skills": e[5], "email": e[6]} for e in emps]
+    return [{"id": e[0], "name": e[1], "designation": e[2], "status": e[3], "employee_type": e[4], "skills": e[5], "email": e[6], "avatar_url": e[7]} for e in emps]
 
 
 @router.get("/{employee_id}/active-projects")
@@ -1638,3 +1638,123 @@ def delete_employee_avatar(
     return employee
 
 
+# ✅ ENCORD HISTORICAL SYNC
+class SyncPayload(BaseModel):
+    period: str  # "current_month", "last_month", "custom"
+    month: Optional[str] = None  # "YYYY-MM" if period is custom
+
+@router.post("/{employee_id}/encord-sync")
+async def trigger_encord_sync(
+    employee_id: int,
+    payload: SyncPayload,
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm"))
+):
+    from app.models.encord_analytics import EncordSyncLog
+    from app.services.encord_sync_service import get_period_dates
+    import uuid
+    import asyncio
+    
+    # 1. Check if an active sync is already running
+    active_sync = db.query(EncordSyncLog).filter_by(
+        employee_id=employee_id, status="in_progress"
+    ).first()
+    if active_sync:
+        raise HTTPException(status_code=400, detail="A sync is already in progress for this user.")
+
+    try:
+        start_dt, end_dt = get_period_dates(payload.period, payload.month)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+        
+    date_range_str = f"{payload.period.replace('_', ' ').title()}"
+    if payload.month:
+        date_range_str += f" ({payload.month})"
+
+    # 2. Create the log
+    log_id = str(uuid.uuid4())
+    sync_log = EncordSyncLog(
+        id=log_id,
+        employee_id=employee_id,
+        synced_by_id=current_user.employee_id or current_user.id,
+        status="in_progress",
+        date_range=date_range_str
+    )
+    db.add(sync_log)
+    db.commit()
+
+    redis = getattr(request.app.state, "redis_pool", None)
+    
+    # 3. Queue job or run inline
+    if redis:
+        job = await redis.enqueue_job("run_user_sync_task", log_id, employee_id, start_dt, end_dt)
+        if not job:
+            sync_log.status = "failed"
+            db.commit()
+            raise HTTPException(status_code=500, detail="Failed to enqueue job.")
+        return {"message": "Sync enqueued", "job_id": job.job_id, "log_id": log_id}
+    else:
+        # Fallback to inline if no redis
+        from app.services.encord_sync_service import run_user_sync
+        def _inline():
+            from app.db.database import SessionLocal
+            db_inline = SessionLocal()
+            try:
+                return run_user_sync(db_inline, log_id, employee_id, start_dt, end_dt)
+            finally:
+                db_inline.close()
+        
+        try:
+            result = await asyncio.to_thread(_inline)
+            return {"status": "complete", "result": result}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/{employee_id}/encord-sync/status/{job_id}")
+async def check_sync_status(
+    employee_id: int, 
+    job_id: str, 
+    request: Request,
+    current_user: User = Depends(require_role("admin", "pm"))
+):
+    from arq.jobs import Job, JobStatus
+    redis = getattr(request.app.state, "redis_pool", None)
+    if not redis:
+        raise HTTPException(status_code=503, detail="Queue unavailable.")
+        
+    job = Job(job_id, redis)
+    status = await job.status()
+    if status == JobStatus.not_found:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    response = {"job_id": job_id, "status": status.value}
+    if status == JobStatus.complete:
+        info = await job.info()
+        if info:
+            response["success"] = info.success
+            response["result"] = info.result
+    return response
+
+
+@router.get("/{employee_id}/encord-sync-logs")
+def get_sync_logs(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "pm"))
+):
+    from app.models.encord_analytics import EncordSyncLog
+    logs = db.query(EncordSyncLog).filter_by(employee_id=employee_id).order_by(EncordSyncLog.created_at.desc()).limit(20).all()
+    
+    return [
+        {
+            "id": log.id,
+            "status": log.status,
+            "date_range": log.date_range,
+            "records_upserted": log.records_upserted,
+            "created_at": log.created_at.isoformat() if log.created_at else None,
+            "completed_at": log.completed_at.isoformat() if log.completed_at else None,
+        }
+        for log in logs
+    ]

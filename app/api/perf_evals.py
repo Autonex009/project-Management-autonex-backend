@@ -341,14 +341,18 @@ def list_evals(
         if search and search.strip():
             q = q.filter(Employee.name.ilike(f"%{search.strip()}%"))
         if role_filter and role_filter != "all":
-            if role_filter == "admin":
+            if role_filter.lower() == "admin":
                 q = q.filter(Employee.designation.ilike("%admin%"))
-            elif role_filter == "pm":
+            elif role_filter.lower() == "pm":
                 q = q.filter(Employee.designation.ilike("%manager%"))
-            elif role_filter == "team_lead":
+            elif role_filter.lower() == "team_lead":
                 q = q.filter(Employee.designation.ilike("%lead%"))
-            elif role_filter == "annotator":
+            elif role_filter.lower() == "annotator":
                 q = q.filter(Employee.designation.ilike("%annotator%"))
+            elif role_filter.lower() in ["full-time", "intern"]:
+                q = q.filter(Employee.employee_type.ilike(role_filter))
+            elif role_filter.lower() == "contract":
+                q = q.filter(Employee.employee_type.ilike("contract%"))
 
     
     # Filter by read privacy first
@@ -394,12 +398,35 @@ from sqlalchemy import func
 @router.get("/admin-kpi", response_model=dict)
 def get_admin_perf_kpi(
     period: Optional[str] = None,
+    project_id: Optional[int] = None,
+    role_filter: Optional[str] = None,
+    search: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "hr", "pm"))
 ):
     q = db.query(PerfEvaluation).filter(PerfEvaluation.project_id != 0)
     if period:
         q = q.filter(PerfEvaluation.period == period)
+    if project_id:
+        q = q.filter(PerfEvaluation.project_id == project_id)
+        
+    if search or role_filter:
+        q = q.outerjoin(Employee, Employee.id == PerfEvaluation.employee_id)
+        if search and search.strip():
+            q = q.filter(Employee.name.ilike(f"%{search.strip()}%"))
+        if role_filter and role_filter != "all":
+            if role_filter.lower() == "admin":
+                q = q.filter(Employee.designation.ilike("%admin%"))
+            elif role_filter.lower() == "pm":
+                q = q.filter(Employee.designation.ilike("%manager%"))
+            elif role_filter.lower() == "team_lead":
+                q = q.filter(Employee.designation.ilike("%lead%"))
+            elif role_filter.lower() == "annotator":
+                q = q.filter(Employee.designation.ilike("%annotator%"))
+            elif role_filter.lower() in ["full-time", "intern"]:
+                q = q.filter(Employee.employee_type.ilike(role_filter))
+            elif role_filter.lower() == "contract":
+                q = q.filter(Employee.employee_type.ilike("contract%"))
     
     # KPIs for the admin dashboard
     total = q.count()
@@ -411,14 +438,7 @@ def get_admin_perf_kpi(
     
     # Avg rating
     # overall_rating might be null, so we avg only non-nulls
-    avg_rating = db.query(func.avg(PerfEvaluation.overall_rating)).filter(
-        PerfEvaluation.project_id != 0,
-        PerfEvaluation.overall_rating.isnot(None)
-    )
-    if period:
-        avg_rating = avg_rating.filter(PerfEvaluation.period == period)
-    
-    avg_val = avg_rating.scalar()
+    avg_val = q.filter(PerfEvaluation.overall_rating.isnot(None)).with_entities(func.avg(PerfEvaluation.overall_rating)).scalar()
     
     return {
         "total": total,
