@@ -22,6 +22,14 @@ _scheduler = BackgroundScheduler()
 ENCORD_SYNC_HOUR = int(os.getenv("ENCORD_SYNC_HOUR", "23"))
 ENCORD_SYNC_MINUTE = int(os.getenv("ENCORD_SYNC_MINUTE", "30"))
 
+# Daily check-in reminders — mid-morning nudge to whoever hasn't checked in yet,
+# then a later nudge to PMs/leads who still have unconfirmed check-ins. Weekdays
+# only. Hours are 24h local time.
+CHECKIN_REMINDER_HOUR = int(os.getenv("CHECKIN_REMINDER_HOUR", "10"))
+CHECKIN_REMINDER_MINUTE = int(os.getenv("CHECKIN_REMINDER_MINUTE", "15"))
+PM_CONFIRM_REMINDER_HOUR = int(os.getenv("PM_CONFIRM_REMINDER_HOUR", "12"))
+PM_CONFIRM_REMINDER_MINUTE = int(os.getenv("PM_CONFIRM_REMINDER_MINUTE", "0"))
+
 
 def _scheduled_hiring_sync() -> None:
     db = SessionLocal()
@@ -180,6 +188,108 @@ def _scheduled_encord_sync() -> None:
         db.close()
 
 
+def _scheduled_checkin_reminders() -> None:
+    """Nudge every active employee who hasn't checked in yet today."""
+    db = SessionLocal()
+    try:
+        from datetime import date
+        from app.models.employee import Employee
+        from app.models.leave import Leave
+        from app.models.daily_checkin import DailyCheckIn
+        from app.services.slack_service import (
+            try_get_or_cache_employee_slack_user_id,
+            try_send_checkin_reminder_message,
+        )
+
+        today = date.today()
+
+        checked_in_ids = {
+            row[0] for row in db.query(DailyCheckIn.employee_id).filter(
+                DailyCheckIn.checkin_date == today
+            ).all()
+        }
+        on_leave_ids = {
+            row[0] for row in db.query(Leave.employee_id).filter(
+                Leave.status == "approved",
+                Leave.start_date <= today,
+                Leave.end_date >= today,
+            ).all()
+        }
+
+        employees = db.query(Employee).filter(Employee.status == "active").all()
+        sent = 0
+        for employee in employees:
+            if employee.id in checked_in_ids or employee.id in on_leave_ids:
+                continue
+            slack_id = try_get_or_cache_employee_slack_user_id(db, employee)
+            if not slack_id:
+                continue
+            if try_send_checkin_reminder_message(
+                employee_slack_user_id=slack_id, employee_name=employee.name
+            ):
+                sent += 1
+        logger.info("[scheduler] Check-in reminders sent to %s employee(s)", sent)
+    except Exception as exc:
+        logger.error("[scheduler] Check-in reminder job failed: %s", exc)
+    finally:
+        db.close()
+
+
+def _scheduled_pm_confirm_reminders() -> None:
+    """Nudge every PM/lead who still has unconfirmed check-ins on their roster."""
+    db = SessionLocal()
+    try:
+        from datetime import date
+        from app.models.user import User
+        from app.models.employee import Employee
+        from app.models.daily_checkin import DailyCheckIn
+        from app.api.checkins import _scoped_roster
+        from app.services.slack_service import (
+            try_get_or_cache_employee_slack_user_id,
+            try_send_pm_confirm_reminder_message,
+        )
+
+        today = date.today()
+        pm_users = (
+            db.query(User)
+            .filter(User.role.in_(["pm", "team_lead"]), User.employee_id.isnot(None))
+            .all()
+        )
+
+        sent = 0
+        for pm_user in pm_users:
+            roster = _scoped_roster(db, pm_user)
+            if not roster:
+                continue
+            employee_ids = list(roster.keys())
+            pending = (
+                db.query(DailyCheckIn)
+                .filter(
+                    DailyCheckIn.employee_id.in_(employee_ids),
+                    DailyCheckIn.checkin_date == today,
+                    DailyCheckIn.pm_confirmed_at.is_(None),
+                )
+                .count()
+            )
+            if pending == 0:
+                continue
+            pm_employee = db.query(Employee).filter(Employee.id == pm_user.employee_id).first()
+            if not pm_employee:
+                continue
+            slack_id = try_get_or_cache_employee_slack_user_id(db, pm_employee)
+            if not slack_id:
+                continue
+            if try_send_pm_confirm_reminder_message(
+                pm_slack_user_id=slack_id, pm_name=pm_employee.name, pending_count=pending
+            ):
+                sent += 1
+        logger.info("[scheduler] PM confirm reminders sent to %s manager(s)", sent)
+    except Exception as exc:
+        logger.error("[scheduler] PM confirm reminder job failed: %s", exc)
+    finally:
+        db.close()
+
+
 def start_scheduler() -> None:
     # Encord analytics pull once a day at end of day (ENCORD_SYNC_HOUR:MINUTE).
     # max_instances=1 + coalesce so a slow run never overlaps the next.
@@ -242,6 +352,35 @@ def start_scheduler() -> None:
             hour=2,
             minute=0,
             id="tenure_yearly_badges",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # Employee check-in reminder – weekdays at CHECKIN_REMINDER_HOUR:MINUTE.
+    if not _scheduler.get_job("checkin_reminder"):
+        _scheduler.add_job(
+            _scheduled_checkin_reminders,
+            trigger="cron",
+            day_of_week="mon-fri",
+            hour=CHECKIN_REMINDER_HOUR,
+            minute=CHECKIN_REMINDER_MINUTE,
+            id="checkin_reminder",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # PM/lead confirm-roster reminder – weekdays at PM_CONFIRM_REMINDER_HOUR:MINUTE,
+    # after the employee reminder has had time to land.
+    if not _scheduler.get_job("pm_confirm_reminder"):
+        _scheduler.add_job(
+            _scheduled_pm_confirm_reminders,
+            trigger="cron",
+            day_of_week="mon-fri",
+            hour=PM_CONFIRM_REMINDER_HOUR,
+            minute=PM_CONFIRM_REMINDER_MINUTE,
+            id="pm_confirm_reminder",
             replace_existing=True,
             max_instances=1,
             coalesce=True,

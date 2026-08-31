@@ -1003,6 +1003,98 @@ def try_send_password_reset_message(employee_email: str, reset_link: str) -> boo
         return False
 
 
+def _checkin_frontend_url() -> str:
+    base = (os.getenv("FRONTEND_URL") or "http://localhost:5173").strip().rstrip("/")
+    return f"{base}/employee/dashboard"
+
+
+def send_checkin_reminder_message(*, employee_slack_user_id: str, employee_name: str) -> bool:
+    """DM an employee who hasn't checked in yet, with a link back to the dashboard
+    (the check-in modal shows itself there — see DailyCheckInModal)."""
+    channel_id = open_direct_message_channel(employee_slack_user_id)
+    response = _slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": f"Good morning {employee_name} — don't forget to check in on Autonex today.",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Good morning, {employee_name}!*\nYou haven't checked in yet today — mark your attendance, work mode, and today's project(s) on Autonex.",
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Check In Now"},
+                            "style": "primary",
+                            "url": _checkin_frontend_url(),
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+    if response.get("ok"):
+        return True
+    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+
+
+def try_send_checkin_reminder_message(**kwargs) -> bool:
+    try:
+        return send_checkin_reminder_message(**kwargs)
+    except Exception as exc:
+        logger.warning("Slack check-in reminder skipped for %s: %s", kwargs.get("employee_name"), exc)
+        return False
+
+
+def send_pm_confirm_reminder_message(*, pm_slack_user_id: str, pm_name: str, pending_count: int) -> bool:
+    """DM a PM/lead who still has unconfirmed check-ins on their roster."""
+    channel_id = open_direct_message_channel(pm_slack_user_id)
+    response = _slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": f"{pm_name}, you have {pending_count} check-in(s) to confirm today.",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Team check-ins waiting on you*\n{pm_name}, {pending_count} check-in{'s' if pending_count != 1 else ''} on your team are still unconfirmed for today.",
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Review Team"},
+                            "style": "primary",
+                            "url": (os.getenv("FRONTEND_URL") or "http://localhost:5173").strip().rstrip("/") + "/pm/team-checkins",
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+    if response.get("ok"):
+        return True
+    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+
+
+def try_send_pm_confirm_reminder_message(**kwargs) -> bool:
+    try:
+        return send_pm_confirm_reminder_message(**kwargs)
+    except Exception as exc:
+        logger.warning("Slack PM confirm reminder skipped for %s: %s", kwargs.get("pm_name"), exc)
+        return False
+
+
 async def send_slack_reset_link(user_slack_id: str, reset_link: str) -> None:
     """Send a password reset link to a user's Slack DM without blocking the event loop."""
     await asyncio.to_thread(_send_slack_reset_link_sync, user_slack_id, reset_link)
