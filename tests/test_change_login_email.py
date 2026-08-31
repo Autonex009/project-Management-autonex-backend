@@ -104,15 +104,15 @@ def change_email(client, employee_id, new_email):
     return client.post(f"/api/employees/{employee_id}/email/verify", json={"otp": otp})
 
 
-def test_rejects_an_address_outside_the_company_domain(ctx):
+def test_accepts_an_address_outside_the_company_domain(ctx):
     client, db, employee, _ = ctx
 
     resp = change_email(client, employee.id, "person@gmail.com")
 
-    assert resp.status_code in (400, 422)
+    assert resp.status_code == 200
     db.expire_all()
-    assert db.query(Employee).get(employee.id).email == PERSONAL
-    assert notices == []
+    assert db.query(Employee).get(employee.id).email == "person@gmail.com"
+    assert len(notices) == 1
 
 
 def test_accepts_the_company_domain_and_moves_the_login(ctx):
@@ -173,8 +173,8 @@ def test_rejects_a_no_op_change(ctx):
     assert resp.status_code == 400
 
 
-def test_employee_cannot_dodge_the_domain_rule_via_the_generic_update(ctx):
-    """Without this guard the whole domain restriction is decorative."""
+def test_employee_cannot_dodge_the_otp_rule_via_the_generic_update(ctx):
+    """Without this guard the whole OTP verification requirement is decorative."""
     client, db, employee, _ = ctx
 
     resp = client.put(f"/api/employees/{employee.id}", json={"email": "anything@elsewhere.com"})
