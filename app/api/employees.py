@@ -877,9 +877,9 @@ def update_employee(
     # everything without being allowed to change designations, salary or status. Adding
     # "team_lead" here would let a view-only role rewrite these fields.
     if current_user.role not in ["admin", "pm", "hr"]:
-        # `email` is here so the company-domain rule on PATCH /{id}/email can't be
+        # `email` is here so the OTP verification requirement on POST /{id}/email/request can't be
         # sidestepped by patching the field directly — self-service email changes
-        # must go through that endpoint, which validates the domain and notifies.
+        # must go through that endpoint, which sends an OTP and notifies.
         admin_only_fields = {
             "email",
             "employee_type", "designation", "working_hours_per_day",
@@ -985,12 +985,6 @@ def request_employee_email_change(
     if new_email == old_email.strip().lower():
         raise HTTPException(status_code=400, detail="That is already your current email address.")
 
-    # Only an admin can set an out-of-domain email. Self-service must stay in-house.
-    if current_user.role != "admin" and not new_email.endswith(f"@{COMPANY_EMAIL_DOMAIN}"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Email changes are restricted to the @{COMPANY_EMAIL_DOMAIN} domain.",
-        )
 
     linked_user = db.query(User).filter(User.employee_id == employee.id).first()
     check_duplicate_identity(
