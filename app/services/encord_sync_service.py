@@ -303,3 +303,118 @@ def run_sync(db: Session, start: datetime | None = None, end: datetime | None = 
             logger.error("[encord_sync] project %s (%s) failed: %s", sp.id, phash, exc)
 
     return summary
+
+
+def get_period_dates(period: str, custom_month: str = None) -> tuple[datetime, datetime]:
+    """Calculate the start and end datetime for the requested period (Current Month, Last Month, Custom Month)."""
+    now = datetime.now()
+    if period == "current_month":
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = now
+    elif period == "last_month":
+        first_of_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        end = first_of_this - timedelta(seconds=1)
+        start = end.replace(day=1, hour=0, minute=0, second=0)
+    elif period == "custom" and custom_month:
+        try:
+            # custom_month format: "YYYY-MM"
+            dt = datetime.strptime(custom_month, "%Y-%m")
+            start = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            # Find the end of that month
+            next_month = start.replace(day=28) + timedelta(days=4)
+            end = next_month - timedelta(days=next_month.day)
+            end = end.replace(hour=23, minute=59, second=59)
+            if end > now:
+                end = now
+        except ValueError:
+            raise ValueError("custom_month must be YYYY-MM")
+    else:
+        raise ValueError("Invalid period")
+    return start, end
+
+
+def run_user_sync(db: Session, log_id: str, employee_id: int, start: datetime, end: datetime):
+    """
+    Historical sync for a specific user over a specific time range.
+    Only fetches data for the missing days for that user.
+    """
+    from app.models.employee import Employee
+    from app.models.encord_analytics import EncordSyncLog
+    import time
+    
+    log = db.query(EncordSyncLog).filter_by(id=log_id).first()
+    if not log:
+        return {"error": "Log not found"}
+
+    try:
+        emp = db.query(Employee).filter_by(id=employee_id).first()
+        if not emp or not emp.encord_id:
+            raise ValueError("Employee not found or lacks encord_id")
+
+        email = emp.encord_id
+        clients = _region_clients()
+        projects = mapped_projects(db)
+        
+        upserted = 0
+        
+        # Loop through projects
+        for sp in projects:
+            phash = sp.encord_project_hash
+            
+            # Find which region has the project
+            project = None
+            for reg, client in clients:
+                try:
+                    project = client.get_project(phash)
+                    break
+                except Exception:
+                    pass
+                    
+            if not project:
+                continue
+                
+            # Chunk the time range so we don't hit Encord's limits
+            agg = {}
+            for win_start, win_end in _windows(start, end):
+                try:
+                    for ts in project.list_time_spent(start=win_start, end=win_end):
+                        # Filter down to just this user
+                        if not ts.user_email or ts.user_email.strip().lower() != email.strip().lower():
+                            continue
+                            
+                        day = ts.period_start_time.date()
+                        stage = _stage_title(getattr(ts, "workflow_stage", None))
+                        role = _role_name(getattr(ts, "project_user_role", None))
+                        
+                        key = (day, stage, role)
+                        bucket = agg.setdefault(key, 0)
+                        agg[key] += int(getattr(ts, "time_spent_seconds", 0) or 0)
+                        
+                except Exception as e:
+                    logger.warning(f"Error fetching for {phash}: {e}")
+                    
+            for (day, stage, role), total_seconds in agg.items():
+                outcome = _upsert(
+                    db, sub_project_id=sp.id, project_hash=phash, metric_date=day,
+                    user_email=email, role=role, stage=stage, seconds=total_seconds
+                )
+                if outcome in ("inserted", "updated"):
+                    upserted += 1
+
+        # Update log on success
+        log.status = "success"
+        log.records_upserted = upserted
+        log.completed_at = datetime.now()
+        db.commit()
+        return {"status": "success", "upserted": upserted}
+        
+    except Exception as e:
+        db.rollback()
+        log = db.query(EncordSyncLog).filter_by(id=log_id).first()
+        if log:
+            log.status = "failed"
+            log.completed_at = datetime.now()
+            db.commit()
+        logger.error(f"[encord_sync] user sync failed: {e}")
+        return {"status": "failed", "error": str(e)}
+

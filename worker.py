@@ -49,8 +49,24 @@ async def run_encord_sync(ctx, start: Optional[datetime] = None, end: Optional[d
     return result
 
 
+def _perform_user_sync(log_id: str, employee_id: int, start: datetime, end: datetime):
+    db = SessionLocal()
+    try:
+        return encord_sync_service.run_user_sync(db, log_id, employee_id, start, end)
+    finally:
+        db.close()
+
+
+async def run_user_sync_task(ctx, log_id: str, employee_id: int, start: datetime, end: datetime):
+    logger.info("Worker picked up user Encord sync — employee=%s start=%s end=%s", employee_id, start, end)
+    result = await asyncio.to_thread(_perform_user_sync, log_id, employee_id, start, end)
+    logger.info("Worker completed user Encord sync: %s", result)
+    return result
+
+
 class WorkerSettings:
     # ARQ looks for this class. `functions` names must match enqueue_job() calls.
-    functions = [run_encord_sync]
+    functions = [run_encord_sync, run_user_sync_task]
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
     max_jobs = 2
+
