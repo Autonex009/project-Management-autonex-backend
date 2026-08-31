@@ -1,3 +1,4 @@
+
 from pydantic import BaseModel, Field, validator
 from datetime import date, datetime
 from typing import List, Optional
@@ -51,7 +52,7 @@ class CheckInResponse(BaseModel):
     checked_out_at: Optional[datetime] = None
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 
 class TodayCheckInStatus(BaseModel):
@@ -60,6 +61,9 @@ class TodayCheckInStatus(BaseModel):
     checkin: Optional[CheckInResponse] = None
     project_options: List[dict] = []  # [{project_id, project_name}]
     suggested_work_mode: str = "WFO"  # "WFH" if an approved WFH request covers today
+
+    class Config:
+        from_attributes = True
 
 
 class TeamCheckInRow(BaseModel):
@@ -75,6 +79,7 @@ class TeamCheckInRow(BaseModel):
     checked_in_at: Optional[datetime] = None
     checked_out_at: Optional[datetime] = None
     pm_confirmed_at: Optional[datetime] = None
+    is_officially_allocated: bool = True
 
 
 class TeamCheckInSummary(BaseModel):
@@ -83,6 +88,16 @@ class TeamCheckInSummary(BaseModel):
     checked_in: int
     confirmed: int
     rows: List[TeamCheckInRow] = []
+
+
+class PaginatedTeamCheckIns(BaseModel):
+    total: int
+    page: int
+    limit: int
+    kpi_total: int = 0
+    kpi_checked_in: int = 0
+    kpi_confirmed: int = 0
+    items: List[TeamCheckInRow] = []
 
 
 class ConfirmResult(BaseModel):
