@@ -345,7 +345,7 @@ def submit_signup_request(
     return _to_response(req)
 
 
-@router.get("/counts", response_model=SignupRequestCountsResponse, dependencies=[Depends(require_role("admin"))])
+@router.get("/counts", response_model=SignupRequestCountsResponse, dependencies=[Depends(require_role("admin", "hr"))])
 def get_signup_request_counts(db: Session = Depends(get_db)):
     """Return pending/approved/rejected/total counts for tab badges."""
     from sqlalchemy import func
@@ -362,7 +362,7 @@ def get_signup_request_counts(db: Session = Depends(get_db)):
     return counts
 
 
-@router.get("", response_model=PaginatedSignupRequestResponse, dependencies=[Depends(require_role("admin"))])
+@router.get("", response_model=PaginatedSignupRequestResponse, dependencies=[Depends(require_role("admin", "hr"))])
 def list_signup_requests(
     status: Optional[str] = Query(None, description="Filter by status: pending | approved | rejected"),
     search: Optional[str] = Query(None, description="Case-insensitive search on name, email, or designation"),
@@ -402,7 +402,7 @@ def approve_signup_request(
     http_request: Request,
     reviewed_by: int = Query(0, deprecated=True),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(require_role("admin", "hr")),
 ):
     """Approve a signup request — creates employee + user accounts and emails credentials.
 
@@ -550,7 +550,7 @@ def update_signup_request(
     payload: UpdateSignupRequest,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(require_role("admin", "hr")),
 ):
     """Update editable fields (employee_type, designation) on a pending signup request."""
     req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
@@ -605,7 +605,7 @@ def reject_signup_request(
     reviewed_by: int = Query(0, deprecated=True),
     body: RejectBody = RejectBody(),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(require_role("admin", "hr")),
 ):
     """Reject a signup request and optionally notify the applicant.
 
@@ -655,7 +655,7 @@ def undo_reject_signup_request(
     http_request: Request,
     reviewed_by: int = Query(0, deprecated=True),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(require_role("admin", "hr")),
 ):
     req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
     if not req:
@@ -698,7 +698,7 @@ def undo_approve_signup_request(
     reviewed_by: int = Query(0, deprecated=True),
     body: RejectBody = RejectBody(),
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin")),
+    current_user: User = Depends(require_role("admin", "hr")),
 ):
     req = db.query(SignupRequest).filter(SignupRequest.id == request_id).first()
     if not req:

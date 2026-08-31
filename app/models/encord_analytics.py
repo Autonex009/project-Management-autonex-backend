@@ -10,7 +10,7 @@ from sqlalchemy import Column, Integer, String, Text, Date, TIMESTAMP, ForeignKe
 from sqlalchemy.sql import func
 
 from app.db.database import Base
-
+import uuid
 
 class EncordDailyTimeSpent(Base):
     __tablename__ = "encord_daily_time_spent"
@@ -36,3 +36,22 @@ class EncordDailyTimeSpent(Base):
             name="uq_encord_day_user_stage",
         ),
     )
+
+
+class EncordSyncLog(Base):
+    """
+    Logs for manual historical Encord syncs.
+    Triggered by PMs/Admins from the dashboard.
+    """
+    __tablename__ = "encord_sync_logs"
+
+    id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=False, index=True)
+    synced_by_id = Column(Integer, ForeignKey("employees.id"), nullable=False)
+    status = Column(String(32), nullable=False, default="in_progress") # 'in_progress', 'success', 'failed'
+    date_range = Column(Text, nullable=True)
+    records_upserted = Column(Integer, nullable=True, default=0)
+    
+    created_at = Column(TIMESTAMP, server_default=func.now())
+    completed_at = Column(TIMESTAMP, nullable=True)
+

@@ -405,6 +405,93 @@ def try_send_otp_email(**kwargs) -> bool:
         return False
 
 
+# ── Onboarding Evaluation emails ──────────────────────────────────────────────
+
+def send_evaluation_passed_email(*, to_email: str, to_name: str, project_name: str) -> None:
+    first = to_name.split()[0]
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f4f7; margin: 0; padding: 0; }}
+    .container {{ max-width: 560px; margin: 40px auto; background: #fff; border-radius: 8px;
+                  padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+    h2 {{ color: #1a1a2e; margin-top: 0; }}
+    .badge {{ display: inline-block; background: #d1fae5; color: #065f46;
+              border-radius: 20px; padding: 4px 14px; font-size: 13px; font-weight: 600; margin-bottom: 20px; }}
+    p {{ color: #374151; line-height: 1.6; }}
+    .footer {{ margin-top: 32px; font-size: 12px; color: #9ca3af;
+               border-top: 1px solid #e5e7eb; padding-top: 16px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <span class="badge">Evaluation Passed</span>
+    <h2>Congratulations, {first}!</h2>
+    <p>We are thrilled to let you know that you have successfully passed your 5-day onboarding evaluation for <strong>{project_name}</strong>.</p>
+    <p>You have now been officially allocated to the project and can begin taking on live tasks. Please check your Autonex portal for any newly assigned work.</p>
+    <p>Welcome to the team, and great job!</p>
+    <p>Best regards,<br><strong>The Autonex AI Team</strong></p>
+    <div class="footer"><p>Autonex AI &mdash; {os.getenv("MAIL_FROM", "")}</p></div>
+  </div>
+</body>
+</html>"""
+    _send(to_email=to_email, to_name=to_name, subject="Congratulations! You passed your evaluation", html_body=html)
+
+
+def send_evaluation_failed_email(*, to_email: str, to_name: str, project_name: str) -> None:
+    first = to_name.split()[0]
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f4f4f7; margin: 0; padding: 0; }}
+    .container {{ max-width: 560px; margin: 40px auto; background: #fff; border-radius: 8px;
+                  padding: 40px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+    h2 {{ color: #1a1a2e; margin-top: 0; }}
+    .badge {{ display: inline-block; background: #fee2e2; color: #991b1b;
+              border-radius: 20px; padding: 4px 14px; font-size: 13px; font-weight: 600; margin-bottom: 20px; }}
+    p {{ color: #374151; line-height: 1.6; }}
+    .footer {{ margin-top: 32px; font-size: 12px; color: #9ca3af;
+               border-top: 1px solid #e5e7eb; padding-top: 16px; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <span class="badge">Evaluation Complete</span>
+    <h2>Onboarding Evaluation Update</h2>
+    <p>Hi {first},</p>
+    <p>Thank you for completing the 5-day onboarding pipeline for <strong>{project_name}</strong>.</p>
+    <p>Unfortunately, your evaluation did not meet the required threshold to proceed to live tasks at this time. Your Team Lead will reach out to discuss your feedback and next steps shortly.</p>
+    <p>We appreciate the effort you put in during your shadowing phase.</p>
+    <p>Best regards,<br><strong>The Autonex AI Team</strong></p>
+    <div class="footer"><p>Autonex AI &mdash; {os.getenv("MAIL_FROM", "")}</p></div>
+  </div>
+</body>
+</html>"""
+    _send(to_email=to_email, to_name=to_name, subject="Update on your Autonex onboarding evaluation", html_body=html)
+
+
+def try_send_evaluation_passed_email(**kwargs) -> bool:
+    try:
+        send_evaluation_passed_email(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning("[email] Evaluation passed email failed: %s", exc)
+        return False
+
+
+def try_send_evaluation_failed_email(**kwargs) -> bool:
+    try:
+        send_evaluation_failed_email(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning("[email] Evaluation failed email failed: %s", exc)
+        return False
+
+
 # ── Referral emails ───────────────────────────────────────────────────────────
 
 def send_referral_confirmation_email(
