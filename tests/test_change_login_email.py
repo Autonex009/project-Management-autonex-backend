@@ -107,11 +107,11 @@ def change_email(client, employee_id, new_email):
 def test_accepts_an_address_outside_the_company_domain(ctx):
     client, db, employee, _ = ctx
 
-    resp = change_email(client, employee.id, "person@gmail.com")
+    resp = change_email(client, employee.id, "another@gmail.com")
 
     assert resp.status_code == 200
     db.expire_all()
-    assert db.query(Employee).get(employee.id).email == "person@gmail.com"
+    assert db.query(Employee).get(employee.id).email == "another@gmail.com"
     assert len(notices) == 1
 
 
