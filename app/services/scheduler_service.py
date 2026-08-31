@@ -15,6 +15,30 @@ from app.services.badge_award_jobs import (
 
 logger = logging.getLogger(__name__)
 
+
+def _onboarding_day5_check() -> None:
+    """Daily job: flip any pipeline record to 'day_5_pending' when 5+ days have
+    elapsed since the candidate clicked 'Accept & Start'."""
+    from app.models.onboarding_pipeline import OnboardingPipeline
+    db = SessionLocal()
+    try:
+        cutoff = datetime.now() - timedelta(days=5)
+        records = db.query(OnboardingPipeline).filter(
+            OnboardingPipeline.status == "in_progress",
+            OnboardingPipeline.started_at <= cutoff,
+        ).all()
+        for record in records:
+            record.status = "day_5_pending"
+        if records:
+            db.commit()
+            logger.info("[scheduler] Onboarding Day-5 check: escalated %d candidate(s)", len(records))
+        else:
+            logger.info("[scheduler] Onboarding Day-5 check: no candidates to escalate")
+    except Exception as exc:
+        logger.error("[scheduler] Onboarding Day-5 check failed: %s", exc)
+    finally:
+        db.close()
+
 _scheduler = BackgroundScheduler()
 
 # Encord analytics are pulled once a day, at end of day. Hour is 24h local time
@@ -249,6 +273,19 @@ def start_scheduler() -> None:
 
     if not _scheduler.running:
         _scheduler.start()
+
+    # Onboarding pipeline Day-5 escalation — every day at 10:00 AM
+    if not _scheduler.get_job("onboarding_day5_check"):
+        _scheduler.add_job(
+            _onboarding_day5_check,
+            trigger="cron",
+            hour=10,
+            minute=0,
+            id="onboarding_day5_check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
 
     logger.info(
         "[scheduler] Started — Encord sync every %s min; hiring sync %s",
