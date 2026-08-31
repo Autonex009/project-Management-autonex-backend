@@ -44,6 +44,7 @@ from app.services.scheduler_service import start_scheduler, shutdown_scheduler
 from app.api.employee_notes import router as employee_notes_router
 from app.api.badges import router as badges_router
 from app.api.slack import router as slack_router
+from app.api.checkins import router as checkins_router
 from app.api.onboarding_pipeline import router as onboarding_pipeline_router
 
 Base.metadata.create_all(bind=engine)
@@ -152,5 +153,6 @@ app.include_router(audit_logs_router)
 app.include_router(employee_notes_router)
 app.include_router(badges_router)
 app.include_router(slack_router)
+app.include_router(checkins_router)
 app.include_router(onboarding_pipeline_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")
