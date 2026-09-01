@@ -189,9 +189,9 @@ def _to_response(req: SignupRequest) -> SignupRequestResponse:
         reason=req.reason,
         status=req.status,
         reviewed_by=req.reviewed_by,
-        reviewed_at=req.reviewed_at.isoformat() if req.reviewed_at else None,
+        reviewed_at=req.reviewed_at.isoformat() + "Z" if req.reviewed_at else None,
         rejection_reason=req.rejection_reason,
-        created_at=req.created_at.isoformat() if req.created_at else None,
+        created_at=req.created_at.isoformat() + "Z" if req.created_at else None,
     )
 
 
