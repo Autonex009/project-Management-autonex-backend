@@ -6,11 +6,11 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 
 from app.db.database import get_db
-from app.modles.allocation import Allocation
-from app.modles.project import SubProject, Project  # SubProject with Project alias
-from app.modles.employee import Employee
-from app.modles.parent_project import MainProject
-from app.modles.sub_project import SubProject as HierarchySubProject
+from app.models.allocation import Allocation
+from app.models.project import SubProject, Project  # SubProject with Project alias
+from app.models.employee import Employee
+from app.models.parent_project import MainProject
+from app.models.sub_project import SubProject as HierarchySubProject
 from datetime import date as date_cls
 from app.models.leave import Leave
 from app.models.wfh import WFHRequest
