@@ -49,7 +49,7 @@ def sync_project_allocations(db, project_id: int):
     from app.services import project_scope
     from app.api.projects import _autonex_headcount
 
-    project = db.query(Project).filter(Project.id == project_id).first()
+    project = db.query(Project).filter(Project.id == project_id)
     if not project: return
 
     allocs = db.query(Allocation).filter(
