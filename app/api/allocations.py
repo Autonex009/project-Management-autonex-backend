@@ -406,9 +406,29 @@ def _format_timeline(project: Project) -> str:
 def _get_project_manager_name(db: Session, project: Project) -> str:
     pm_name = None
 
-    if getattr(project, "main_project_id", None):
+    if getattr(project, "assigned_employee_ids", None):
+        # Pick the first valid assigned PM
+        for pm_id in project.assigned_employee_ids:
+            try:
+                emp = db.query(Employee).filter(Employee.id == int(pm_id)).first()
+                if emp:
+                    pm_name = emp.name
+                    break
+            except (ValueError, TypeError):
+                continue
+
+    if not pm_name and getattr(project, "main_project_id", None):
         main_project = db.query(MainProject).filter(MainProject.id == project.main_project_id).first()
-        if main_project and main_project.program_manager_id:
+        if main_project and getattr(main_project, "program_manager_ids", None):
+            for pm_id in main_project.program_manager_ids:
+                try:
+                    emp = db.query(Employee).filter(Employee.id == int(pm_id)).first()
+                    if emp:
+                        pm_name = emp.name
+                        break
+                except (ValueError, TypeError):
+                    continue
+        if not pm_name and main_project and getattr(main_project, "program_manager_id", None):
             pm_employee = db.query(Employee).filter(Employee.id == main_project.program_manager_id).first()
             pm_name = pm_employee.name if pm_employee else None
 

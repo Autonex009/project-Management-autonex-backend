@@ -329,15 +329,16 @@ def list_evals(
     if status:
         q = q.filter(PerfEvaluation.status == status)
 
-    if type == "pm":
-        q = q.filter(PerfEvaluation.project_id == 0)
-    elif type == "employee":
-        q = q.filter(PerfEvaluation.project_id != 0)
-    elif type == "bonus":
+    if type == "bonus":
         q = q.filter(PerfEvaluation.bonus_suggested == True)
 
-    if search or role_filter:
+    if type in ["pm", "hr"] or search or role_filter:
         q = q.outerjoin(Employee, Employee.id == PerfEvaluation.employee_id)
+        if type == "pm":
+            q = q.filter(PerfEvaluation.project_id == 0, Employee.designation.ilike("%manager%"))
+        elif type == "hr":
+            q = q.filter(PerfEvaluation.project_id == 0, Employee.designation.ilike("%hr%"))
+            
         if search and search.strip():
             q = q.filter(Employee.name.ilike(f"%{search.strip()}%"))
         if role_filter and role_filter != "all":
@@ -347,10 +348,16 @@ def list_evals(
                 q = q.filter(Employee.designation.ilike("%manager%"))
             elif role_filter.lower() == "team_lead":
                 q = q.filter(Employee.designation.ilike("%lead%"))
+            elif role_filter.lower() == "hr":
+                q = q.filter(Employee.designation.ilike("%hr%"))
             elif role_filter.lower() == "annotator":
                 q = q.filter(Employee.designation.ilike("%annotator%"))
             elif role_filter.lower() in ["full-time", "intern"]:
                 q = q.filter(Employee.employee_type.ilike(role_filter))
+                if role_filter.lower() == "full-time":
+                    q = q.filter(~Employee.designation.ilike("%manager%"))
+                    q = q.filter(~Employee.designation.ilike("%hr%"))
+                    q = q.filter(~Employee.designation.ilike("%lead%"))
             elif role_filter.lower() == "contract":
                 q = q.filter(Employee.employee_type.ilike("contract%"))
 
@@ -401,17 +408,23 @@ def get_admin_perf_kpi(
     project_id: Optional[int] = None,
     role_filter: Optional[str] = None,
     search: Optional[str] = None,
+    type: Optional[str] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "hr", "pm"))
 ):
-    q = db.query(PerfEvaluation).filter(PerfEvaluation.project_id != 0)
+    q = db.query(PerfEvaluation)
     if period:
         q = q.filter(PerfEvaluation.period == period)
     if project_id:
         q = q.filter(PerfEvaluation.project_id == project_id)
         
-    if search or role_filter:
+    if type in ["pm", "hr"] or search or role_filter:
         q = q.outerjoin(Employee, Employee.id == PerfEvaluation.employee_id)
+        if type == "pm":
+            q = q.filter(PerfEvaluation.project_id == 0, Employee.designation.ilike("%manager%"))
+        elif type == "hr":
+            q = q.filter(PerfEvaluation.project_id == 0, Employee.designation.ilike("%hr%"))
+            
         if search and search.strip():
             q = q.filter(Employee.name.ilike(f"%{search.strip()}%"))
         if role_filter and role_filter != "all":
@@ -421,20 +434,45 @@ def get_admin_perf_kpi(
                 q = q.filter(Employee.designation.ilike("%manager%"))
             elif role_filter.lower() == "team_lead":
                 q = q.filter(Employee.designation.ilike("%lead%"))
+            elif role_filter.lower() == "hr":
+                q = q.filter(Employee.designation.ilike("%hr%"))
             elif role_filter.lower() == "annotator":
                 q = q.filter(Employee.designation.ilike("%annotator%"))
             elif role_filter.lower() in ["full-time", "intern"]:
                 q = q.filter(Employee.employee_type.ilike(role_filter))
+                if role_filter.lower() == "full-time":
+                    q = q.filter(~Employee.designation.ilike("%manager%"))
+                    q = q.filter(~Employee.designation.ilike("%hr%"))
+                    q = q.filter(~Employee.designation.ilike("%lead%"))
             elif role_filter.lower() == "contract":
                 q = q.filter(Employee.employee_type.ilike("contract%"))
     
     # KPIs for the admin dashboard
     total = q.count()
+    
+    # Multi-project employees
+    multi_evals = q.with_entities(PerfEvaluation.employee_id, func.count(PerfEvaluation.id)).group_by(PerfEvaluation.employee_id).having(func.count(PerfEvaluation.id) > 1).all()
+    multi_eval_emp_ids = [row[0] for row in multi_evals]
+    multi_eval_counts = {row[0]: row[1] for row in multi_evals}
+    multi_eval_names = []
+    if multi_eval_emp_ids:
+        emp_names = db.query(Employee.id, Employee.name).filter(Employee.id.in_(multi_eval_emp_ids)).all()
+        multi_eval_names = [f"{name} ({multi_eval_counts[emp_id]})" for emp_id, name in emp_names]
+        
     pending = q.filter(PerfEvaluation.status == "submitted").count()
     reviewed = q.filter(PerfEvaluation.status == "reviewed").count()
     
     # Bonus evaluations
-    bonus = q.filter(PerfEvaluation.bonus_suggested == True).count()
+    q_bonus = q.filter(PerfEvaluation.bonus_suggested == True)
+    bonus = q_bonus.count()
+    
+    multi_bonus = q_bonus.with_entities(PerfEvaluation.employee_id, func.count(PerfEvaluation.id)).group_by(PerfEvaluation.employee_id).having(func.count(PerfEvaluation.id) > 1).all()
+    multi_bonus_emp_ids = [row[0] for row in multi_bonus]
+    multi_bonus_counts = {row[0]: row[1] for row in multi_bonus}
+    multi_bonus_names = []
+    if multi_bonus_emp_ids:
+        emp_names = db.query(Employee.id, Employee.name).filter(Employee.id.in_(multi_bonus_emp_ids)).all()
+        multi_bonus_names = [f"{name} ({multi_bonus_counts[emp_id]})" for emp_id, name in emp_names]
     
     # Avg rating
     # overall_rating might be null, so we avg only non-nulls
@@ -442,10 +480,14 @@ def get_admin_perf_kpi(
     
     return {
         "total": total,
+        "multiEvalCount": len(multi_eval_names),
+        "multiEvalNames": multi_eval_names,
         "pending": pending,
         "reviewed": reviewed,
         "completionRate": round((reviewed / total) * 100) if total > 0 else 0,
         "bonusCount": bonus,
+        "multiBonusCount": len(multi_bonus_names),
+        "multiBonusNames": multi_bonus_names,
         "avgRating": float(avg_val) if avg_val else None,
     }
 
@@ -545,6 +587,15 @@ def create_eval(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    from calendar import monthrange
+    today = datetime.today()
+    last_day = monthrange(today.year, today.month)[1]
+    if today.day < last_day - 6:
+        raise HTTPException(
+            status_code=403,
+            detail="Performance evaluations can only be submitted during the last week of the month."
+        )
+
     # Deliberately NOT has_team_read: submitting an evaluation *for* someone else is a
     # manager's action. A team lead falls through to the self-check below, so it can still
     # file its own self-evaluation and nobody else's.
