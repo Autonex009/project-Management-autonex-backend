@@ -67,7 +67,7 @@ class SignupRequestCreate(BaseModel):
     verification_token: str
     phone: Optional[str] = None
     designation: Optional[str] = None
-    employee_type: str = "Full-time"
+    employee_type: str = "Intern"
     skills: Optional[List[str]] = []
     reason: Optional[str] = None
 

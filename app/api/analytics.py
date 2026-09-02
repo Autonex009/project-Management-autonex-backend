@@ -441,7 +441,8 @@ def project_analytics(
     if not sp:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    today = date.today()
+    latest = db.query(func.max(EncordDailyTimeSpent.metric_date)).scalar()
+    today = latest or date.today()
     start = _parse_date(date_from, _month_start(today))
     end = _parse_date(date_to, today)
 
@@ -590,7 +591,8 @@ def summary(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    today = date.today()
+    latest = db.query(func.max(EncordDailyTimeSpent.metric_date)).scalar()
+    today = latest or date.today()
     # Window follows the dashboard range toggle (1|7|30 days|custom). Falls back to
     # month-to-date when no range is given, preserving the old default.
     start, end = _range_dates(range, today, date_from, date_to) if range else (_month_start(today), today)
@@ -817,7 +819,8 @@ def autonex_project_kpis(
     sp = db.query(DailySheet).filter(DailySheet.id == sub_project_id).first()
     if not sp:
         raise HTTPException(status_code=404, detail="Project not found")
-    today = date.today()
+    latest = db.query(func.max(EncordDailyTimeSpent.metric_date)).scalar()
+    today = latest or date.today()
     start, end = _range_dates(range, today, date_from, date_to) if range else (_month_start(today), today)
     result = _autonex_kpis(db, start=start, end=end, project_hash=sp.encord_project_hash)
     result["project_id"] = sp.id
@@ -834,7 +837,8 @@ def autonex_global_kpis(
     current_user: User = Depends(get_current_user),
 ):
     """6 Autonex-only KPIs + daily time graph across ALL mapped projects, over the range."""
-    today = date.today()
+    latest = db.query(func.max(EncordDailyTimeSpent.metric_date)).scalar()
+    today = latest or date.today()
     start, end = _range_dates(range, today, date_from, date_to) if range else (_month_start(today), today)
     allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
     allowed_hashes = None
@@ -852,7 +856,8 @@ def autonex_overview(
     current_user: User = Depends(get_current_user),
 ):
     """Dashboard: most active Autonex user and most active project (by time), this month."""
-    today = date.today()
+    latest = db.query(func.max(EncordDailyTimeSpent.metric_date)).scalar()
+    today = latest or date.today()
     start = _month_start(today)
 
     allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
