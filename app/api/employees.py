@@ -763,7 +763,35 @@ def get_team_data(
     if has_full_access(current_user):
         scoped_projects = all_projects
     else:
-        scoped_projects = [p for p in all_projects if can_act_on_project(db, current_user, p)]
+        actor_id = getattr(current_user, "employee_id", None)
+        if not actor_id:
+            scoped_projects = []
+        else:
+            main_pm_rows = db.query(MainProject.id, MainProject.program_manager_ids, MainProject.program_manager_id).all()
+            actor_main_proj_ids = set()
+            for m in main_pm_rows:
+                pm_ids = m.program_manager_ids or []
+                if str(actor_id) in [str(x) for x in pm_ids]:
+                    actor_main_proj_ids.add(m.id)
+                elif str(actor_id) == str(m.program_manager_id):
+                    actor_main_proj_ids.add(m.id)
+            
+            actor_allocations = db.query(Allocation.sub_project_id).filter(
+                Allocation.employee_id == actor_id
+            ).all()
+            actor_alloc_proj_ids = {r[0] for r in actor_allocations if r[0]}
+            
+            scoped_projects = []
+            for p in all_projects:
+                assigned = p.assigned_employee_ids or []
+                if str(actor_id) in [str(x) for x in assigned]:
+                    scoped_projects.append(p)
+                    continue
+                if p.main_project_id in actor_main_proj_ids:
+                    scoped_projects.append(p)
+                    continue
+                if p.id in actor_alloc_proj_ids:
+                    scoped_projects.append(p)
         
     scoped_project_ids = [p.id for p in scoped_projects]
     
@@ -779,13 +807,6 @@ def get_team_data(
     
     employees = db.query(Employee).filter(Employee.id.in_(emp_ids)).all()
     
-    # Fetch leaves and wfh requests for these employees
-    from app.models.leave import Leave
-    from app.models.wfh import WFHRequest
-    
-    leaves = db.query(Leave).filter(Leave.employee_id.in_(emp_ids)).all()
-    wfh_requests = db.query(WFHRequest).filter(WFHRequest.employee_id.in_(emp_ids)).all()
-
     # We only return the specific fields the frontend needs to avoid sending huge payloads
     return {
         "projects": [
@@ -805,41 +826,18 @@ def get_team_data(
                 "total_daily_hours": a.total_daily_hours
             } for a in allocations
         ],
-        "employees": [EmployeeResponse.model_validate(e).model_dump(mode='json') for e in employees],
-        "leaves": [
+        "employees": [
             {
-                "id": l.id,
-                "leave_id": l.id,
-                "employee_id": l.employee_id,
-                "start_date": l.start_date.isoformat() if l.start_date else None,
-                "end_date": l.end_date.isoformat() if l.end_date else None,
-                "status": l.status,
-                "leave_type": l.leave_type,
-                "reason": l.reason,
-                "is_half_day": l.is_half_day,
-                "half_day_slot": l.half_day_slot,
-                "is_emergency": getattr(l, "is_emergency", False),
-                "flagged": getattr(l, "flagged", False),
-                "approval_remark": getattr(l, "approval_remark", None),
-                "approved_by": l.approved_by,
-                "created_at": l.created_at.isoformat() if getattr(l, "created_at", None) else None,
-                "updated_at": l.updated_at.isoformat() if getattr(l, "updated_at", None) else None,
-            } for l in leaves
-        ],
-        "wfh_requests": [
-            {
-                "id": w.id,
-                "employee_id": w.employee_id,
-                "wfh_date": w.wfh_date.isoformat() if w.wfh_date else None,
-                "start_date": w.wfh_date.isoformat() if w.wfh_date else None,
-                "end_date": w.end_date.isoformat() if w.end_date else None,
-                "status": w.status,
-                "reason": w.reason,
-                "remark": w.remark,
-                "flagged": getattr(w, "flagged", False),
-                "approved_by": w.approved_by,
-                "created_at": w.created_at.isoformat() if w.created_at else None
-            } for w in wfh_requests
+                "id": e.id,
+                "name": e.name,
+                "email": e.email,
+                "slack_user_id": e.slack_user_id,
+                "status": e.status,
+                "designation": e.designation,
+                "phone": e.phone,
+                "skills": e.skills,
+                "employee_type": e.employee_type
+            } for e in employees
         ]
     }
 

@@ -1,7 +1,7 @@
 
 from pydantic import BaseModel, Field, validator
 from datetime import date, datetime
-from typing import List, Optional
+from typing import List, Optional, Union
 
 WORK_MODE_CHOICES = ["WFO", "WFH"]
 MOOD_CHOICES = ["great", "okay", "low", "stressed"]
@@ -9,7 +9,7 @@ MOOD_CHOICES = ["great", "okay", "low", "stressed"]
 
 class CheckInCreate(BaseModel):
     work_mode: str
-    project_ids: List[int] = Field(default_factory=list)
+    project_ids: List[Union[int, str]] = Field(default_factory=list)
     mood: Optional[str] = None
 
     @validator("work_mode")
@@ -46,7 +46,7 @@ class CheckInResponse(BaseModel):
     employee_id: int
     checkin_date: date
     work_mode: str
-    project_ids: List[int] = []
+    project_ids: List[Union[int, str]] = []
     mood: Optional[str] = None
     checked_in_at: Optional[datetime] = None
     checked_out_at: Optional[datetime] = None
