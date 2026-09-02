@@ -3,8 +3,9 @@ import os
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
-from app.db.database import SessionLocal
+from app.db.database import SessionLocal, engine
 from app.services.hiring_sync_service import run_sync
 from app.services.encord_sync_service import run_sync as run_encord_sync
 from app.services.badge_award_jobs import (
@@ -39,7 +40,10 @@ def _onboarding_day5_check() -> None:
     finally:
         db.close()
 
-_scheduler = BackgroundScheduler()
+jobstores = {
+    'default': SQLAlchemyJobStore(engine=engine, tablename='apscheduler_jobs')
+}
+_scheduler = BackgroundScheduler(jobstores=jobstores)
 
 # Encord analytics are pulled once a day, at end of day. Hour is 24h local time
 # (default 23:30). Upsert makes the pull idempotent if re-run.
@@ -340,28 +344,28 @@ def start_scheduler() -> None:
             next_run_time=datetime.now(),
         )
 
-    # Weekly badges – every Monday at 00:30
+    # Weekly badges — every Monday at 23:45
     if not _scheduler.get_job("weekly_badge_award"):
         _scheduler.add_job(
             run_weekly_badge_job,
             trigger="cron",
             day_of_week="mon",
-            hour=0,
-            minute=30,
+            hour=23,
+            minute=45,
             id="weekly_badge_award",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
 
-    # Monthly badges – 1st of every month at 01:00
+    # Monthly badges — 1st of every month at 23:45
     if not _scheduler.get_job("monthly_badge_award"):
         _scheduler.add_job(
             run_monthly_badge_job,
             trigger="cron",
             day=1,
-            hour=1,
-            minute=0,
+            hour=23,
+            minute=45,
             id="monthly_badge_award",
             replace_existing=True,
             max_instances=1,

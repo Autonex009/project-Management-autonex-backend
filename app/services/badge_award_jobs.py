@@ -18,10 +18,10 @@ from app.services.badge_service import (
 logger = logging.getLogger(__name__)
 
 
-def _get_employee_hours(db: Session, start: date, end: date) -> dict[int, float]:
+def _get_employee_hours(db: Session, start: date, end: date) -> tuple[dict[str, float], dict[str, int]]:
     """
     Calculate real hours using EncordDailyTimeSpent.
-    Returns {employee_id: total_hours} for the given date range.
+    Returns (hours_by_user, emp_map) for the given date range.
     """
     from sqlalchemy import func
     from app.models.employee import Employee
@@ -43,18 +43,17 @@ def _get_employee_hours(db: Session, start: date, end: date) -> dict[int, float]
         .filter(
             EncordDailyTimeSpent.metric_date >= start,
             EncordDailyTimeSpent.metric_date <= end,
+            EncordDailyTimeSpent.user_email.ilike("%_theta@encord.ai"),
         )
         .group_by(EncordDailyTimeSpent.user_email)
         .all()
     )
 
-    hours_by_emp = {}
+    hours_by_user = {}
     for user_email, total_seconds in results:
-        emp_id = emp_map.get(user_email)
-        if emp_id:
-            hours_by_emp[emp_id] = hours_by_emp.get(emp_id, 0.0) + (total_seconds / 3600.0)
+        hours_by_user[user_email] = hours_by_user.get(user_email, 0.0) + (total_seconds / 3600.0)
 
-    return hours_by_emp
+    return hours_by_user, emp_map
 
 
 def run_weekly_badge_job() -> dict:
@@ -64,9 +63,9 @@ def run_weekly_badge_job() -> dict:
         expire_due_badges(db)
 
         week_start, week_end = get_previous_week_range()
-        hours = _get_employee_hours(db, week_start, week_end)
+        hours, emp_map = _get_employee_hours(db, week_start, week_end)
 
-        count = award_weekly_badges(db, week_start, week_end, hours)
+        count = award_weekly_badges(db, week_start, week_end, hours, emp_map)
         db.commit()
 
         logger.info("[badges] Weekly job done – awarded=%s (%s → %s)", count, week_start, week_end)
@@ -86,9 +85,9 @@ def run_monthly_badge_job() -> dict:
         expire_due_badges(db)
 
         month_start, month_end = get_previous_month_range()
-        hours = _get_employee_hours(db, month_start, month_end)
+        hours, emp_map = _get_employee_hours(db, month_start, month_end)
 
-        count = award_monthly_badges(db, month_start, month_end, hours)
+        count = award_monthly_badges(db, month_start, month_end, hours, emp_map)
         db.commit()
 
         logger.info("[badges] Monthly job done – awarded=%s (%s → %s)", count, month_start, month_end)

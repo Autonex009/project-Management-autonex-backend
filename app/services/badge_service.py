@@ -205,7 +205,9 @@ def award_weekly_badges(
     db: Session,
     week_start: date,
     week_end: date,
-    hours_by_employee: Dict[int, float],
+    hours_by_user: Dict[str, float],
+    emp_map: Dict[str, int],
+    target_employee_id: Optional[int] = None,
 ) -> int:
     """
     Award hrs_50_week + weekly_top_1/2/3.
@@ -216,7 +218,10 @@ def award_weekly_badges(
     awarded = 0
 
     # 50 hours threshold
-    for emp_id, hours in hours_by_employee.items():
+    for user, hours in hours_by_user.items():
+        emp_id = emp_map.get(user)
+        if not emp_id: continue
+        if target_employee_id and emp_id != target_employee_id: continue
         if hours >= 50:
             if award_badge(
                 db,
@@ -230,8 +235,11 @@ def award_weekly_badges(
                 awarded += 1
 
     # Top 1 / 2 / 3
-    ranked = sorted(hours_by_employee.items(), key=lambda x: x[1], reverse=True)
-    for rank, (emp_id, hours) in enumerate(ranked[:3], start=1):
+    ranked = sorted(hours_by_user.items(), key=lambda x: x[1], reverse=True)
+    for rank, (user, hours) in enumerate(ranked[:3], start=1):
+        emp_id = emp_map.get(user)
+        if not emp_id: continue
+        if target_employee_id and emp_id != target_employee_id: continue
         if award_badge(
             db,
             employee_id=emp_id,
@@ -254,7 +262,9 @@ def award_monthly_badges(
     db: Session,
     month_start: date,
     month_end: date,
-    hours_by_employee: Dict[int, float],
+    hours_by_user: Dict[str, float],
+    emp_map: Dict[str, int],
+    target_employee_id: Optional[int] = None,
 ) -> int:
     """
     Award hrs_200_month + monthly_top_1/2/3.
@@ -272,7 +282,10 @@ def award_monthly_badges(
     awarded = 0
 
     # 200 hours threshold
-    for emp_id, hours in hours_by_employee.items():
+    for user, hours in hours_by_user.items():
+        emp_id = emp_map.get(user)
+        if not emp_id: continue
+        if target_employee_id and emp_id != target_employee_id: continue
         if hours >= 200:
             if award_badge(
                 db,
@@ -286,8 +299,11 @@ def award_monthly_badges(
                 awarded += 1
 
     # Top 1 / 2 / 3
-    ranked = sorted(hours_by_employee.items(), key=lambda x: x[1], reverse=True)
-    for rank, (emp_id, hours) in enumerate(ranked[:3], start=1):
+    ranked = sorted(hours_by_user.items(), key=lambda x: x[1], reverse=True)
+    for rank, (user, hours) in enumerate(ranked[:3], start=1):
+        emp_id = emp_map.get(user)
+        if not emp_id: continue
+        if target_employee_id and emp_id != target_employee_id: continue
         if award_badge(
             db,
             employee_id=emp_id,
