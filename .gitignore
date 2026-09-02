@@ -79,4 +79,4 @@ autonex.db.bak
 # Local reference audit docs & generator scripts
 *.pdf
 generate_audit_doc.py
-
+.agents/
