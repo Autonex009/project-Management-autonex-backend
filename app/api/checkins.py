@@ -220,8 +220,10 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
         
         if chk and chk.project_ids:
             chk_pnames = [all_proj[pid] for pid in chk.project_ids if pid in all_proj]
+            if "other" in chk.project_ids:
+                chk_pnames.append("Other")
             if scoped_project_ids is not None:
-                chk_pids = set(chk.project_ids)
+                chk_pids = set(pid for pid in chk.project_ids if isinstance(pid, int))
                 overlap = chk_pids.intersection(scoped_project_ids)
                 if overlap and not overlap.intersection(emp_alloc_pids):
                     is_officially_allocated = False
