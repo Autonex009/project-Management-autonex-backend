@@ -214,7 +214,7 @@ def confirm_onboarding(
     return _enrich_pipeline_record(record, db)
 
 
-@router.get("/", response_model=List[PipelineResponse])
+@router.get("", response_model=List[PipelineResponse])
 def list_pipeline(
     status_filter: str = None,
     db: Session = Depends(get_db),
