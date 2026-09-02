@@ -34,6 +34,7 @@ from app.models.employee import Employee
 from app.models.notification import Notification
 from app.models.signup_request import SignupRequest
 from app.models.user import User
+from app.models.onboarding_pipeline import OnboardingPipeline
 from app.services.email_service import (
     send_signup_verification_email,
     try_send_signup_approved_email,
@@ -708,6 +709,16 @@ def undo_approve_signup_request(
     user = db.query(User).filter(User.email == req.email).first()
     if user:
         user.is_active = False
+        # Delete the stranded onboarding pipeline record if it exists
+        db.query(OnboardingPipeline).filter(
+            OnboardingPipeline.candidate_id == user.id,
+            OnboardingPipeline.status.in_([
+                "pending_confirmation", 
+                "in_progress", 
+                "day_5_pending", 
+                "assigned"
+            ])
+        ).delete(synchronize_session=False)
     employee = db.query(Employee).filter(Employee.email == req.email).first()
     if employee:
         employee.status = "inactive"
