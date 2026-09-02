@@ -3,6 +3,7 @@ Authentication API: signup, login, logout, forgot-password, reset-password, me.
 """
 import logging
 import os
+import re
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
