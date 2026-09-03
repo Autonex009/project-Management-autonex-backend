@@ -137,76 +137,135 @@ def test_create_half_day_leave_validation_errors(client_and_db):
     resp = client.post("/api/leaves", json=payload)
     assert resp.status_code == 422
 
-
 def test_first_half_leave_timing_rules(client_and_db):
     client, db = client_and_db
     emp, admin = _seed_employee(db)
 
-    # India time is mocked to 2026-06-16 10:00:00 IST
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-    mocked_dt = datetime(2026, 6, 16, 10, 0, tzinfo=ist_tz)
-    
-    with patch("app.api.leaves.get_current_ist_datetime", return_value=mocked_dt):
-        # 1. Apply for tomorrow (2026-06-17) first_half -> Should SUCCEED (at least 1 day advance)
-        payload = {
-            "employee_id": emp.id,
-            "leave_type": "first_half",
-            "start_date": "2026-06-17",
-            "end_date": "2026-06-17",
-            "reason": "Appointment"
-        }
-        resp = client.post("/api/leaves", json=payload)
-        assert resp.status_code == 201
+    # Normal employee (non-privileged)
+    employee_user = User(
+        id=99,
+        email=emp.email,
+        name=emp.name,
+        role="employee",
+        employee_id=emp.id,
+        is_active=True,
+        password_hash="x",
+    )
+    db.add(employee_user)
+    db.commit()
 
-        # 2. Apply for today (2026-06-16) first_half -> Should FAIL
-        payload = {
-            "employee_id": emp.id,
-            "leave_type": "first_half",
-            "start_date": "2026-06-16",
-            "end_date": "2026-06-16",
-            "reason": "Appointment"
-        }
-        resp = client.post("/api/leaves", json=payload)
-        assert resp.status_code == 400
-        assert "First-half leaves must be applied at least one day in advance" in resp.json()["detail"]
+    from app.services.auth_service import get_current_user
+    original_override = client.app.dependency_overrides.get(get_current_user)
+
+    def override_as_employee():
+        return employee_user
+
+    client.app.dependency_overrides[get_current_user] = override_as_employee
+
+    try:
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
+        mocked_dt = datetime(2026, 6, 16, 10, 0, tzinfo=ist_tz)
+        mocked_today = mocked_dt.date()   # 2026-06-16
+
+        with patch("app.api.leaves.get_current_ist_datetime", return_value=mocked_dt), \
+             patch("app.api.leaves.today_ist", return_value=mocked_today):
+
+            # 1. Tomorrow first_half → SUCCEED
+            payload = {
+                "employee_id": emp.id,
+                "leave_type": "first_half",
+                "start_date": "2026-06-17",
+                "end_date": "2026-06-17",
+                "reason": "Appointment"
+            }
+            resp = client.post("/api/leaves", json=payload)
+            assert resp.status_code == 201
+
+            # 2. Today first_half → FAIL (must be 1 day in advance)
+            payload = {
+                "employee_id": emp.id,
+                "leave_type": "first_half",
+                "start_date": "2026-06-16",
+                "end_date": "2026-06-16",
+                "reason": "Appointment"
+            }
+            resp = client.post("/api/leaves", json=payload)
+            assert resp.status_code == 400
+            assert "First-half leaves must be applied at least one day in advance" in resp.json()["detail"]
+    finally:
+        if original_override is not None:
+            client.app.dependency_overrides[get_current_user] = original_override
+        else:
+            client.app.dependency_overrides.pop(get_current_user, None)
 
 
 def test_second_half_leave_timing_rules(client_and_db):
     client, db = client_and_db
     emp, admin = _seed_employee(db)
 
-    ist_tz = timezone(timedelta(hours=5, minutes=30))
-
-    # Test 1: Apply for today before 2:00 PM IST (e.g. 1:59 PM) -> Should SUCCEED
-    mocked_dt_before = datetime(2026, 6, 16, 13, 59, tzinfo=ist_tz)
-    with patch("app.api.leaves.get_current_ist_datetime", return_value=mocked_dt_before):
-        payload = {
-            "employee_id": emp.id,
-            "leave_type": "second_half",
-            "start_date": "2026-06-16",
-            "end_date": "2026-06-16",
-            "reason": "Personal work"
-        }
-        resp = client.post("/api/leaves", json=payload)
-        assert resp.status_code == 201
-
-    # Clear leaves to allow next tests on same date
-    db.query(Leave).delete()
+    employee_user = User(
+        id=99,
+        email=emp.email,
+        name=emp.name,
+        role="employee",
+        employee_id=emp.id,
+        is_active=True,
+        password_hash="x",
+    )
+    db.add(employee_user)
     db.commit()
 
-    # Test 2: Apply for today after 2:00 PM IST (e.g. 2:01 PM) -> Should FAIL
-    mocked_dt_after = datetime(2026, 6, 16, 14, 1, tzinfo=ist_tz)
-    with patch("app.api.leaves.get_current_ist_datetime", return_value=mocked_dt_after):
-        payload = {
-            "employee_id": emp.id,
-            "leave_type": "second_half",
-            "start_date": "2026-06-16",
-            "end_date": "2026-06-16",
-            "reason": "Personal work"
-        }
-        resp = client.post("/api/leaves", json=payload)
-        assert resp.status_code == 400
-        assert "Second-half leaves must be applied before 2:00 PM on the same day" in resp.json()["detail"]
+    from app.services.auth_service import get_current_user
+    original_override = client.app.dependency_overrides.get(get_current_user)
+
+    def override_as_employee():
+        return employee_user
+
+    client.app.dependency_overrides[get_current_user] = override_as_employee
+
+    try:
+        ist_tz = timezone(timedelta(hours=5, minutes=30))
+
+        # Case 1: before 14:00 → SUCCEED
+        mocked_dt_before = datetime(2026, 6, 16, 13, 59, tzinfo=ist_tz)
+        mocked_today = mocked_dt_before.date()
+
+        with patch("app.api.leaves.get_current_ist_datetime", return_value=mocked_dt_before), \
+             patch("app.api.leaves.today_ist", return_value=mocked_today):
+            payload = {
+                "employee_id": emp.id,
+                "leave_type": "second_half",
+                "start_date": "2026-06-16",
+                "end_date": "2026-06-16",
+                "reason": "Personal work"
+            }
+            resp = client.post("/api/leaves", json=payload)
+            assert resp.status_code == 201
+
+        # Clear so the second request is not blocked by overlap
+        db.query(Leave).delete()
+        db.commit()
+
+        # Case 2: after 14:00 → FAIL
+        mocked_dt_after = datetime(2026, 6, 16, 14, 1, tzinfo=ist_tz)
+
+        with patch("app.api.leaves.get_current_ist_datetime", return_value=mocked_dt_after), \
+             patch("app.api.leaves.today_ist", return_value=mocked_today):
+            payload = {
+                "employee_id": emp.id,
+                "leave_type": "second_half",
+                "start_date": "2026-06-16",
+                "end_date": "2026-06-16",
+                "reason": "Personal work"
+            }
+            resp = client.post("/api/leaves", json=payload)
+            assert resp.status_code == 400
+            assert "Second-half leaves must be applied before 2:00 PM on the same day" in resp.json()["detail"]
+    finally:
+        if original_override is not None:
+            client.app.dependency_overrides[get_current_user] = original_override
+        else:
+            client.app.dependency_overrides.pop(get_current_user, None)
 
 
 def test_leave_overlaps_logic(client_and_db):
