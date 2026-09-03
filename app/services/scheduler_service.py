@@ -3,9 +3,8 @@ import os
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.background import BackgroundScheduler  # type: ignore
-from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
-from app.db.database import SessionLocal, engine
+from app.db.database import SessionLocal
 from app.services.hiring_sync_service import run_sync
 from app.services.encord_sync_service import run_sync as run_encord_sync
 from app.services.badge_award_jobs import (
@@ -40,10 +39,7 @@ def _onboarding_day5_check() -> None:
     finally:
         db.close()
 
-jobstores = {
-    'default': SQLAlchemyJobStore(engine=engine, tablename='apscheduler_jobs')
-}
-_scheduler = BackgroundScheduler(jobstores=jobstores)
+_scheduler = BackgroundScheduler()
 
 # Encord analytics are pulled once a day, at end of day. Hour is 24h local time
 # (default 23:30). Upsert makes the pull idempotent if re-run.
@@ -344,41 +340,41 @@ def start_scheduler() -> None:
             next_run_time=datetime.now(),
         )
 
-    # Weekly badges — every Monday at 23:45
+    # Weekly badges – every Monday at ENCORD_SYNC_HOUR:MINUTE (same as Encord)
     if not _scheduler.get_job("weekly_badge_award"):
         _scheduler.add_job(
             run_weekly_badge_job,
             trigger="cron",
             day_of_week="mon",
-            hour=23,
-            minute=45,
+            hour=ENCORD_SYNC_HOUR,
+            minute=ENCORD_SYNC_MINUTE,
             id="weekly_badge_award",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
 
-    # Monthly badges — 1st of every month at 23:45
+    # Monthly badges – 1st of every month at ENCORD_SYNC_HOUR:MINUTE (same as Encord)
     if not _scheduler.get_job("monthly_badge_award"):
         _scheduler.add_job(
             run_monthly_badge_job,
             trigger="cron",
             day=1,
-            hour=23,
-            minute=45,
+            hour=ENCORD_SYNC_HOUR,
+            minute=ENCORD_SYNC_MINUTE,
             id="monthly_badge_award",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
 
-    # Tenure + Yearly milestones – every day at 02:00
+    # Tenure + Yearly milestones – every day at ENCORD_SYNC_HOUR:MINUTE (same as Encord)
     if not _scheduler.get_job("tenure_yearly_badges"):
         _scheduler.add_job(
             run_tenure_and_yearly_job,
             trigger="cron",
-            hour=2,
-            minute=0,
+            hour=ENCORD_SYNC_HOUR,
+            minute=ENCORD_SYNC_MINUTE,
             id="tenure_yearly_badges",
             replace_existing=True,
             max_instances=1,

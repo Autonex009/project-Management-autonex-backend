@@ -1,5 +1,5 @@
 from datetime import date, datetime, time, timedelta
-from typing import Optional, Any, Dict, Tuple
+from typing import Optional, Any, Dict, Tuple, List
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -117,9 +117,81 @@ def award_badge(
     return badge
 
 
+# =====================================================================
+# Week / Month helpers  (unchanged)
+# =====================================================================
+
+def get_week_range(reference: date) -> Tuple[date, date]:
+    """Return (monday, sunday) of the week containing reference."""
+    start = reference - timedelta(days=reference.weekday())
+    end = start + timedelta(days=6)
+    return start, end
+
+
+def get_previous_week_range(today: Optional[date] = None) -> Tuple[date, date]:
+    today = today or date.today()
+    this_monday, _ = get_week_range(today)
+    prev_monday = this_monday - timedelta(days=7)
+    prev_sunday = prev_monday + timedelta(days=6)
+    return prev_monday, prev_sunday
+
+
+def get_previous_month_range(today: Optional[date] = None) -> Tuple[date, date]:
+    today = today or date.today()
+    first_of_this_month = today.replace(day=1)
+    last_of_prev_month = first_of_this_month - timedelta(days=1)
+    first_of_prev_month = last_of_prev_month.replace(day=1)
+    return first_of_prev_month, last_of_prev_month
+
+
+# =====================================================================
+# NEW / UPDATED expiry logic
+# =====================================================================
+
+# Codes that are week-scoped
+WEEKLY_CODES = {
+    "hrs_50_week",
+    "weekly_top_1",
+    "weekly_top_2",
+    "weekly_top_3",
+}
+
+# Codes that are month-scoped
+MONTHLY_CODES = {
+    "hrs_200_month",
+    "monthly_top_1",
+    "monthly_top_2",
+    "monthly_top_3",
+}
+
+# Codes that never expire (tenure / yearly)
+NEVER_EXPIRE_CODES = {
+    "tenure_3_months",
+    "tenure_6_months",
+    "yearly_milestone",
+}
+
+
 def expire_due_badges(db: Session, now: Optional[datetime] = None) -> int:
-    """Expire active badges past expires_at. Returns number expired."""
+    """
+    1. Classic time-based expiry (expires_at <= now)
+    2. Force-expire any week/month badge that does NOT belong to
+       the *previous* week / *previous* month.
+
+    Tenure & yearly badges are left untouched.
+    Returns total number of badges that changed status to "expired".
+    """
     now = now or datetime.utcnow()
+    today = now.date()
+
+    prev_week_start, prev_week_end = get_previous_week_range(today)
+    prev_month_start, prev_month_end = get_previous_month_range(today)
+
+    count = 0
+
+    # ------------------------------------------------------------------
+    # A. Classic expires_at based expiry
+    # ------------------------------------------------------------------
     due = (
         db.query(EmployeeBadge)
         .filter(
@@ -129,7 +201,6 @@ def expire_due_badges(db: Session, now: Optional[datetime] = None) -> int:
         )
         .all()
     )
-    count = 0
     for badge in due:
         badge.status = "expired"
         _write_log(
@@ -140,10 +211,63 @@ def expire_due_badges(db: Session, now: Optional[datetime] = None) -> int:
             action="expired",
             period_start=badge.period_start,
             period_end=badge.period_end,
-            details={"expires_at": badge.expires_at.isoformat() if badge.expires_at else None},
+            details={
+                "reason": "expires_at_passed",
+                "expires_at": badge.expires_at.isoformat() if badge.expires_at else None,
+            },
             actor_id=None,
         )
         count += 1
+
+    # ------------------------------------------------------------------
+    # B. Force-expire week/month badges that are NOT the previous period
+    # ------------------------------------------------------------------
+    active_period_badges = (
+        db.query(EmployeeBadge)
+        .filter(
+            EmployeeBadge.status == "active",
+            EmployeeBadge.badge_code.in_(WEEKLY_CODES | MONTHLY_CODES),
+        )
+        .all()
+    )
+
+    for badge in active_period_badges:
+        code = badge.badge_code
+        p_start = badge.period_start
+        p_end = badge.period_end
+
+        should_expire = False
+        reason = None
+
+        if code in WEEKLY_CODES:
+            if p_start != prev_week_start or p_end != prev_week_end:
+                should_expire = True
+                reason = "not_previous_week"
+
+        elif code in MONTHLY_CODES:
+            if p_start != prev_month_start or p_end != prev_month_end:
+                should_expire = True
+                reason = "not_previous_month"
+
+        if should_expire:
+            badge.status = "expired"
+            _write_log(
+                db,
+                employee_badge_id=badge.id,
+                employee_id=badge.employee_id,
+                badge_code=badge.badge_code,
+                action="expired",
+                period_start=badge.period_start,
+                period_end=badge.period_end,
+                details={
+                    "reason": reason,
+                    "prev_week": f"{prev_week_start} → {prev_week_end}",
+                    "prev_month": f"{prev_month_start} → {prev_month_end}",
+                },
+                actor_id=None,
+            )
+            count += 1
+
     return count
 
 
@@ -171,33 +295,6 @@ def revoke_badge(
 
 
 # =====================================================================
-# Week / Month helpers
-# =====================================================================
-
-def get_week_range(reference: date) -> Tuple[date, date]:
-    """Return (monday, sunday) of the week containing reference."""
-    start = reference - timedelta(days=reference.weekday())
-    end = start + timedelta(days=6)
-    return start, end
-
-
-def get_previous_week_range(today: Optional[date] = None) -> Tuple[date, date]:
-    today = today or date.today()
-    this_monday, _ = get_week_range(today)
-    prev_monday = this_monday - timedelta(days=7)
-    prev_sunday = prev_monday + timedelta(days=6)
-    return prev_monday, prev_sunday
-
-
-def get_previous_month_range(today: Optional[date] = None) -> Tuple[date, date]:
-    today = today or date.today()
-    first_of_this_month = today.replace(day=1)
-    last_of_prev_month = first_of_this_month - timedelta(days=1)
-    first_of_prev_month = last_of_prev_month.replace(day=1)
-    return first_of_prev_month, last_of_prev_month
-
-
-# =====================================================================
 # Weekly badges (50 hrs + top 1/2/3)
 # =====================================================================
 
@@ -205,24 +302,23 @@ def award_weekly_badges(
     db: Session,
     week_start: date,
     week_end: date,
-    hours_by_user: Dict[str, float],
-    emp_map: Dict[str, int],
-    target_employee_id: Optional[int] = None,
+    ranked_hours: List[dict],
 ) -> int:
     """
-    Award hrs_50_week + weekly_top_1/2/3.
-    Badge stays visible during the following week.
+    Award hrs_50_week + weekly_top_1/2/3 using the *true* global ranking.
     """
+    # Expire everything that is no longer the previous week *before* awarding
+    expire_due_badges(db)
+
     next_week_end = week_end + timedelta(days=7)
     expires_at = _end_of_day(next_week_end)
     awarded = 0
 
-    # 50 hours threshold
-    for user, hours in hours_by_user.items():
-        emp_id = emp_map.get(user)
-        if not emp_id: continue
-        if target_employee_id and emp_id != target_employee_id: continue
-        if hours >= 50:
+    # 50-hour threshold
+    for entry in ranked_hours:
+        emp_id = entry.get("employee_id")
+        hours = entry.get("hours", 0)
+        if emp_id and hours >= 50:
             if award_badge(
                 db,
                 employee_id=emp_id,
@@ -230,16 +326,18 @@ def award_weekly_badges(
                 period_start=week_start,
                 period_end=week_end,
                 expires_at=expires_at,
-                meta={"hours": round(hours, 2)},
+                meta={
+                    "hours": hours,
+                    "user_email": entry.get("user_email"),
+                },
             ):
                 awarded += 1
 
-    # Top 1 / 2 / 3
-    ranked = sorted(hours_by_user.items(), key=lambda x: x[1], reverse=True)
-    for rank, (user, hours) in enumerate(ranked[:3], start=1):
-        emp_id = emp_map.get(user)
-        if not emp_id: continue
-        if target_employee_id and emp_id != target_employee_id: continue
+    # True top 1 / 2 / 3
+    for rank, entry in enumerate(ranked_hours[:3], start=1):
+        emp_id = entry.get("employee_id")
+        if not emp_id:
+            continue
         if award_badge(
             db,
             employee_id=emp_id,
@@ -247,7 +345,11 @@ def award_weekly_badges(
             period_start=week_start,
             period_end=week_end,
             expires_at=expires_at,
-            meta={"hours": round(hours, 2), "rank": rank},
+            meta={
+                "hours": entry.get("hours"),
+                "rank": rank,
+                "user_email": entry.get("user_email"),
+            },
         ):
             awarded += 1
 
@@ -262,14 +364,14 @@ def award_monthly_badges(
     db: Session,
     month_start: date,
     month_end: date,
-    hours_by_user: Dict[str, float],
-    emp_map: Dict[str, int],
-    target_employee_id: Optional[int] = None,
+    ranked_hours: List[dict],
 ) -> int:
     """
-    Award hrs_200_month + monthly_top_1/2/3.
-    Badge stays visible during the following month.
+    Award hrs_200_month + monthly_top_1/2/3 using the *true* global ranking.
     """
+    # Expire everything that is no longer the previous month *before* awarding
+    expire_due_badges(db)
+
     next_month_start = month_end + timedelta(days=1)
     if next_month_start.month == 12:
         next_month_end = date(next_month_start.year + 1, 1, 1) - timedelta(days=1)
@@ -281,12 +383,11 @@ def award_monthly_badges(
     expires_at = _end_of_day(next_month_end)
     awarded = 0
 
-    # 200 hours threshold
-    for user, hours in hours_by_user.items():
-        emp_id = emp_map.get(user)
-        if not emp_id: continue
-        if target_employee_id and emp_id != target_employee_id: continue
-        if hours >= 200:
+    # 200-hour threshold
+    for entry in ranked_hours:
+        emp_id = entry.get("employee_id")
+        hours = entry.get("hours", 0)
+        if emp_id and hours >= 200:
             if award_badge(
                 db,
                 employee_id=emp_id,
@@ -294,16 +395,18 @@ def award_monthly_badges(
                 period_start=month_start,
                 period_end=month_end,
                 expires_at=expires_at,
-                meta={"hours": round(hours, 2)},
+                meta={
+                    "hours": hours,
+                    "user_email": entry.get("user_email"),
+                },
             ):
                 awarded += 1
 
-    # Top 1 / 2 / 3
-    ranked = sorted(hours_by_user.items(), key=lambda x: x[1], reverse=True)
-    for rank, (user, hours) in enumerate(ranked[:3], start=1):
-        emp_id = emp_map.get(user)
-        if not emp_id: continue
-        if target_employee_id and emp_id != target_employee_id: continue
+    # True top 1 / 2 / 3
+    for rank, entry in enumerate(ranked_hours[:3], start=1):
+        emp_id = entry.get("employee_id")
+        if not emp_id:
+            continue
         if award_badge(
             db,
             employee_id=emp_id,
@@ -311,7 +414,11 @@ def award_monthly_badges(
             period_start=month_start,
             period_end=month_end,
             expires_at=expires_at,
-            meta={"hours": round(hours, 2), "rank": rank},
+            meta={
+                "hours": entry.get("hours"),
+                "rank": rank,
+                "user_email": entry.get("user_email"),
+            },
         ):
             awarded += 1
 
@@ -379,14 +486,13 @@ def award_tenure_badges(db: Session, today: Optional[date] = None) -> int:
 
 
 # =====================================================================
-# Yearly milestone – one badge per completed year (based on created_at)
+# Yearly milestone – one badge per completed year
 # =====================================================================
 
 def award_yearly_milestones(db: Session, today: Optional[date] = None) -> int:
     """
     Award one 'yearly_milestone' badge for every completed year
     based on employee.created_at.
-    Example: 2 years completed → 2 separate badge rows.
     """
     from app.models.employee import Employee
 
@@ -407,21 +513,22 @@ def award_yearly_milestones(db: Session, today: Optional[date] = None) -> int:
         if years <= 0:
             continue
 
-        for year_num in range(1, years + 1):
-            anniversary = join + relativedelta(years=year_num)
-
+        # Award one badge per completed year (idempotent via unique constraint)
+        for y in range(1, years + 1):
+            # We use a synthetic period so the unique constraint works
+            # period_start = join anniversary of that year, period_end = same
+            anniversary = join.replace(year=join.year + y)
             if award_badge(
                 db,
                 employee_id=emp.id,
                 badge_code="yearly_milestone",
                 period_start=anniversary,
                 period_end=anniversary,
-                expires_at=None,
+                expires_at=None,          # never expires
                 meta={
                     "based_on": "created_at",
-                    "year_number": year_num,
-                    "created_at": join.isoformat(),
-                    "anniversary": anniversary.isoformat(),
+                    "year_number": y,
+                    "join_date": join.isoformat(),
                 },
             ):
                 awarded += 1

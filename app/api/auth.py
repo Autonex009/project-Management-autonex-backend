@@ -3,6 +3,7 @@ Authentication API: signup, login, logout, forgot-password, reset-password, me.
 """
 import logging
 import os
+import re
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
@@ -156,8 +157,6 @@ def _dev_mode() -> bool:
 
 # ── Endpoints ───────────────────────────────────────────────────────
 
-import re
-
 def validate_password_strength(password: str):
     if len(password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
@@ -165,6 +164,14 @@ def validate_password_strength(password: str):
         raise HTTPException(status_code=400, detail="Password must contain at least one number.")
     if not re.search(r"[!@#$%^&*(),.?\":{}|<>]", password):
         raise HTTPException(status_code=400, detail="Password must contain at least one special character.")
+
+
+def _get_cookie_settings():
+    is_local = os.getenv("ENVIRONMENT", "development").lower() == "development" and not os.getenv("VERCEL")
+    secure_flag = not is_local
+    samesite_policy = "lax" if is_local else "none"
+    return secure_flag, samesite_policy
+
 
 @router.post("/login", response_model=LoginResponse)
 def login(body: LoginRequest, db: Session = Depends(get_db)):
@@ -309,13 +316,13 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         "user": response_user.model_dump(),
     })
 
-    is_prod = os.getenv("ENVIRONMENT", "development") != "development"
+    secure_flag, samesite_policy = _get_cookie_settings()
     response.set_cookie(
         key="access_token",
         value=token,
         httponly=True,
-        secure=is_prod,
-        samesite="lax",
+        secure=secure_flag,
+        samesite=samesite_policy,
         max_age=15 * 60,  # 15 mins
         path="/",
     )
@@ -323,8 +330,8 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         key="refresh_token",
         value=refresh_token,
         httponly=True,
-        secure=is_prod,
-        samesite="lax",
+        secure=secure_flag,
+        samesite=samesite_policy,
         max_age=7 * 24 * 60 * 60,  # 7 days
         path="/",
     )
@@ -504,9 +511,10 @@ def logout(request: Request, db: Session = Depends(get_db)):
     if refresh_token:
         verify_and_delete_refresh_token(refresh_token, db)
         
+    secure_flag, samesite_policy = _get_cookie_settings()
     response = JSONResponse(content={"message": "Logged out successfully"})
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("refresh_token", path="/")
+    response.delete_cookie("access_token", path="/", secure=secure_flag, samesite=samesite_policy, httponly=True)
+    response.delete_cookie("refresh_token", path="/", secure=secure_flag, samesite=samesite_policy, httponly=True)
     return response
 
 @router.post("/refresh")
@@ -538,13 +546,13 @@ def refresh_access_token(request: Request, db: Session = Depends(get_db)):
         "user": response_user.model_dump(),
     })
     
-    is_prod = os.getenv("ENVIRONMENT", "development") != "development"
+    secure_flag, samesite_policy = _get_cookie_settings()
     response.set_cookie(
         key="access_token",
         value=access_token,
         httponly=True,
-        secure=is_prod,
-        samesite="lax",
+        secure=secure_flag,
+        samesite=samesite_policy,
         max_age=15 * 60,  # 15 mins
         path="/",
     )
@@ -552,8 +560,8 @@ def refresh_access_token(request: Request, db: Session = Depends(get_db)):
         key="refresh_token",
         value=new_refresh_token,
         httponly=True,
-        secure=is_prod,
-        samesite="lax",
+        secure=secure_flag,
+        samesite=samesite_policy,
         max_age=7 * 24 * 60 * 60,  # 7 days
         path="/",
     )
