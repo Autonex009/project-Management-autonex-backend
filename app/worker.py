@@ -47,6 +47,46 @@ async def run_user_sync_task(ctx, log_id: str, employee_id: int, start: datetime
     logger.info("Worker picked up user Encord sync — employee=%s start=%s end=%s", employee_id, start, end)
     result = await asyncio.to_thread(_perform_user_sync, log_id, employee_id, start, end)
     logger.info("Worker completed user Encord sync: %s", result)
+
+    def _sync_user_badges():
+        db = SessionLocal()
+        try:
+            from app.services.badge_award_jobs import _get_employee_hours
+            from app.services.badge_service import award_weekly_badges, award_monthly_badges
+            from datetime import timedelta
+            
+            s_date = start.date() if isinstance(start, datetime) else start
+            e_date = end.date() if isinstance(end, datetime) else end
+            
+            # Sync weeks overlapping the selected period
+            # Find the Monday on or before s_date
+            curr_monday = s_date - timedelta(days=s_date.weekday())
+            while curr_monday <= e_date:
+                week_start = curr_monday
+                week_end = curr_monday + timedelta(days=6)
+                hours, emp_map = _get_employee_hours(db, week_start, week_end)
+                award_weekly_badges(db, week_start, week_end, hours, emp_map, target_employee_id=employee_id)
+                curr_monday += timedelta(weeks=1)
+                
+            # Sync months overlapping the selected period
+            curr_month = s_date.replace(day=1)
+            while curr_month <= e_date:
+                month_start = curr_month
+                next_month = curr_month.replace(day=28) + timedelta(days=4)
+                month_end = next_month - timedelta(days=next_month.day)
+                hours, emp_map = _get_employee_hours(db, month_start, month_end)
+                award_monthly_badges(db, month_start, month_end, hours, emp_map, target_employee_id=employee_id)
+                curr_month = next_month.replace(day=1)
+                
+            db.commit()
+            logger.info("Targeted badge sync completed for employee=%s in period %s to %s", employee_id, s_date, e_date)
+        except Exception as e:
+            db.rollback()
+            logger.error("Failed to sync badges for user %s: %s", employee_id, e)
+        finally:
+            db.close()
+            
+    await asyncio.to_thread(_sync_user_badges)
     return result
 
 # ARQ looks for this specific class name when starting up
