@@ -1,10 +1,14 @@
 """Scheduled jobs that calculate hours and award all types of badges."""
 
 import logging
+from collections import defaultdict
 from datetime import date
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from app.db.database import SessionLocal
+from app.models.employee import Employee
+from app.models.encord_analytics import EncordDailyTimeSpent
 from app.services.badge_service import (
     award_weekly_badges,
     award_monthly_badges,
@@ -15,30 +19,40 @@ from app.services.badge_service import (
     get_previous_month_range,
 )
 
+# Re-use the same normalization + Autonex filter used by the leaderboard
+from app.api.analytics import is_autonex_email, _norm_encord
+
 logger = logging.getLogger(__name__)
 
 
-def _get_employee_hours(db: Session, start: date, end: date) -> dict[int, float]:
+def _get_ranked_hours(db: Session, start: date, end: date) -> list[dict]:
     """
-    Calculate real hours using EncordDailyTimeSpent.
-    Returns {employee_id: total_hours} for the given date range.
-    """
-    from sqlalchemy import func
-    from app.models.employee import Employee
-    from app.models.encord_analytics import EncordDailyTimeSpent
+    Full ranking of Autonex accounts by platform hours for [start, end].
 
+    Returns a list sorted by hours descending:
+    [
+      {
+        "user_email": str,
+        "hours": float,
+        "employee_id": int | None,   # None when not mapped to an employee
+      },
+      ...
+    ]
+    """
+    # Build normalized lookup: normalized_encord_id / email → employee_id
     employees = db.query(Employee).all()
-    emp_map = {}
+    emp_map: dict[str, int] = {}
     for emp in employees:
         if emp.encord_id:
-            emp_map[emp.encord_id] = emp.id
+            emp_map[_norm_encord(emp.encord_id)] = emp.id
         if emp.email:
-            emp_map[emp.email] = emp.id
+            # fallback for accounts that still use the company email as encord_id
+            emp_map.setdefault(_norm_encord(emp.email), emp.id)
 
     results = (
         db.query(
             EncordDailyTimeSpent.user_email,
-            func.sum(EncordDailyTimeSpent.time_spent_seconds).label("total_seconds")
+            func.sum(EncordDailyTimeSpent.time_spent_seconds).label("total_seconds"),
         )
         .filter(
             EncordDailyTimeSpent.metric_date >= start,
@@ -48,13 +62,23 @@ def _get_employee_hours(db: Session, start: date, end: date) -> dict[int, float]
         .all()
     )
 
-    hours_by_emp = {}
+    # Aggregate (keep only Autonex accounts – same rule as leaderboard)
+    hours_by_email: dict[str, float] = defaultdict(float)
     for user_email, total_seconds in results:
-        emp_id = emp_map.get(user_email)
-        if emp_id:
-            hours_by_emp[emp_id] = hours_by_emp.get(emp_id, 0.0) + (total_seconds / 3600.0)
+        if not is_autonex_email(user_email):
+            continue
+        hours_by_email[user_email] += (total_seconds or 0) / 3600.0
 
-    return hours_by_emp
+    # Build ranked list (true global order)
+    ranked = []
+    for user_email, hours in sorted(hours_by_email.items(), key=lambda kv: kv[1], reverse=True):
+        emp_id = emp_map.get(_norm_encord(user_email))
+        ranked.append({
+            "user_email": user_email,
+            "hours": round(hours, 2),
+            "employee_id": emp_id,
+        })
+    return ranked
 
 
 def run_weekly_badge_job() -> dict:
@@ -64,9 +88,9 @@ def run_weekly_badge_job() -> dict:
         expire_due_badges(db)
 
         week_start, week_end = get_previous_week_range()
-        hours = _get_employee_hours(db, week_start, week_end)
+        ranked = _get_ranked_hours(db, week_start, week_end)
 
-        count = award_weekly_badges(db, week_start, week_end, hours)
+        count = award_weekly_badges(db, week_start, week_end, ranked)
         db.commit()
 
         logger.info("[badges] Weekly job done – awarded=%s (%s → %s)", count, week_start, week_end)
@@ -86,9 +110,9 @@ def run_monthly_badge_job() -> dict:
         expire_due_badges(db)
 
         month_start, month_end = get_previous_month_range()
-        hours = _get_employee_hours(db, month_start, month_end)
+        ranked = _get_ranked_hours(db, month_start, month_end)
 
-        count = award_monthly_badges(db, month_start, month_end, hours)
+        count = award_monthly_badges(db, month_start, month_end, ranked)
         db.commit()
 
         logger.info("[badges] Monthly job done – awarded=%s (%s → %s)", count, month_start, month_end)
