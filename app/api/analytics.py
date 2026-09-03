@@ -609,7 +609,6 @@ def summary(
 
     # Fast path for dashboard slim query to prevent N+1 bottleneck
     if fields == "project_id,autonex_platform_hours":
-        from sqlalchemy import func
         rows = db.query(
             EncordDailyTimeSpent.encord_project_hash,
             func.sum(EncordDailyTimeSpent.time_spent_seconds)

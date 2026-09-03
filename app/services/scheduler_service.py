@@ -340,41 +340,41 @@ def start_scheduler() -> None:
             next_run_time=datetime.now(),
         )
 
-    # Weekly badges – every Monday at 00:30
+    # Weekly badges – every Monday at ENCORD_SYNC_HOUR:MINUTE (same as Encord)
     if not _scheduler.get_job("weekly_badge_award"):
         _scheduler.add_job(
             run_weekly_badge_job,
             trigger="cron",
             day_of_week="mon",
-            hour=0,
-            minute=30,
+            hour=ENCORD_SYNC_HOUR,
+            minute=ENCORD_SYNC_MINUTE,
             id="weekly_badge_award",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
 
-    # Monthly badges – 1st of every month at 01:00
+    # Monthly badges – 1st of every month at ENCORD_SYNC_HOUR:MINUTE (same as Encord)
     if not _scheduler.get_job("monthly_badge_award"):
         _scheduler.add_job(
             run_monthly_badge_job,
             trigger="cron",
             day=1,
-            hour=1,
-            minute=0,
+            hour=ENCORD_SYNC_HOUR,
+            minute=ENCORD_SYNC_MINUTE,
             id="monthly_badge_award",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
         )
 
-    # Tenure + Yearly milestones – every day at 02:00
+    # Tenure + Yearly milestones – every day at ENCORD_SYNC_HOUR:MINUTE (same as Encord)
     if not _scheduler.get_job("tenure_yearly_badges"):
         _scheduler.add_job(
             run_tenure_and_yearly_job,
             trigger="cron",
-            hour=2,
-            minute=0,
+            hour=ENCORD_SYNC_HOUR,
+            minute=ENCORD_SYNC_MINUTE,
             id="tenure_yearly_badges",
             replace_existing=True,
             max_instances=1,
