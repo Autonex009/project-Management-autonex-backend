@@ -11,7 +11,8 @@ from pydantic import BaseModel, Field
 class PipelineAssignRequest(BaseModel):
     """PM/HR assigns a candidate to a project and buddy."""
     candidate_id: int
-    project_id: int
+    project_id: Optional[int] = None
+    sub_project_id: Optional[int] = None
     buddy_id: int
     escalation_days: Optional[int] = 5
 
@@ -19,7 +20,8 @@ class PipelineAssignRequest(BaseModel):
 class PipelineBulkAssignRequest(BaseModel):
     """PM/HR assigns multiple candidates to the same project and buddy."""
     candidate_ids: list[int]
-    project_id: int
+    project_id: Optional[int] = None
+    sub_project_id: Optional[int] = None
     buddy_id: int
     escalation_days: Optional[int] = 5
 
@@ -41,11 +43,15 @@ class PipelineResponse(BaseModel):
     candidate_email: Optional[str] = None
     project_id: Optional[int] = None
     project_name: Optional[str] = None
+    sub_project_id: Optional[int] = None
+    sub_project_name: Optional[str] = None
     buddy_id: Optional[int] = None
     buddy_name: Optional[str] = None
     status: str
     days_elapsed: Optional[int] = None
     started_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
+    approved_at: Optional[datetime] = None
     evaluated_at: Optional[datetime] = None
     eval_score: Optional[int] = None
     eval_notes: Optional[str] = None

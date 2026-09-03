@@ -18,7 +18,9 @@ from app.models.onboarding_pipeline import OnboardingPipeline
 from app.models.user import User
 from app.models.employee import Employee
 from app.models.parent_project import ParentProject
+from app.models.project import DailySheet as SubProject
 from app.models.allocation import Allocation
+from app.models.signup_request import SignupRequest
 from app.schemas.onboarding_pipeline import (
     PipelineAssignRequest,
     PipelineBulkAssignRequest,
@@ -44,12 +46,22 @@ def _enrich_pipeline_record(record: OnboardingPipeline, db: Session) -> Pipeline
     """Join in candidate name, project name, buddy name, and compute days_elapsed."""
     candidate = db.query(User).filter(User.id == record.candidate_id).first()
     project = db.query(ParentProject).filter(ParentProject.id == record.project_id).first() if record.project_id else None
+    
+    sub_project_name = None
+    if record.sub_project_id:
+        sp = db.query(SubProject).filter(SubProject.id == record.sub_project_id).first()
+        sub_project_name = sp.name if sp else None
+
     buddy = db.query(Employee).filter(Employee.id == record.buddy_id).first() if record.buddy_id else None
 
     days_elapsed = None
     if record.started_at:
         delta = datetime.utcnow() - record.started_at
         days_elapsed = delta.days
+
+    signup = None
+    if candidate and candidate.email:
+        signup = db.query(SignupRequest).filter(SignupRequest.email == candidate.email).first()
 
     return PipelineResponse(
         id=record.id,
@@ -58,11 +70,15 @@ def _enrich_pipeline_record(record: OnboardingPipeline, db: Session) -> Pipeline
         candidate_email=candidate.email if candidate else None,
         project_id=record.project_id,
         project_name=project.name if project else None,
+        sub_project_id=record.sub_project_id,
+        sub_project_name=sub_project_name,
         buddy_id=record.buddy_id,
         buddy_name=buddy.name if buddy else None,
         status=record.status,
         days_elapsed=days_elapsed,
         started_at=record.started_at,
+        applied_at=signup.created_at if signup else None,
+        approved_at=signup.reviewed_at if signup else None,
         evaluated_at=record.evaluated_at,
         eval_score=record.eval_score,
         eval_notes=record.eval_notes,
@@ -106,9 +122,15 @@ def assign_candidate(
         )
 
     # Validate project exists
-    project = db.query(ParentProject).filter(ParentProject.id == payload.project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found.")
+    if payload.project_id:
+        project = db.query(ParentProject).filter(ParentProject.id == payload.project_id).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found.")
+            
+    if payload.sub_project_id:
+        sub_project = db.query(SubProject).filter(SubProject.id == payload.sub_project_id).first()
+        if not sub_project:
+            raise HTTPException(status_code=404, detail="Sub-Project not found.")
 
     # Validate buddy exists
     buddy = db.query(Employee).filter(Employee.id == payload.buddy_id).first()
@@ -118,6 +140,7 @@ def assign_candidate(
     record = OnboardingPipeline(
         candidate_id=payload.candidate_id,
         project_id=payload.project_id,
+        sub_project_id=payload.sub_project_id,
         buddy_id=payload.buddy_id,
         status="pending_confirmation",
     )
@@ -138,9 +161,15 @@ def bulk_assign_candidates(
     _require_admin_or_hr(current_user)
 
     # Validate project exists
-    project = db.query(ParentProject).filter(ParentProject.id == payload.project_id).first()
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found.")
+    if payload.project_id:
+        project = db.query(ParentProject).filter(ParentProject.id == payload.project_id).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found.")
+            
+    if payload.sub_project_id:
+        sub_project = db.query(SubProject).filter(SubProject.id == payload.sub_project_id).first()
+        if not sub_project:
+            raise HTTPException(status_code=404, detail="Sub-Project not found.")
 
     # Validate buddy exists
     buddy = db.query(Employee).filter(Employee.id == payload.buddy_id).first()
@@ -174,6 +203,7 @@ def bulk_assign_candidates(
         record = OnboardingPipeline(
             candidate_id=cid,
             project_id=payload.project_id,
+            sub_project_id=payload.sub_project_id,
             buddy_id=payload.buddy_id,
             status="pending_confirmation",
         )
@@ -307,15 +337,33 @@ def evaluate_candidate(
 
     # If passed, auto-create an Allocation record
     candidate = db.query(User).filter(User.id == record.candidate_id).first()
-    project = db.query(ParentProject).filter(ParentProject.id == record.project_id).first()
-    project_name = project.name if project else "General Onboarding"
     
-    if payload.result == "passed" and record.project_id:
+    project_name = "General Onboarding"
+    if record.sub_project_id:
+        sp = db.query(SubProject).filter(SubProject.id == record.sub_project_id).first()
+        if sp:
+            project_name = sp.name
+    elif record.project_id:
+        project = db.query(ParentProject).filter(ParentProject.id == record.project_id).first()
+        if project:
+            project_name = project.name
+    
+    if payload.result == "passed" and (record.sub_project_id or record.project_id):
         # Find the candidate's employee_id
         if candidate and candidate.employee_id:
+            sub_proj_id = record.sub_project_id
+            
+            # Fallback for old records that only have project_id
+            if not sub_proj_id and record.project_id:
+                first_sub_project = db.query(SubProject).filter(
+                    SubProject.main_project_id == record.project_id
+                ).first()
+                if first_sub_project:
+                    sub_proj_id = first_sub_project.id
+
             allocation = Allocation(
                 employee_id=candidate.employee_id,
-                sub_project_id=None,  # Will be linked when specific sub-project is chosen
+                sub_project_id=sub_proj_id,
                 active_start_date=date.today(),
                 role_tags=["Annotator / Reviewer"],
                 is_active=True,
