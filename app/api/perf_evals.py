@@ -298,6 +298,7 @@ def list_evals(
     status: Optional[str] = None,
     search: Optional[str] = None,
     role_filter: Optional[str] = None,
+    pm_id: Optional[int] = None,
     type: Optional[str] = None,  # 'employee' (exclude pm self evals), 'pm' (only pm self evals), 'bonus'
     page: int = Query(1, ge=1),
     limit: int = Query(25, ge=1, le=500),
@@ -322,6 +323,15 @@ def list_evals(
     q = db.query(PerfEvaluation)
     if project_id:
         q = q.filter(PerfEvaluation.project_id == project_id)
+    elif pm_id:
+        main_projects = db.query(MainProject).all()
+        daily_sheets = db.query(DailySheet).all()
+        allocations = db.query(Allocation).filter(Allocation.employee_id == pm_id).all()
+        pm_sub_projects = _get_pm_sub_projects(daily_sheets, main_projects, pm_id, allocations)
+        pm_sub_project_ids = [sp.id for sp in pm_sub_projects]
+        if not pm_sub_project_ids:
+            return {"items": [], "total": 0, "page": page, "limit": limit}
+        q = q.filter(PerfEvaluation.project_id.in_(pm_sub_project_ids))
     if employee_id:
         q = q.filter(PerfEvaluation.employee_id == employee_id)
     if period:
