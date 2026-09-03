@@ -16,6 +16,7 @@ from app.db.database import get_db
 from app.models.user import User
 from app.models.employee import Employee
 from app.models.allocation import Allocation
+from app.models.signup_request import SignupRequest
 from app.models.project import DailySheet
 from app.models.onboarding import (
     OnboardingModule,
@@ -1055,10 +1056,17 @@ def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] 
     for a in db.query(OnboardingQuizAttempt).filter(OnboardingQuizAttempt.user_id.in_(candidate_user_ids)).all():
         attempts_by_user.setdefault(a.user_id, []).append(a)
 
+    candidate_emails = [c.email for c in candidates if c.email]
+    signup_requests = {
+        sr.email: sr 
+        for sr in db.query(SignupRequest).filter(SignupRequest.email.in_(candidate_emails)).all()
+    } if candidate_emails else {}
+
     reports = []
     for c in candidates:
         employee = employees_by_id.get(c.employee_id)
         dept = employee.designation if employee else "Annotator"
+        signup = signup_requests.get(c.email)
 
         progress_records = progress_by_user.get(c.id, [])
         completed_module_sections = {}
@@ -1121,7 +1129,9 @@ def fetch_onboarding_reports_data(db: Session, candidates: Optional[List[User]] 
             "attemptedQuestions": attempted_questions,
             "correctAnswers": correct_answers,
             "totalQuestions": total_questions,
-            "moduleStats": module_stats
+            "moduleStats": module_stats,
+            "appliedAt": signup.created_at.isoformat() if signup and signup.created_at else None,
+            "approvedAt": signup.reviewed_at.isoformat() if signup and signup.reviewed_at else None,
         })
 
     return reports

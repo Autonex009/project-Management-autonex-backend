@@ -151,14 +151,8 @@ def get_employee_active_projects(
         return []
         
     daily_sheets = db.query(DailySheet).filter(DailySheet.id.in_(sub_project_ids)).all()
-    main_project_ids = list(set([ds.main_project_id for ds in daily_sheets if ds.main_project_id]))
     
-    if not main_project_ids:
-        return []
-        
-    main_projects = db.query(MainProject).filter(MainProject.id.in_(main_project_ids)).all()
-    
-    return [{"id": mp.id, "name": mp.name} for mp in main_projects]
+    return [{"id": ds.id, "name": ds.name} for ds in daily_sheets]
 
 import secrets
 from app.services.email_service import try_send_signup_approved_email

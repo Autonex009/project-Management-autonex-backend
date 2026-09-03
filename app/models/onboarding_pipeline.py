@@ -23,10 +23,17 @@ class OnboardingPipeline(Base):
         index=True,
     )
 
-    # Which project they train on
+    # Which project they train on (legacy field)
     project_id = Column(
         Integer,
         ForeignKey("main_projects.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # Which specific sheet/sub-team they train on
+    sub_project_id = Column(
+        Integer,
+        ForeignKey("daily_sheets.id", ondelete="SET NULL"),
         nullable=True,
     )
 
