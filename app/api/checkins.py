@@ -262,6 +262,8 @@ def get_team_today(
     search: str = "",
     status: str = "",
     work_mode: str = "",
+    project_id: int = None,
+    time_filter: str = "",
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("pm", "team_lead")),
 ):
@@ -314,6 +316,26 @@ def get_team_today(
     if work_mode:
         query = query.filter(DailyCheckIn.work_mode == work_mode)
         
+    if project_id:
+        allocs_proj = db.query(Allocation.employee_id).filter(
+            Allocation.sub_project_id == project_id, 
+            Allocation.is_active == True
+        ).all()
+        proj_emp_ids = {a.employee_id for a in allocs_proj if a.employee_id}
+        chk_proj = db.query(DailyCheckIn.employee_id).filter(
+            DailyCheckIn.checkin_date == today,
+            DailyCheckIn.project_ids.contains([project_id])
+        ).all()
+        proj_emp_ids.update({c.employee_id for c in chk_proj})
+        query = query.filter(Employee.id.in_(proj_emp_ids))
+        
+    if time_filter == "late":
+        from datetime import time as dtime
+        from datetime import timezone
+        late_threshold_ist = datetime.combine(today, dtime(10, 0), tzinfo=IST)
+        late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
+        query = query.filter(DailyCheckIn.checked_in_at > late_threshold_utc)
+        
     res = _build_paginated_checkins(db, query, page, limit, kpis, scoped_project_ids)
     t4 = time.time()
     
@@ -364,6 +386,8 @@ def get_admin_checkins_paginated(
     search: str = "",
     status: str = "",
     work_mode: str = "",
+    project_id: int = None,
+    time_filter: str = "",
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "hr")),
 ):
@@ -393,4 +417,105 @@ def get_admin_checkins_paginated(
     if work_mode:
         query = query.filter(DailyCheckIn.work_mode == work_mode)
         
+    if project_id:
+        allocs_proj = db.query(Allocation.employee_id).filter(
+            Allocation.sub_project_id == project_id, 
+            Allocation.is_active == True
+        ).all()
+        proj_emp_ids = {a.employee_id for a in allocs_proj if a.employee_id}
+        chk_proj = db.query(DailyCheckIn.employee_id).filter(
+            DailyCheckIn.checkin_date == today,
+            DailyCheckIn.project_ids.contains([project_id])
+        ).all()
+        proj_emp_ids.update({c.employee_id for c in chk_proj})
+        query = query.filter(Employee.id.in_(proj_emp_ids))
+        
+    if time_filter == "late":
+        from datetime import time as dtime
+        from datetime import timezone
+        late_threshold_ist = datetime.combine(today, dtime(10, 0), tzinfo=IST)
+        late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
+        query = query.filter(DailyCheckIn.checked_in_at > late_threshold_utc)
+        
     return _build_paginated_checkins(db, query, page, limit, kpis, scoped_project_ids=None)
+
+from app.schemas.checkin import MatrixResponse, MatrixRow
+import calendar
+
+def _get_matrix_data(db: Session, month_year: str, employee_ids: set) -> MatrixResponse:
+    y_str, m_str = month_year.split("-")
+    y, m = int(y_str), int(m_str)
+    _, days_in_month = calendar.monthrange(y, m)
+    
+    current_month_year = _get_ist_today().strftime("%Y-%m")
+    
+    emp_map = {}
+    if employee_ids:
+        emps = db.query(Employee).filter(Employee.id.in_(employee_ids), Employee.status == "active").all()
+    else:
+        emps = db.query(Employee).filter(Employee.status == "active").all()
+        employee_ids = {e.id for e in emps}
+        
+    for e in emps:
+        emp_map[e.id] = MatrixRow(
+            employee_id=e.id, 
+            name=e.name, 
+            avatar_url=getattr(e, "avatar_url", None), 
+            designation=e.designation,
+            checkins={}
+        )
+        
+    if month_year == current_month_year:
+        from sqlalchemy import text
+        res = db.execute(text("""
+            SELECT employee_id, EXTRACT(DAY FROM checkin_date)::TEXT as day_str, 
+                   TO_CHAR(checked_in_at AT TIME ZONE 'Asia/Kolkata', 'HH24:MI') as time, work_mode
+            FROM daily_checkins
+            WHERE TO_CHAR(checkin_date, 'YYYY-MM') = :my
+        """), {"my": month_year}).fetchall()
+        for r in res:
+            eid, dstr, t, mode = r
+            if eid in emp_map:
+                emp_map[eid].checkins[dstr] = {"time": t, "mode": mode}
+    else:
+        from sqlalchemy import text
+        res = db.execute(text("""
+            SELECT employee_id, checkin_matrix
+            FROM historical_checkins_matrix
+            WHERE month_year = :my
+        """), {"my": month_year}).fetchall()
+        for r in res:
+            eid, matrix = r
+            if eid in emp_map and matrix:
+                emp_map[eid].checkins = matrix
+                
+    rows = list(emp_map.values())
+    rows.sort(key=lambda x: x.name)
+    return MatrixResponse(month_year=month_year, days_in_month=days_in_month, rows=rows)
+
+@router.get("/team/matrix", response_model=MatrixResponse)
+def get_team_matrix(
+    month_year: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("pm", "team_lead")),
+):
+    scoped_project_ids = _get_scoped_project_ids(db, current_user)
+    if not scoped_project_ids:
+        y, m = map(int, month_year.split("-"))
+        _, d = calendar.monthrange(y, m)
+        return MatrixResponse(month_year=month_year, days_in_month=d, rows=[])
+        
+    allocs = db.query(Allocation.employee_id).filter(
+        Allocation.sub_project_id.in_(scoped_project_ids), 
+        Allocation.is_active == True
+    ).all()
+    emp_ids = {a.employee_id for a in allocs if a.employee_id}
+    return _get_matrix_data(db, month_year, emp_ids)
+
+@router.get("/admin/matrix", response_model=MatrixResponse)
+def get_admin_matrix(
+    month_year: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "hr")),
+):
+    return _get_matrix_data(db, month_year, set())

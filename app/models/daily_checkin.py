@@ -21,11 +21,12 @@ class DailyCheckIn(Base):
     __table_args__ = (
         UniqueConstraint("employee_id", "checkin_date", name="uq_daily_checkin_employee_date"),
         Index("idx_daily_checkin_projects", "project_ids", postgresql_using="gin"),
+        {"postgresql_partition_by": "RANGE (checkin_date)"}
     )
 
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, nullable=False, index=True)
-    checkin_date = Column(Date, nullable=False, index=True)
+    checkin_date = Column(Date, primary_key=True, nullable=False, index=True)
     work_mode = Column(Text, nullable=False)  # WFO, WFH
     project_ids = Column(JSONB, default=[])
     mood = Column(Text, nullable=True)  # great, okay, low, stressed
