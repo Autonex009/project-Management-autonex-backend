@@ -10,7 +10,6 @@ from fastapi import Request as HTTPRequest
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
 from pydantic import BaseModel
-
 from app.db.database import get_db
 from app.constants.leave_types import (
     RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type,
@@ -38,12 +37,23 @@ from app.services.slack_service import (
 from app.services.auth_service import get_current_user, has_team_read, require_role
 from app.services import audit_service, project_scope
 
-
 def get_current_ist_datetime() -> datetime:
     return now_ist()
 
+def is_privileged_actor(user) -> bool:
+    """Admin / HR / PM / Team Lead may backdate and bypass slot timing rules."""
+    return getattr(user, "role", None) in ("admin", "hr", "pm", "team_lead")
 
-def validate_half_day_timing(start_date: date_type, half_day_slot: str) -> None:
+
+def validate_half_day_timing(
+    start_date: date_type,
+    half_day_slot: str,
+    *,
+    skip: bool = False,
+) -> None:
+    if skip:
+        return
+
     current_dt = get_current_ist_datetime()
     current_date = current_dt.date()
     current_time = current_dt.time()
@@ -60,12 +70,11 @@ def validate_half_day_timing(start_date: date_type, half_day_slot: str) -> None:
                 status_code=400,
                 detail="Cannot apply for a second-half leave after the request date has passed.",
             )
-        elif current_date == start_date:
-            if current_time > time_type(14, 0):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Second-half leaves must be applied before 2:00 PM on the same day.",
-                )
+        elif current_date == start_date and current_time > time_type(14, 0):
+            raise HTTPException(
+                status_code=400,
+                detail="Second-half leaves must be applied before 2:00 PM on the same day.",
+            )
     else:
         raise HTTPException(
             status_code=400,
@@ -1148,8 +1157,19 @@ def create_leave(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
+    if not is_privileged_actor(current_user):
+        if payload.start_date < today_ist():
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot apply leave for a past date.",
+            )
+
     if payload.is_half_day:
-        validate_half_day_timing(payload.start_date, payload.half_day_slot)
+        validate_half_day_timing(
+            payload.start_date,
+            payload.half_day_slot,
+            skip=is_privileged_actor(current_user),
+        )
 
     # Validate consecutive leaves safeguard
     validate_consecutive_leaves(payload.employee_id, payload.start_date, payload.end_date, db, is_half_day=payload.is_half_day)
@@ -1477,7 +1497,18 @@ def update_leave(
         and not is_fixed_holiday(payload.start_date + timedelta(days=i))
     )
     if payload.is_half_day:
-        working_day_count = 0.5 if working_day_count > 0 else 0.0
+        validate_half_day_timing(
+            payload.start_date,
+            payload.half_day_slot,
+            skip=is_privileged_actor(current_user),
+        )
+
+    if not is_privileged_actor(current_user):
+        if payload.start_date < today_ist():
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot apply leave for a past date.",
+            )
 
     if working_day_count == 0:
         raise HTTPException(
@@ -1946,7 +1977,7 @@ def delete_leave(
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
     check_leave_access(leave.employee_id, current_user, db)
-    if leave.start_date <= date_type.today() and current_user.role not in ["admin", "hr"]:
+    if leave.start_date <= date_type.today() and current_user.role not in ["admin", "hr", "pm", "team_lead"]:
         raise HTTPException(status_code=400, detail="Cannot delete a leave that has already started")
 
     # If this leave was pushed to Razorpay, reverse it there FIRST. If Razorpay rejects,
