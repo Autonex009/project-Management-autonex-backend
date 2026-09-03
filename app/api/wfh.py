@@ -24,6 +24,10 @@ from datetime import date as date_type
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/wfh", tags=["wfh"], dependencies=[Depends(get_current_user)])
 
+def is_privileged_actor(user) -> bool:
+    """Admin / HR / PM / Team Lead may backdate and bypass slot timing rules."""
+    return getattr(user, "role", None) in ("admin", "hr", "pm", "team_lead")
+
 @router.get("/today-ids")
 def get_wfh_today_ids(db: Session = Depends(get_db)):
     """Ultra-lightweight endpoint returning only employee IDs WFH today."""
@@ -386,6 +390,14 @@ def create_wfh_request(
     end_date = payload.end_date or payload.wfh_date
     if end_date < payload.wfh_date:
         raise HTTPException(status_code=400, detail="End date cannot be before start date")
+
+    if not is_privileged_actor(current_user):
+        today = today_ist()
+        if payload.wfh_date < today:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot apply WFH for a past date.",
+            )
 
     # Check for overlap with existing non-rejected WFH requests
     overlap = db.query(WFHRequest).filter(
@@ -911,7 +923,7 @@ def delete_wfh(
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
     check_wfh_access(req.employee_id, current_user, db)
-    if req.wfh_date <= date.today() and current_user.role not in ["admin", "hr"]:
+    if req.wfh_date <= date.today() and current_user.role not in ["admin", "hr", "pm", "team_lead"]:
         raise HTTPException(status_code=400, detail="Cannot delete a WFH request on or after its date")
 
     deleted_employee = db.query(Employee).filter(Employee.id == req.employee_id).first()
