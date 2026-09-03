@@ -102,3 +102,15 @@ class PaginatedTeamCheckIns(BaseModel):
 
 class ConfirmResult(BaseModel):
     confirmed: int
+
+class MatrixRow(BaseModel):
+    employee_id: int
+    name: str
+    avatar_url: Optional[str] = None
+    designation: Optional[str] = None
+    checkins: dict  # {"1": {"time": "10:00", "mode": "WFO"}, ...}
+
+class MatrixResponse(BaseModel):
+    month_year: str
+    days_in_month: int
+    rows: List[MatrixRow] = []
