@@ -24,7 +24,7 @@ class DailyCheckIn(Base):
         {"postgresql_partition_by": "RANGE (checkin_date)"}
     )
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     employee_id = Column(Integer, nullable=False, index=True)
     checkin_date = Column(Date, primary_key=True, nullable=False, index=True)
     work_mode = Column(Text, nullable=False)  # WFO, WFH
