@@ -39,7 +39,22 @@ def _onboarding_day5_check() -> None:
     finally:
         db.close()
 
-_scheduler = BackgroundScheduler()
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+from app.db.database import engine
+from zoneinfo import ZoneInfo
+
+jobstores = {
+    'default': SQLAlchemyJobStore(engine=engine)
+}
+job_defaults = {
+    'misfire_grace_time': 24 * 60 * 60  # Catch up on jobs missed by up to 24 hours
+}
+
+_scheduler = BackgroundScheduler(
+    jobstores=jobstores,
+    job_defaults=job_defaults,
+    timezone="Asia/Kolkata"
+)
 
 # Encord analytics are pulled once a day, at end of day. Hour is 24h local time
 # (default 23:30). Upsert makes the pull idempotent if re-run.
@@ -259,6 +274,54 @@ def _scheduled_checkin_reminders() -> None:
         db.close()
 
 
+def _refresh_materialized_view() -> None:
+    """Refresh the historical checkins materialized view on the 1st of the month."""
+    db = SessionLocal()
+    try:
+        from sqlalchemy import text
+        # CONCURRENTLY requires a unique index, which we added in the migration
+        db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY historical_checkins_matrix"))
+        db.commit()
+        logger.info("[scheduler] Refreshed historical_checkins_matrix materialized view")
+    except Exception as exc:
+        logger.error("[scheduler] Failed to refresh materialized view: %s", exc)
+    finally:
+        db.close()
+
+
+def _create_next_month_partition() -> None:
+    """Create the partition for the upcoming month for the daily_checkins table."""
+    db = SessionLocal()
+    try:
+        from sqlalchemy import text
+        
+        now = datetime.now()
+        # Calculate next month and year
+        next_month_val = now.month + 1 if now.month < 12 else 1
+        next_year_val = now.year if now.month < 12 else now.year + 1
+        
+        table_name = f"daily_checkins_{next_year_val}_{next_month_val:02d}"
+        start_date = f"{next_year_val}-{next_month_val:02d}-01"
+        
+        # Calculate end_date (1st of the month after next)
+        after_next_month_val = next_month_val + 1 if next_month_val < 12 else 1
+        after_next_year_val = next_year_val if next_month_val < 12 else next_year_val + 1
+        end_date = f"{after_next_year_val}-{after_next_month_val:02d}-01"
+        
+        sql = f"""
+            CREATE TABLE IF NOT EXISTS {table_name} 
+            PARTITION OF daily_checkins 
+            FOR VALUES FROM ('{start_date}') TO ('{end_date}')
+        """
+        db.execute(text(sql))
+        db.commit()
+        logger.info("[scheduler] Created next month partition: %s", table_name)
+    except Exception as exc:
+        logger.error("[scheduler] Failed to create partition: %s", exc)
+    finally:
+        db.close()
+
+
 def _scheduled_pm_confirm_reminders() -> None:
     """Nudge every PM/lead who still has unconfirmed check-ins on their roster."""
     db = SessionLocal()
@@ -421,6 +484,34 @@ def start_scheduler() -> None:
             hour=10,
             minute=0,
             id="onboarding_day5_check",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # Refresh historical checkins materialized view - 1st of every month at 00:05 AM IST
+    if not _scheduler.get_job("refresh_checkins_matrix"):
+        _scheduler.add_job(
+            _refresh_materialized_view,
+            trigger="cron",
+            day=1,
+            hour=0,
+            minute=5,
+            id="refresh_checkins_matrix",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+
+    # Create next month's partition for daily_checkins - 25th of every month
+    if not _scheduler.get_job("create_checkins_partition"):
+        _scheduler.add_job(
+            _create_next_month_partition,
+            trigger="cron",
+            day=25,
+            hour=2,
+            minute=0,
+            id="create_checkins_partition",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
