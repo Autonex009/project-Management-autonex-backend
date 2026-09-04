@@ -1,7 +1,7 @@
 """
 Pydantic schemas for the Onboarding Pipeline endpoints.
 """
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 from pydantic import BaseModel, Field
 
@@ -50,6 +50,7 @@ class PipelineResponse(BaseModel):
     status: str
     days_elapsed: Optional[int] = None
     started_at: Optional[datetime] = None
+    expected_eval_date: Optional[date] = None
     applied_at: Optional[datetime] = None
     approved_at: Optional[datetime] = None
     evaluated_at: Optional[datetime] = None
