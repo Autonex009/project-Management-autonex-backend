@@ -28,6 +28,7 @@ from app.schemas.onboarding_pipeline import (
     PipelineResponse,
 )
 from app.services.auth_service import get_current_user
+from app.utils.business_time import calculate_business_days
 from app.services.email_service import (
     try_send_evaluation_passed_email,
     try_send_evaluation_failed_email,
@@ -77,6 +78,7 @@ def _enrich_pipeline_record(record: OnboardingPipeline, db: Session) -> Pipeline
         status=record.status,
         days_elapsed=days_elapsed,
         started_at=record.started_at,
+        expected_eval_date=record.expected_eval_date,
         applied_at=signup.created_at if signup else None,
         approved_at=signup.reviewed_at if signup else None,
         evaluated_at=record.evaluated_at,
@@ -237,7 +239,9 @@ def confirm_onboarding(
         )
 
     record.status = "in_progress"
-    record.started_at = datetime.utcnow()
+    now = datetime.utcnow()
+    record.started_at = now
+    record.expected_eval_date = calculate_business_days(now.date(), 5)
     db.commit()
     db.refresh(record)
 
@@ -293,7 +297,7 @@ def my_mentees(
 
     records = db.query(OnboardingPipeline).filter(
         OnboardingPipeline.buddy_id == current_user.employee_id,
-        OnboardingPipeline.status.in_(["in_progress", "day_5_pending"])
+        OnboardingPipeline.status.in_(["pending_confirmation", "in_progress", "day_5_pending"])
     ).order_by(OnboardingPipeline.created_at.desc()).all()
 
     return [_enrich_pipeline_record(r, db) for r in records]
@@ -373,19 +377,32 @@ def evaluate_candidate(
     db.commit()
     db.refresh(record)
 
-    # Send email notification
-    if candidate and candidate.email:
-        if payload.result == "passed":
-            try_send_evaluation_passed_email(
-                to_email=candidate.email, 
-                to_name=candidate.name, 
-                project_name=project_name
-            )
-        elif payload.result == "failed":
-            try_send_evaluation_failed_email(
-                to_email=candidate.email, 
-                to_name=candidate.name, 
-                project_name=project_name
-            )
+    # Handle failure side-effects and send email notification
+    if candidate:
+        if payload.result == "failed":
+            candidate.is_active = False
+            if candidate.employee_id:
+                emp = db.query(Employee).filter(Employee.id == candidate.employee_id).first()
+                if emp:
+                    emp.status = "archived"
+                # Remove any active project allocations for this failed candidate
+                db.query(Allocation).filter(
+                    Allocation.employee_id == candidate.employee_id
+                ).delete(synchronize_session=False)
+            db.commit()
+
+        if candidate.email:
+            if payload.result == "passed":
+                try_send_evaluation_passed_email(
+                    to_email=candidate.email, 
+                    to_name=candidate.name, 
+                    project_name=project_name
+                )
+            elif payload.result == "failed":
+                try_send_evaluation_failed_email(
+                    to_email=candidate.email, 
+                    to_name=candidate.name, 
+                    project_name=project_name
+                )
 
     return _enrich_pipeline_record(record, db)

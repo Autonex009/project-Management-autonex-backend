@@ -22,10 +22,10 @@ def _onboarding_day5_check() -> None:
     from app.models.onboarding_pipeline import OnboardingPipeline
     db = SessionLocal()
     try:
-        cutoff = datetime.now() - timedelta(days=5)
+        today = datetime.now().date()
         records = db.query(OnboardingPipeline).filter(
             OnboardingPipeline.status == "in_progress",
-            OnboardingPipeline.started_at <= cutoff,
+            OnboardingPipeline.expected_eval_date <= today,
         ).all()
         for record in records:
             record.status = "day_5_pending"
