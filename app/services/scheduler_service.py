@@ -61,6 +61,7 @@ _scheduler = BackgroundScheduler(
 ENCORD_SYNC_HOUR = int(os.getenv("ENCORD_SYNC_HOUR", "23"))
 ENCORD_SYNC_MINUTE = int(os.getenv("ENCORD_SYNC_MINUTE", "30"))
 
+
 # Daily check-in reminders — mid-morning nudge to whoever hasn't checked in yet,
 # then a later nudge to PMs/leads who still have unconfirmed check-ins. Weekdays
 # only. Hours are 24h local time.
@@ -68,6 +69,20 @@ CHECKIN_REMINDER_HOUR = int(os.getenv("CHECKIN_REMINDER_HOUR", "10"))
 CHECKIN_REMINDER_MINUTE = int(os.getenv("CHECKIN_REMINDER_MINUTE", "0"))
 PM_CONFIRM_REMINDER_HOUR = int(os.getenv("PM_CONFIRM_REMINDER_HOUR", "12"))
 PM_CONFIRM_REMINDER_MINUTE = int(os.getenv("PM_CONFIRM_REMINDER_MINUTE", "0"))
+
+# Onboarding checks
+ONBOARDING_DAY5_CHECK_HOUR = int(os.getenv("ONBOARDING_DAY5_CHECK_HOUR", "10"))
+ONBOARDING_DAY5_CHECK_MINUTE = int(os.getenv("ONBOARDING_DAY5_CHECK_MINUTE", "0"))
+
+# Database maintenance jobs
+REFRESH_MATRIX_HOUR = int(os.getenv("REFRESH_MATRIX_HOUR", "0"))
+REFRESH_MATRIX_MINUTE = int(os.getenv("REFRESH_MATRIX_MINUTE", "5"))
+
+CREATE_PARTITION_HOUR = int(os.getenv("CREATE_PARTITION_HOUR", "2"))
+CREATE_PARTITION_MINUTE = int(os.getenv("CREATE_PARTITION_MINUTE", "0"))
+
+# Hiring sync interval
+HIRING_SYNC_INTERVAL_HOURS = int(os.getenv("HIRING_SYNC_INTERVAL_HOURS", "12"))
 
 
 def _scheduled_hiring_sync() -> None:
@@ -255,6 +270,7 @@ def _scheduled_checkin_reminders() -> None:
             ).all()
         }
 
+        import time
         employees = db.query(Employee).filter(Employee.status == "active").all()
         sent = 0
         for employee in employees:
@@ -267,6 +283,7 @@ def _scheduled_checkin_reminders() -> None:
                 employee_slack_user_id=slack_id, employee_name=employee.name
             ):
                 sent += 1
+                time.sleep(1.5)  # Avoid Slack API rate limit (conversations.open is 50/min)
         logger.info("[scheduler] Check-in reminders sent to %s employee(s)", sent)
     except Exception as exc:
         logger.error("[scheduler] Check-in reminder job failed: %s", exc)
@@ -343,6 +360,7 @@ def _scheduled_pm_confirm_reminders() -> None:
             .all()
         )
 
+        import time
         sent = 0
         for pm_user in pm_users:
             roster = _scoped_roster(db, pm_user)
@@ -370,6 +388,7 @@ def _scheduled_pm_confirm_reminders() -> None:
                 pm_slack_user_id=slack_id, pm_name=pm_employee.name, pending_count=pending
             ):
                 sent += 1
+                time.sleep(1.5)  # Avoid Slack API rate limit
         logger.info("[scheduler] PM confirm reminders sent to %s manager(s)", sent)
     except Exception as exc:
         logger.error("[scheduler] PM confirm reminder job failed: %s", exc)
@@ -380,142 +399,133 @@ def _scheduled_pm_confirm_reminders() -> None:
 def start_scheduler() -> None:
     # Encord analytics pull once a day at end of day (ENCORD_SYNC_HOUR:MINUTE).
     # max_instances=1 + coalesce so a slow run never overlaps the next.
-    if not _scheduler.get_job("encord_sync"):
-        _scheduler.add_job(
-            _scheduled_encord_sync,
-            trigger="cron",
-            hour=ENCORD_SYNC_HOUR,
-            minute=ENCORD_SYNC_MINUTE,
-            id="encord_sync",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
+    _scheduler.add_job(
+        _scheduled_encord_sync,
+        trigger="cron",
+        hour=ENCORD_SYNC_HOUR,
+        minute=ENCORD_SYNC_MINUTE,
+        id="encord_sync",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     # Legacy hiring-portal sync is opt-in (it used to be disabled entirely).
-    if os.getenv("ENABLE_HIRING_SYNC") and not _scheduler.get_job("hiring_sync"):
+    if os.getenv("ENABLE_HIRING_SYNC"):
         _scheduler.add_job(
             _scheduled_hiring_sync,
             trigger="interval",
-            hours=12,
+            hours=HIRING_SYNC_INTERVAL_HOURS,
             id="hiring_sync",
             replace_existing=True,
             next_run_time=datetime.now(),
         )
 
     # Weekly badges – every Monday at ENCORD_SYNC_HOUR:MINUTE (same as Encord)
-    if not _scheduler.get_job("weekly_badge_award"):
-        _scheduler.add_job(
-            run_weekly_badge_job,
-            trigger="cron",
-            day_of_week="mon",
-            hour=ENCORD_SYNC_HOUR,
-            minute=ENCORD_SYNC_MINUTE,
-            id="weekly_badge_award",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
+    _scheduler.add_job(
+        run_weekly_badge_job,
+        trigger="cron",
+        day_of_week="mon",
+        hour=ENCORD_SYNC_HOUR,
+        minute=ENCORD_SYNC_MINUTE,
+        id="weekly_badge_award",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     # Monthly badges – 1st of every month at ENCORD_SYNC_HOUR:MINUTE (same as Encord)
-    if not _scheduler.get_job("monthly_badge_award"):
-        _scheduler.add_job(
-            run_monthly_badge_job,
-            trigger="cron",
-            day=1,
-            hour=ENCORD_SYNC_HOUR,
-            minute=ENCORD_SYNC_MINUTE,
-            id="monthly_badge_award",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
+    _scheduler.add_job(
+        run_monthly_badge_job,
+        trigger="cron",
+        day=1,
+        hour=ENCORD_SYNC_HOUR,
+        minute=ENCORD_SYNC_MINUTE,
+        id="monthly_badge_award",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     # Tenure + Yearly milestones – every day at ENCORD_SYNC_HOUR:MINUTE (same as Encord)
-    if not _scheduler.get_job("tenure_yearly_badges"):
-        _scheduler.add_job(
-            run_tenure_and_yearly_job,
-            trigger="cron",
-            hour=ENCORD_SYNC_HOUR,
-            minute=ENCORD_SYNC_MINUTE,
-            id="tenure_yearly_badges",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
+    _scheduler.add_job(
+        run_tenure_and_yearly_job,
+        trigger="cron",
+        hour=ENCORD_SYNC_HOUR,
+        minute=ENCORD_SYNC_MINUTE,
+        id="tenure_yearly_badges",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     # Employee check-in reminder – weekdays at CHECKIN_REMINDER_HOUR:MINUTE.
-    if not _scheduler.get_job("checkin_reminder"):
-        _scheduler.add_job(
-            _scheduled_checkin_reminders,
-            trigger="cron",
-            day_of_week="mon-fri",
-            hour=CHECKIN_REMINDER_HOUR,
-            minute=CHECKIN_REMINDER_MINUTE,
-            id="checkin_reminder",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
+    _scheduler.add_job(
+        _scheduled_checkin_reminders,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=CHECKIN_REMINDER_HOUR,
+        minute=CHECKIN_REMINDER_MINUTE,
+        id="checkin_reminder",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     # PM/lead confirm-roster reminder – weekdays at PM_CONFIRM_REMINDER_HOUR:MINUTE,
     # after the employee reminder has had time to land.
-    if not _scheduler.get_job("pm_confirm_reminder"):
-        _scheduler.add_job(
-            _scheduled_pm_confirm_reminders,
-            trigger="cron",
-            day_of_week="mon-fri",
-            hour=PM_CONFIRM_REMINDER_HOUR,
-            minute=PM_CONFIRM_REMINDER_MINUTE,
-            id="pm_confirm_reminder",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
+    _scheduler.add_job(
+        _scheduled_pm_confirm_reminders,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=PM_CONFIRM_REMINDER_HOUR,
+        minute=PM_CONFIRM_REMINDER_MINUTE,
+        id="pm_confirm_reminder",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     if not _scheduler.running:
         _scheduler.start()
 
     # Onboarding pipeline Day-5 escalation — every day at 10:00 AM
-    if not _scheduler.get_job("onboarding_day5_check"):
-        _scheduler.add_job(
-            _onboarding_day5_check,
-            trigger="cron",
-            hour=10,
-            minute=0,
-            id="onboarding_day5_check",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
+    _scheduler.add_job(
+        _onboarding_day5_check,
+        trigger="cron",
+        hour=ONBOARDING_DAY5_CHECK_HOUR,
+        minute=ONBOARDING_DAY5_CHECK_MINUTE,
+        id="onboarding_day5_check",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     # Refresh historical checkins materialized view - 1st of every month at 00:05 AM IST
-    if not _scheduler.get_job("refresh_checkins_matrix"):
-        _scheduler.add_job(
-            _refresh_materialized_view,
-            trigger="cron",
-            day=1,
-            hour=0,
-            minute=5,
-            id="refresh_checkins_matrix",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
+    _scheduler.add_job(
+        _refresh_materialized_view,
+        trigger="cron",
+        day=1,
+        hour=REFRESH_MATRIX_HOUR,
+        minute=REFRESH_MATRIX_MINUTE,
+        id="refresh_checkins_matrix",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     # Create next month's partition for daily_checkins - 25th of every month
-    if not _scheduler.get_job("create_checkins_partition"):
-        _scheduler.add_job(
-            _create_next_month_partition,
-            trigger="cron",
-            day=25,
-            hour=2,
-            minute=0,
-            id="create_checkins_partition",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-        )
+    _scheduler.add_job(
+        _create_next_month_partition,
+        trigger="cron",
+        day=25,
+        hour=CREATE_PARTITION_HOUR,
+        minute=CREATE_PARTITION_MINUTE,
+        id="create_checkins_partition",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
 
     logger.info(
         "[scheduler] Started — Encord sync every %s min; hiring sync %s",
