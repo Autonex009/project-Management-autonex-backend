@@ -515,6 +515,7 @@ def create_wfh_request(
                 reason=req.reason,
                 impacted_projects=target.get("impacted_projects", []),
                 wfh_id=req.id,
+                exceeds_limit=req.flagged or False,
             )
 
     # Admins: as a fallback when nobody else resolved, and additionally for a team lead's
@@ -923,6 +924,10 @@ def delete_wfh(
     if not req:
         raise HTTPException(status_code=404, detail="WFH request not found")
     check_wfh_access(req.employee_id, current_user, db)
+    
+    if req.status and req.status != "pending":
+        raise HTTPException(status_code=400, detail="Cannot delete a WFH request that has already been approved or rejected.")
+        
     if req.wfh_date <= date.today() and current_user.role not in ["admin", "hr", "pm", "team_lead"]:
         raise HTTPException(status_code=400, detail="Cannot delete a WFH request on or after its date")
 

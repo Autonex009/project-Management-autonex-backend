@@ -213,104 +213,117 @@ def send_pm_leave_request_message(
     reason: str | None,
     impacted_projects: list[str] | None = None,
     leave_id: int,
+    exceeds_limit: bool = False,
 ) -> bool:
     channel_id = open_direct_message_channel(pm_slack_user_id)
     project_lines = impacted_projects or ["No active project mapping found"]
     projects_text = "\n".join(f"• {line}" for line in project_lines)
     normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "No reason provided"
 
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*New leave request received*\n{employee_name} has submitted a leave request in Autonex.",
+            },
+        },
+        {
+            "type": "section",
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*PM*\n{pm_name}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Employee*\n{employee_name}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Email*\n{employee_email}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Designation*\n{employee_designation or 'N/A'}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Leave Type*\n{leave_type}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Duration*\n{duration_days} day(s)",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Start Date*\n{start_date}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*End Date*\n{end_date}",
+                },
+            ],
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Reason*\n{normalized_reason}",
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Impacted Projects*\n{projects_text}",
+            },
+        }
+    ]
+
+    if exceeds_limit:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "⚠️ *Limit Exceeded:* This user has exceeded their allowed leave limit. Approval requires a mandatory remark. Please visit the Autonex PM Portal to review and approve this request."
+            }
+        })
+    else:
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Approve",
+                        "emoji": True
+                    },
+                    "style": "primary",
+                    "value": json.dumps({"action": "approve", "type": "leave", "id": leave_id}),
+                    "action_id": "approve_leave"
+                },
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Reject",
+                        "emoji": True
+                    },
+                    "style": "danger",
+                    "value": json.dumps({"action": "reject", "type": "leave", "id": leave_id}),
+                    "action_id": "reject_leave"
+                }
+            ]
+        })
+
     response = _slack_request(
         "/chat.postMessage",
         {
             "channel": channel_id,
             "text": f"New leave request from {employee_name} ({start_date} to {end_date})",
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*New leave request received*\n{employee_name} has submitted a leave request in Autonex.",
-                    },
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*PM*\n{pm_name}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Employee*\n{employee_name}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Email*\n{employee_email}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Designation*\n{employee_designation or 'N/A'}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Leave Type*\n{leave_type}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Duration*\n{duration_days} day(s)",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Start Date*\n{start_date}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*End Date*\n{end_date}",
-                        },
-                    ],
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Reason*\n{normalized_reason}",
-                    },
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Impacted Projects*\n{projects_text}",
-                    },
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Approve",
-                                "emoji": True
-                            },
-                            "style": "primary",
-                            "value": json.dumps({"action": "approve", "type": "leave", "id": leave_id}),
-                            "action_id": "approve_leave"
-                        },
-                        {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Reject",
-                                "emoji": True
-                            },
-                            "style": "danger",
-                            "value": json.dumps({"action": "reject", "type": "leave", "id": leave_id}),
-                            "action_id": "reject_leave"
-                        }
-                    ]
-                }
-            ],
+            "blocks": blocks,
         },
     )
 
@@ -341,100 +354,113 @@ def send_pm_wfh_request_message(
     reason: str | None,
     impacted_projects: list[str] | None = None,
     wfh_id: int,
+    exceeds_limit: bool = False,
 ) -> bool:
     channel_id = open_direct_message_channel(pm_slack_user_id)
     project_lines = impacted_projects or ["No active project mapping found"]
     projects_text = "\n".join(f"• {line}" for line in project_lines)
     normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "No reason provided"
 
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*New WFH request received*\n{employee_name} has submitted a WFH request in Autonex.",
+            },
+        },
+        {
+            "type": "section",
+            "fields": [
+                {
+                    "type": "mrkdwn",
+                    "text": f"*PM*\n{pm_name}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Employee*\n{employee_name}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Email*\n{employee_email}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Designation*\n{employee_designation or 'N/A'}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Duration*\n{duration_days} day(s)",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*Start Date*\n{start_date}",
+                },
+                {
+                    "type": "mrkdwn",
+                    "text": f"*End Date*\n{end_date}",
+                },
+            ],
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Reason*\n{normalized_reason}",
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Impacted Projects*\n{projects_text}",
+            },
+        }
+    ]
+
+    if exceeds_limit:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "⚠️ *Limit Exceeded:* This user has exceeded their allowed WFH limit. Approval requires a mandatory remark. Please visit the Autonex PM Portal to review and approve this request."
+            }
+        })
+    else:
+        blocks.append({
+            "type": "actions",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Approve",
+                        "emoji": True
+                    },
+                    "style": "primary",
+                    "value": json.dumps({"action": "approve", "type": "wfh", "id": wfh_id}),
+                    "action_id": "approve_wfh"
+                },
+                {
+                    "type": "button",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "Reject",
+                        "emoji": True
+                    },
+                    "style": "danger",
+                    "value": json.dumps({"action": "reject", "type": "wfh", "id": wfh_id}),
+                    "action_id": "reject_wfh"
+                }
+            ]
+        })
+
     response = _slack_request(
         "/chat.postMessage",
         {
             "channel": channel_id,
             "text": f"New WFH request from {employee_name} ({start_date} to {end_date})",
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*New WFH request received*\n{employee_name} has submitted a WFH request in Autonex.",
-                    },
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*PM*\n{pm_name}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Employee*\n{employee_name}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Email*\n{employee_email}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Designation*\n{employee_designation or 'N/A'}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Duration*\n{duration_days} day(s)",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Start Date*\n{start_date}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*End Date*\n{end_date}",
-                        },
-                    ],
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Reason*\n{normalized_reason}",
-                    },
-                },
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*Impacted Projects*\n{projects_text}",
-                    },
-                },
-                {
-                    "type": "actions",
-                    "elements": [
-                        {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Approve",
-                                "emoji": True
-                            },
-                            "style": "primary",
-                            "value": json.dumps({"action": "approve", "type": "wfh", "id": wfh_id}),
-                            "action_id": "approve_wfh"
-                        },
-                        {
-                            "type": "button",
-                            "text": {
-                                "type": "plain_text",
-                                "text": "Reject",
-                                "emoji": True
-                            },
-                            "style": "danger",
-                            "value": json.dumps({"action": "reject", "type": "wfh", "id": wfh_id}),
-                            "action_id": "reject_wfh"
-                        }
-                    ]
-                }
-            ],
+            "blocks": blocks,
         },
     )
 
