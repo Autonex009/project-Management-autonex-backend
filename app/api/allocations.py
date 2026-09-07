@@ -104,6 +104,7 @@ def get_allocations_page(
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=100),
     search: Optional[str] = Query(None, max_length=200),
+    project_view: Optional[str] = Query("active", description="active | archived"),
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm", "team_lead")),
 ):
@@ -117,10 +118,23 @@ def get_allocations_page(
     """
     today = date_cls.today()
 
-    # 1) Same visibility rules as GET /api/sub-projects.
     all_projects = db.query(Project).order_by(Project.id.asc()).all()
     if current_user.role in ("pm", "hr", "team_lead") and not project_scope.has_full_access(current_user):
         all_projects = [p for p in all_projects if project_scope.can_act_on_project(db, current_user, p)]
+
+    # Active vs Archived (same rules as Projects page)
+    ARCHIVED_STATUSES = {"completed", "on-hold", "cancelled"}
+    view = (project_view or "active").strip().lower()
+    if view == "archived":
+        all_projects = [
+            p for p in all_projects
+            if (p.project_status or "active").lower().strip() in ARCHIVED_STATUSES
+        ]
+    else:
+        all_projects = [
+            p for p in all_projects
+            if (p.project_status or "active").lower().strip() not in ARCHIVED_STATUSES
+        ]
 
     if not all_projects:
         return AllocationsPageResponse(items=[], page=page, page_size=page_size, total_items=0, total_pages=0)
