@@ -2,6 +2,8 @@
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from typing import Optional, List
+from pydantic import BaseModel
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy.orm import Session
@@ -343,9 +345,12 @@ def get_team_today(
     return res
 
 
+class ConfirmRequest(BaseModel):
+    employee_ids: Optional[List[int]] = None
+
 @router.post("/team/confirm", response_model=ConfirmResult)
 def confirm_team_today(
-
+    req: ConfirmRequest = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("pm", "team_lead")),
 ):
@@ -358,10 +363,15 @@ def confirm_team_today(
     allocs = db.query(Allocation).filter(Allocation.sub_project_id.in_(scoped_project_ids), Allocation.is_active == True).all()
     roster_emp_ids = {a.employee_id for a in allocs if a.employee_id}
     
-    all_today_checkins = db.query(DailyCheckIn).filter(
+    query = db.query(DailyCheckIn).filter(
         DailyCheckIn.checkin_date == today,
         DailyCheckIn.pm_confirmed_at.is_(None)
-    ).all()
+    )
+    
+    if req and req.employee_ids is not None:
+        query = query.filter(DailyCheckIn.employee_id.in_(req.employee_ids))
+        
+    all_today_checkins = query.all()
     
     to_confirm = []
     now = _get_ist_now()

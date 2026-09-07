@@ -49,7 +49,7 @@ def sync_project_allocations(db, project_id: int):
     from app.services import project_scope
     from app.api.projects import _autonex_headcount
 
-    project = db.query(Project).filter(Project.id == project_id)
+    project = db.query(Project).filter(Project.id == project_id).first()
     if not project: return
 
     allocs = db.query(Allocation).filter(
@@ -1016,7 +1016,7 @@ def delete_allocation(
         entity_type="allocation",
         entity_id=allocation.id,
         entity_name=removed_name,
-        subject_employee_id=allocation.employee_id,
+        subject_employee_id=allocation.employee_id if removed_employee else None,
         subject_name=removed_name,
         details=audit_service.changes(
             audit_service.field_diff("Project", project.name if project else f"#{sub_project_id}", None),

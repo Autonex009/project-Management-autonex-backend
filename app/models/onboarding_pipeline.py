@@ -4,7 +4,7 @@ SQLAlchemy model for the Onboarding Pipeline tracker.
 Tracks candidates through:
   pending_confirmation → in_progress → day_5_pending → passed / failed
 """
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, TIMESTAMP, Index
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, TIMESTAMP, Index, Date
 from sqlalchemy.sql import func
 
 from app.db.database import Base
@@ -54,6 +54,9 @@ class OnboardingPipeline(Base):
 
     # Set when the candidate clicks "Accept & Start Onboarding"
     started_at = Column(TIMESTAMP, nullable=True)
+
+    # Pre-calculated 5th business day (skipping weekends and fixed holidays)
+    expected_eval_date = Column(Date, nullable=True)
 
     # Set when the buddy/PM submits the Day-5 evaluation
     evaluated_at = Column(TIMESTAMP, nullable=True)
