@@ -1978,10 +1978,9 @@ def delete_leave(
     if not leave:
         raise HTTPException(status_code=404, detail="Leave not found")
     check_leave_access(leave.employee_id, current_user, db)
-    
     if leave.status and leave.status != "pending":
-        raise HTTPException(status_code=400, detail="Cannot delete a leave that has already been approved or rejected.")
-        
+        if current_user.role not in ["admin", "hr", "pm", "team_lead"]:
+            raise HTTPException(status_code=400, detail="Cannot delete a leave that has already been approved or rejected.")
     if leave.start_date <= date_type.today() and current_user.role not in ["admin", "hr", "pm", "team_lead"]:
         raise HTTPException(status_code=400, detail="Cannot delete a leave that has already started")
 

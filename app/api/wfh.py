@@ -926,8 +926,8 @@ def delete_wfh(
     check_wfh_access(req.employee_id, current_user, db)
     
     if req.status and req.status != "pending":
-        raise HTTPException(status_code=400, detail="Cannot delete a WFH request that has already been approved or rejected.")
-        
+        if current_user.role not in ["admin", "hr", "pm", "team_lead"]:
+            raise HTTPException(status_code=400, detail="Cannot delete a WFH request that has already been approved or rejected.")
     if req.wfh_date <= date.today() and current_user.role not in ["admin", "hr", "pm", "team_lead"]:
         raise HTTPException(status_code=400, detail="Cannot delete a WFH request on or after its date")
 
