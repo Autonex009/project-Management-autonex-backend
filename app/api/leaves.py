@@ -33,6 +33,8 @@ from app.services.slack_service import (
     try_send_leave_applied_message,
     try_send_pm_leave_request_message,
     try_send_leave_status_message,
+    get_leave_balances_text,
+    try_overwrite_deleted_message,
 )
 from app.services.auth_service import get_current_user, has_team_read, require_role
 from app.services import audit_service, project_scope
@@ -1134,10 +1136,10 @@ def validate_consecutive_leaves(
         if not is_weekend(cur) and not is_fixed_holiday(cur):
             if cur in leave_working_days:
                 consecutive_run += 1
-                if consecutive_run >= 5:
+                if consecutive_run > 5:
                     raise HTTPException(
                         status_code=400,
-                        detail="Safe guard triggered: You cannot apply for 5 or more consecutive leaves."
+                        detail="Safe guard triggered: You cannot apply for more than 5 consecutive leaves."
                     )
             else:
                 consecutive_run = 0
@@ -1227,25 +1229,44 @@ def create_leave(
 
     # Monthly paid leave limit: max 2 paid leaves per calendar month
     flagged = False
+    exceeds_by = 0.0
     if payload.leave_type == "paid":
+        def calc_days(s, e, half=False):
+            if not s or not e: return 0
+            if half: return 0.5
+            d = 0
+            c = s
+            while c <= e:
+                if c.weekday() < 5:
+                    d += 1
+                c += timedelta(days=1)
+            return d
+
         month_start = payload.start_date.replace(day=1)
         end_mo = payload.start_date.month + 1 if payload.start_date.month < 12 else 1
         end_yr = payload.start_date.year if payload.start_date.month < 12 else payload.start_date.year + 1
         month_end = date_type(end_yr, end_mo, 1)
-        paid_this_month = (
+        leaves_this_month = (
             db.query(Leave)
             .filter(
                 Leave.employee_id == payload.employee_id,
                 Leave.leave_type == "paid",
-                Leave.status != "rejected",
+                Leave.status == "approved",
                 Leave.start_date >= month_start,
                 Leave.start_date < month_end,
             )
-            .count()
+            .all()
         )
+        used_days = sum(calc_days(l.start_date, l.end_date, l.is_half_day) for l in leaves_this_month)
+        req_days = calc_days(payload.start_date, payload.end_date, payload.is_half_day)
+        
         limit = 1 if is_intern_or_contractor(employee.employee_type) else 2
-        if paid_this_month >= limit:
+        if used_days + req_days > limit:
             flagged = True
+            # if they already exceeded before this request, we only count this request's days OR the total excess
+            # Wait, if they had 0 limit left, this request exceeds by req_days.
+            # If they had 1 left, and requested 5, they exceed by 4.
+            exceeds_by = (used_days + req_days) - limit
 
     leave = Leave(
         employee_id=payload.employee_id,
@@ -1262,6 +1283,7 @@ def create_leave(
     db.add(leave)
     db.commit()
     db.refresh(leave)
+    leave._exceeds_by = exceeds_by
 
     # Recorded after the refresh because leave.id only exists once the insert lands.
     # Actor and subject genuinely differ here: an admin can file a leave on someone
@@ -1346,8 +1368,10 @@ def create_leave(
     else:
         notification_targets = pm_targets
     notified_user_ids: set[int] = set()
+    ts_list = []
+    ch_list = []
     for target in notification_targets:
-        try_send_pm_leave_request_message(
+        ts, ch = try_send_pm_leave_request_message(
             pm_slack_user_id=target["pm_slack_user_id"],
             pm_name=target["pm_employee"].name,
             employee_name=employee.name,
@@ -1361,7 +1385,13 @@ def create_leave(
             impacted_projects=target["impacted_projects"],
             leave_id=leave.id,
             exceeds_limit=leave.flagged or False,
+            leave_balances_text=get_leave_balances_text(db, employee),
+            exceeds_limit_text=f"by {leave._exceeds_by} days (Approval requires a mandatory remark)." if getattr(leave, '_exceeds_by', 0) > 0 else None,
         )
+        if ts and ch:
+            ts_list.append(ts)
+            ch_list.append(ch)
+            
         # In-app notification for PM (real PM only — admin fallback handled below)
         pm_emp_id = getattr(target["pm_employee"], "id", None)
         if pm_emp_id:
@@ -1374,6 +1404,11 @@ def create_leave(
                     f"{employee.name} has requested {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date}.",
                     "leave_applied",
                 )
+
+    if ts_list:
+        leave.slack_pm_message_ts = ",".join(ts_list)
+        leave.slack_pm_channel_id = ",".join(ch_list)
+        db.commit()
 
     # Admin fallback: notify each admin exactly once (regardless of Slack-reachable count)
     if not pm_targets:
@@ -1717,13 +1752,15 @@ def approve_leave(
         msg = "Leave approved (Razorpay sync pending — use 'Apply to Razorpay' to retry)"
 
     result = {
-        "message": msg,
+            "message": msg,
         "leave_id": leave_id,
         "status": "approved",
         "razorpay_applied": leave.razorpay_applied or False,
     }
     if sync_warning:
         result["sync_warning"] = sync_warning
+        
+    trigger_leave_revalidation(employee.id)
     return result
 
 
@@ -2021,6 +2058,12 @@ def delete_leave(
         request=http_request,
     )
 
+    if leave.slack_pm_message_ts and leave.slack_pm_channel_id:
+        tss = leave.slack_pm_message_ts.split(",")
+        chs = leave.slack_pm_channel_id.split(",")
+        for ts, ch in zip(tss, chs):
+            try_overwrite_deleted_message(ch, ts)
+
     db.delete(leave)
     db.commit()
     return {"message": "Leave deleted successfully"}
@@ -2028,3 +2071,114 @@ def delete_leave(
 
 
 
+
+def _revalidate_pending_leaves_background(employee_id: int, db: Session):
+    try:
+        from app.services.slack_service import try_update_pm_leave_request_message
+        
+        employee = db.query(Employee).filter(Employee.id == employee_id).first()
+        if not employee: return
+        
+        limit = 1 if is_intern_or_contractor(employee.employee_type) else 2
+        
+        # Get all pending paid leaves
+        pending_leaves = db.query(Leave).filter(
+            Leave.employee_id == employee_id,
+            Leave.leave_type == "paid",
+            Leave.status == "pending"
+        ).order_by(Leave.start_date.asc(), Leave.id.asc()).all()
+        
+        if not pending_leaves:
+            return
+            
+        def calc_days(sd, ed, hd):
+            return 0.5 if hd else (ed - sd).days + 1
+
+        for p_leave in pending_leaves:
+            month_start = p_leave.start_date.replace(day=1)
+            next_month = month_start.replace(day=28) + timedelta(days=4)
+            month_end = next_month.replace(day=1)
+            
+            approved_leaves = db.query(Leave).filter(
+                Leave.employee_id == employee_id,
+                Leave.leave_type == "paid",
+                Leave.status == "approved",
+                Leave.start_date >= month_start,
+                Leave.start_date < month_end,
+            ).all()
+            
+            used_days = sum(calc_days(l.start_date, l.end_date, l.is_half_day) for l in approved_leaves)
+            req_days = calc_days(p_leave.start_date, p_leave.end_date, p_leave.is_half_day)
+            
+            flagged = False
+            exceeds_by = 0
+            if used_days + req_days > limit:
+                flagged = True
+                exceeds_by = (used_days + req_days) - limit
+            
+            # Did it change from False to True?
+            if flagged and not p_leave.flagged:
+                p_leave.flagged = True
+                db.commit()
+                
+                # Update Slack Messages
+                if p_leave.slack_pm_message_ts and p_leave.slack_pm_channel_id:
+                    tss = p_leave.slack_pm_message_ts.split(",")
+                    chs = p_leave.slack_pm_channel_id.split(",")
+                    
+                    escalates_to_admin = project_scope.escalates_to_admin(db, employee.id)
+                    pm_targets = ([] if escalates_to_admin else _get_pm_notification_targets(db, employee, p_leave))
+                    # Fallback to admins if no PMs
+                    if escalates_to_admin or not pm_targets:
+                        targets = _get_admin_notification_targets(db)
+                    else:
+                        targets = pm_targets
+                        
+                    target_map = {t.get("pm_slack_user_id"): t for t in targets}
+                    
+                    # We might have sent to multiple PMs and stored multiple TSs
+                    for ts, ch in zip(tss, chs):
+                        # We need to guess which target this channel belongs to.
+                        # Fortunately, the PM's channel ID is often tied to their Slack ID, 
+                        # but we can just use the first target's details for the name as an approximation
+                        # or better, just pass "PM" if we don't know.
+                        t = targets[0] if targets else {}
+                        try_update_pm_leave_request_message(
+                            ts=ts,
+                            channel_id=ch,
+                            pm_name=getattr(t.get("pm_employee"), "name", "PM"),
+                            employee_name=employee.name,
+                            employee_email=employee.email,
+                            employee_designation=employee.designation,
+                            leave_type=get_leave_type_label(p_leave.leave_type),
+                            start_date=p_leave.start_date.isoformat(),
+                            end_date=p_leave.end_date.isoformat(),
+                            duration_days=req_days,
+                            reason=p_leave.reason,
+                            impacted_projects=t.get("impacted_projects", []),
+                            leave_id=p_leave.id,
+                            exceeds_limit=True,
+                            leave_balances_text=get_leave_balances_text(db, employee),
+                            exceeds_limit_text=f"by {exceeds_by} days (Approval requires a mandatory remark)."
+                        )
+                        
+    except Exception as e:
+        import traceback
+        print(f"Error in background pending leave revalidation: {e}")
+        traceback.print_exc()
+
+def trigger_leave_revalidation(employee_id: int):
+    # This acts as a fire-and-forget background task without tying up the request
+    # If fastapi BackgroundTasks is available, we use it, otherwise thread.
+    import threading
+    from app.database import SessionLocal
+    def worker():
+        db = SessionLocal()
+        try:
+            _revalidate_pending_leaves_background(employee_id, db)
+        finally:
+            db.close()
+    
+    t = threading.Thread(target=worker)
+    t.daemon = True
+    t.start()
