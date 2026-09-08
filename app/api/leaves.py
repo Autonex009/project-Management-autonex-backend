@@ -2171,7 +2171,7 @@ def trigger_leave_revalidation(employee_id: int):
     # This acts as a fire-and-forget background task without tying up the request
     # If fastapi BackgroundTasks is available, we use it, otherwise thread.
     import threading
-    from app.database import SessionLocal
+    from app.db.database import SessionLocal
     def worker():
         db = SessionLocal()
         try:
