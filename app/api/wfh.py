@@ -15,7 +15,7 @@ from app.models.user import User
 from app.models.notification import Notification
 from types import SimpleNamespace
 from app.api.leaves import _get_pm_notification_targets, _get_admin_notification_targets
-from app.services.slack_service import try_send_pm_wfh_request_message, try_send_wfh_status_message
+from app.services.slack_service import try_send_pm_wfh_request_message, try_send_wfh_status_message, get_wfh_balances_text, try_overwrite_deleted_message
 from app.constants.leave_types import is_intern_or_contractor
 
 from sqlalchemy import or_
@@ -105,13 +105,13 @@ def _validate_wfh_limit(db: Session, employee: Employee, start_date: date, end_d
         return
 
     # Query existing active WFH requests for this employee (excluding the one being updated, if any)
-    query = db.query(WFHRequest).filter(
+    existing_wfh = db.query(WFHRequest).filter(
         WFHRequest.employee_id == employee.id,
-        WFHRequest.status != "rejected"
+        WFHRequest.status == "approved"
     )
     if exclude_wfh_id is not None:
-        query = query.filter(WFHRequest.id != exclude_wfh_id)
-    existing_requests = query.all()
+        existing_wfh = existing_wfh.filter(WFHRequest.id != exclude_wfh_id)
+    existing_requests = existing_wfh.all()
 
     existing_dates = set()
     for r in existing_requests:
@@ -123,6 +123,9 @@ def _validate_wfh_limit(db: Session, employee: Employee, start_date: date, end_d
             curr_d += timedelta(days=1)
 
     # Check limits based on employee type
+    flagged = False
+    exceeds_msg = None
+
     if is_intern_or_contractor(employee.employee_type):
         # Limit: 2 WFH per calendar month
         month_counts = {}
@@ -130,26 +133,51 @@ def _validate_wfh_limit(db: Session, employee: Employee, start_date: date, end_d
             key = (d.year, d.month)
             month_counts[key] = month_counts.get(key, 0) + 1
         
+        exceeds_by = 0
         for d in proposed_dates:
             key = (d.year, d.month)
             new_count = month_counts.get(key, 0) + 1
             if new_count > 2:
-                return True
+                flagged = True
+                exceeds_by += 1
             month_counts[key] = new_count
+        if exceeds_by > 0:
+            exceeds_msg = f"by {exceeds_by} days (monthly limit)"
     else:
-        # Limit: 1 WFH per week (Mon-Sun)
+        # Limit: 4 WFH per calendar month, 1 WFH per week
+        month_counts = {}
         week_counts = {}
         for d in existing_dates:
-            monday = d - timedelta(days=d.weekday())
-            week_counts[monday] = week_counts.get(monday, 0) + 1
+            m_key = (d.year, d.month)
+            month_counts[m_key] = month_counts.get(m_key, 0) + 1
+            w_key = d - timedelta(days=d.weekday())
+            week_counts[w_key] = week_counts.get(w_key, 0) + 1
             
+        exceeds_monthly = 0
+        exceeds_weekly = 0
         for d in proposed_dates:
-            monday = d - timedelta(days=d.weekday())
-            new_count = week_counts.get(monday, 0) + 1
-            if new_count > 1:
-                return True
-            week_counts[monday] = new_count
-    return False
+            m_key = (d.year, d.month)
+            new_m = month_counts.get(m_key, 0) + 1
+            if new_m > 4:
+                flagged = True
+                exceeds_monthly += 1
+            month_counts[m_key] = new_m
+
+            w_key = d - timedelta(days=d.weekday())
+            new_w = week_counts.get(w_key, 0) + 1
+            if new_w > 1:
+                flagged = True
+                exceeds_weekly += 1
+            week_counts[w_key] = new_w
+            
+        if exceeds_monthly and exceeds_weekly:
+            exceeds_msg = f"by {exceeds_monthly} days (monthly limit) and {exceeds_weekly} days (weekly limit)"
+        elif exceeds_monthly:
+            exceeds_msg = f"by {exceeds_monthly} days (monthly limit)"
+        elif exceeds_weekly:
+            exceeds_msg = f"by {exceeds_weekly} days (weekly limit)"
+    
+    return (flagged, exceeds_msg)
 
 
 def _approver_names(db: Session, requests) -> dict:
@@ -414,7 +442,7 @@ def create_wfh_request(
         )
 
     # Validate WFH limit
-    is_flagged = _validate_wfh_limit(db, employee, payload.wfh_date, end_date)
+    is_flagged, exceeds_msg = _validate_wfh_limit(db, employee, payload.wfh_date, end_date)
 
     req = WFHRequest(
         employee_id=payload.employee_id,
@@ -427,6 +455,7 @@ def create_wfh_request(
     db.add(req)
     db.commit()
     db.refresh(req)
+    req._exceeds_msg = exceeds_msg
 
     wfh_period = (
         f"{req.wfh_date} → {req.end_date}"
@@ -485,6 +514,8 @@ def create_wfh_request(
 
     notified_user_ids: set[int] = set()
     duration_days = (end_date - req.wfh_date).days + 1
+    ts_list = []
+    ch_list = []
 
     for target in pm_targets:
         # In-app notification for PM
@@ -503,7 +534,7 @@ def create_wfh_request(
         # Slack DM for PM
         pm_slack_id = target.get("pm_slack_user_id")
         if pm_slack_id:
-            try_send_pm_wfh_request_message(
+            ts, ch = try_send_pm_wfh_request_message(
                 pm_slack_user_id=pm_slack_id,
                 pm_name=getattr(target["pm_employee"], "name", "PM"),
                 employee_name=employee.name,
@@ -516,7 +547,17 @@ def create_wfh_request(
                 impacted_projects=target.get("impacted_projects", []),
                 wfh_id=req.id,
                 exceeds_limit=req.flagged or False,
+                wfh_balances_text=get_wfh_balances_text(db, employee),
+                exceeds_limit_text=f"{req._exceeds_msg} (Approval requires a mandatory remark)." if getattr(req, '_exceeds_msg', None) else None,
             )
+            if ts and ch:
+                ts_list.append(ts)
+                ch_list.append(ch)
+
+    if ts_list:
+        req.slack_pm_message_ts = ",".join(ts_list)
+        req.slack_pm_channel_id = ",".join(ch_list)
+        db.commit()
 
     # Admins: as a fallback when nobody else resolved, and additionally for a team lead's
     # own request, which is theirs to countersign alongside the program manager.
@@ -628,6 +669,7 @@ def approve_wfh(
         approved=True,
     )
 
+    trigger_wfh_revalidation(employee.id if employee else req.employee_id)
     return {"message": "WFH request approved", "wfh_id": wfh_id, "status": "approved"}
 
 
@@ -870,7 +912,7 @@ def update_wfh_request(
         raise HTTPException(status_code=404, detail="Employee not found")
 
     # Validate WFH limit
-    is_flagged = _validate_wfh_limit(db, employee, payload.wfh_date, end_date, exclude_wfh_id=wfh_id)
+    is_flagged, exceeds_msg = _validate_wfh_limit(db, employee, payload.wfh_date, end_date, exclude_wfh_id=wfh_id)
 
     before = audit_service.snapshot(req, ["wfh_date", "end_date", "reason", "status", "flagged"])
 
@@ -879,6 +921,7 @@ def update_wfh_request(
     req.reason = payload.reason
     req.status = "pending"  # reset so manager re-reviews
     req.flagged = is_flagged
+    req._exceeds_msg = exceeds_msg
 
     audit_service.record(
         db,
@@ -955,8 +998,138 @@ def delete_wfh(
         request=http_request,
     )
 
+    if req.slack_pm_message_ts and req.slack_pm_channel_id:
+        tss = req.slack_pm_message_ts.split(",")
+        chs = req.slack_pm_channel_id.split(",")
+        for ts, ch in zip(tss, chs):
+            try_overwrite_deleted_message(ch, ts)
+
     db.delete(req)
     db.commit()
     return {"message": "WFH request deleted"}
 
 
+
+def _revalidate_pending_wfh_background(employee_id: int, db: Session):
+    try:
+        from app.services.slack_service import try_update_pm_wfh_request_message
+        from datetime import timedelta
+        
+        employee = db.query(Employee).filter(Employee.id == employee_id).first()
+        if not employee: return
+        
+        # Determine limits
+        monthly_limit = 2 if is_intern_or_contractor(employee.employee_type) else 4
+        weekly_limit = None if is_intern_or_contractor(employee.employee_type) else 1
+        
+        # Get all pending WFH
+        pending_wfh = db.query(WFHRequest).filter(
+            WFHRequest.employee_id == employee_id,
+            WFHRequest.status == "pending"
+        ).order_by(WFHRequest.wfh_date.asc(), WFHRequest.id.asc()).all()
+        
+        if not pending_wfh:
+            return
+
+        def _get_start_of_week(dt):
+            return dt - timedelta(days=dt.weekday())
+
+        def calc_days(start_date, end_date):
+            return (end_date - start_date).days + 1
+
+        for p_req in pending_wfh:
+            month_start = p_req.wfh_date.replace(day=1)
+            next_month = month_start.replace(day=28) + timedelta(days=4)
+            month_end = next_month.replace(day=1)
+            
+            end_date = p_req.end_date or p_req.wfh_date
+            req_days = calc_days(p_req.wfh_date, end_date)
+            
+            approved_month = db.query(WFHRequest).filter(
+                WFHRequest.employee_id == employee_id,
+                WFHRequest.status == "approved",
+                WFHRequest.wfh_date >= month_start,
+                WFHRequest.wfh_date < month_end,
+            ).all()
+            used_this_month = sum(calc_days(r.wfh_date, r.end_date or r.wfh_date) for r in approved_month)
+            
+            flagged = False
+            exceeds_msg_parts = []
+            
+            if used_this_month + req_days > monthly_limit:
+                flagged = True
+                exceeded = (used_this_month + req_days) - monthly_limit
+                exceeds_msg_parts.append(f"{exceeded} days (monthly limit)")
+                
+            if weekly_limit is not None:
+                week_start = _get_start_of_week(p_req.wfh_date)
+                week_end = week_start + timedelta(days=7)
+                approved_week = db.query(WFHRequest).filter(
+                    WFHRequest.employee_id == employee_id,
+                    WFHRequest.status == "approved",
+                    WFHRequest.wfh_date >= week_start,
+                    WFHRequest.wfh_date < week_end,
+                ).all()
+                used_this_week = sum(calc_days(r.wfh_date, r.end_date or r.wfh_date) for r in approved_week)
+                
+                if used_this_week + req_days > weekly_limit:
+                    flagged = True
+                    exceeded = (used_this_week + req_days) - weekly_limit
+                    exceeds_msg_parts.append(f"{exceeded} days (weekly limit)")
+                    
+            if flagged and not p_req.flagged:
+                p_req.flagged = True
+                db.commit()
+                
+                if p_req.slack_pm_message_ts and p_req.slack_pm_channel_id:
+                    tss = p_req.slack_pm_message_ts.split(",")
+                    chs = p_req.slack_pm_channel_id.split(",")
+                    
+                    escalates_to_admin = project_scope.escalates_to_admin(db, employee.id)
+                    dummy_leave = SimpleNamespace(start_date=p_req.wfh_date, end_date=end_date)
+                    pm_targets = ([] if escalates_to_admin else _get_pm_notification_targets(db, employee, dummy_leave))
+                    if escalates_to_admin or not pm_targets:
+                        targets = _get_admin_notification_targets(db)
+                    else:
+                        targets = pm_targets
+                        
+                    t = targets[0] if targets else {}
+                    
+                    exceeds_msg = "by " + " and ".join(exceeds_msg_parts)
+                    
+                    for ts, ch in zip(tss, chs):
+                        try_update_pm_wfh_request_message(
+                            ts=ts,
+                            channel_id=ch,
+                            pm_name=getattr(t.get("pm_employee"), "name", "PM"),
+                            employee_name=employee.name,
+                            employee_email=employee.email,
+                            employee_designation=employee.designation,
+                            start_date=p_req.wfh_date.isoformat(),
+                            end_date=end_date.isoformat(),
+                            duration_days=req_days,
+                            reason=p_req.reason,
+                            impacted_projects=t.get("impacted_projects", []),
+                            wfh_id=p_req.id,
+                            exceeds_limit=True,
+                            wfh_balances_text=get_wfh_balances_text(db, employee),
+                            exceeds_limit_text=f"{exceeds_msg} (Approval requires a mandatory remark)."
+                        )
+    except Exception as e:
+        import traceback
+        print(f"Error in background pending WFH revalidation: {e}")
+        traceback.print_exc()
+
+def trigger_wfh_revalidation(employee_id: int):
+    import threading
+    from app.database import SessionLocal
+    def worker():
+        db = SessionLocal()
+        try:
+            _revalidate_pending_wfh_background(employee_id, db)
+        finally:
+            db.close()
+    
+    t = threading.Thread(target=worker)
+    t.daemon = True
+    t.start()
