@@ -13,6 +13,12 @@ import logging
 import os
 import urllib.error
 import urllib.request
+import base64
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import smtplib  
 
 logger = logging.getLogger(__name__)
 
@@ -599,4 +605,91 @@ def try_send_referral_status_update_email(**kwargs) -> bool:
         return True
     except Exception as exc:
         logger.warning("[email] Referral status update email failed: %s", exc)
+        return False
+
+def _send_with_attachment(
+    *,
+    to_email: str,
+    to_name: str,
+    subject: str,
+    html_body: str,
+    attachment_bytes: bytes,
+    attachment_filename: str,
+) -> None:
+    """Send HTML email + one PDF attachment via Brevo."""
+    api_key   = os.getenv("BREVO_API_KEY", "")
+    from_addr = os.getenv("MAIL_FROM", "")
+    from_name = os.getenv("MAIL_FROM_NAME", "Autonex AI")
+
+    if not api_key:
+        raise RuntimeError("BREVO_API_KEY is not configured")
+    if not from_addr:
+        raise RuntimeError("MAIL_FROM is not configured")
+
+    # Brevo accepts base64-encoded attachment
+    encoded = base64.b64encode(attachment_bytes).decode("utf-8")
+
+    payload = {
+        "sender": {"name": from_name, "email": from_addr},
+        "to": [{"email": to_email, "name": to_name}],
+        "subject": subject,
+        "htmlContent": html_body,
+        "attachment": [
+            {
+                "content": encoded,
+                "name": attachment_filename,
+            }
+        ],
+        "trackClicks": False,
+    }
+
+    data = json.dumps(payload).encode("utf-8")
+
+    req = urllib.request.Request(
+        BREVO_API_URL,
+        data=data,
+        headers={
+            "api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8")
+            logger.info("[email] Brevo accepted message+attachment to %s: %s", to_email, body)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        logger.error("[email] Brevo API error %s: %s", exc.code, detail)
+        raise RuntimeError(f"Brevo API error {exc.code}: {detail}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"Could not reach Brevo API: {exc}") from exc
+
+
+def send_lunch_report_email(
+    *,
+    to_email: str,
+    to_name: str,
+    subject: str,
+    html_body: str,
+    pdf_bytes: bytes,
+    pdf_filename: str,
+) -> None:
+    _send_with_attachment(
+        to_email=to_email,
+        to_name=to_name,
+        subject=subject,
+        html_body=html_body,
+        attachment_bytes=pdf_bytes,
+        attachment_filename=pdf_filename,
+    )
+
+
+def try_send_lunch_report_email(**kwargs) -> bool:
+    try:
+        send_lunch_report_email(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning("[email] Lunch report email failed: %s", exc)
         return False
