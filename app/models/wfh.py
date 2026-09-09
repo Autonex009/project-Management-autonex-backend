@@ -16,5 +16,8 @@ class WFHRequest(Base):
     remark = Column(Text, nullable=True)
     flagged = Column(Boolean, default=False, nullable=False)
 
+    slack_pm_message_ts = Column(String, nullable=True)
+    slack_pm_channel_id = Column(String, nullable=True)
+
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())

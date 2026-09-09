@@ -376,7 +376,7 @@ def test_consecutive_leaves_blocking_basic(client_and_db):
     db.query(Leave).delete()
     db.commit()
 
-    # 5 consecutive working days (Monday 2026-06-15 to Friday 2026-06-19) -> Should FAIL
+    # 5 consecutive working days (Monday 2026-06-15 to Friday 2026-06-19) -> Should SUCCEED
     payload_5 = {
         "employee_id": emp.id,
         "leave_type": "paid",
@@ -385,6 +385,21 @@ def test_consecutive_leaves_blocking_basic(client_and_db):
         "reason": "5 consecutive days"
     }
     resp = client.post("/api/leaves", json=payload_5)
+    assert resp.status_code == 201
+
+    # Clear database
+    db.query(Leave).delete()
+    db.commit()
+
+    # 6 consecutive working days (Monday 2026-06-15 to Monday 2026-06-22) -> Should FAIL
+    payload_6 = {
+        "employee_id": emp.id,
+        "leave_type": "paid",
+        "start_date": "2026-06-15",
+        "end_date": "2026-06-22",
+        "reason": "6 consecutive days"
+    }
+    resp = client.post("/api/leaves", json=payload_6)
     assert resp.status_code == 400
     assert "Safe guard triggered" in resp.json()["detail"]
 
@@ -420,7 +435,7 @@ def test_consecutive_leaves_across_weekend_split(client_and_db):
                  status="approved"))
     db.commit()
 
-    # Now apply for Monday (2026-06-22) to Thursday (2026-06-25) -> Should FAIL (5 total days: Fri + Mon-Thu)
+    # Now apply for Monday (2026-06-22) to Thursday (2026-06-25) -> Should SUCCEED (5 total days: Fri + Mon-Thu)
     payload_5 = {
         "employee_id": emp.id,
         "leave_type": "paid",
@@ -429,6 +444,27 @@ def test_consecutive_leaves_across_weekend_split(client_and_db):
         "reason": "5 days total bridging weekend"
     }
     resp = client.post("/api/leaves", json=payload_5)
+    assert resp.status_code == 201
+
+    # Clear database to test block
+    db.query(Leave).delete()
+    db.commit()
+
+    # Re-apply Friday
+    db.add(Leave(employee_id=emp.id, leave_type="paid",
+                 start_date=date(2026, 6, 19), end_date=date(2026, 6, 19),
+                 status="approved"))
+    db.commit()
+
+    # Now apply for Monday (2026-06-22) to Monday (2026-06-29) -> Should FAIL (6 total days: Fri + Mon-Thu + Mon)
+    payload_6 = {
+        "employee_id": emp.id,
+        "leave_type": "paid",
+        "start_date": "2026-06-22",
+        "end_date": "2026-06-29",
+        "reason": "6 days total bridging weekend and holiday"
+    }
+    resp = client.post("/api/leaves", json=payload_6)
     assert resp.status_code == 400
     assert "Safe guard triggered" in resp.json()["detail"]
 
@@ -523,7 +559,7 @@ def test_consecutive_leaves_fixed_holiday_ignored(client_and_db):
 
     # Now apply for Monday (2026-06-29) to Tuesday (2026-06-30) -> 2 days.
     # Tue-Thu (3 days) + Friday (Holiday, skipped) + Sat/Sun (Weekend, skipped) + Mon-Tue (2 days) = 5 days
-    # This should FAIL
+    # This should SUCCEED
     payload_5 = {
         "employee_id": emp.id,
         "leave_type": "paid",
@@ -532,6 +568,29 @@ def test_consecutive_leaves_fixed_holiday_ignored(client_and_db):
         "reason": "Split bridging weekend and holiday (5 days total)"
     }
     resp = client.post("/api/leaves", json=payload_5)
+    assert resp.status_code == 201
+
+    # Clear leaves for next check
+    db.query(Leave).delete()
+    db.commit()
+
+    # Re-apply Tuesday to Thursday (3 days)
+    db.add(Leave(employee_id=emp.id, leave_type="paid",
+                 start_date=date(2026, 6, 23), end_date=date(2026, 6, 25),
+                 status="approved"))
+    db.commit()
+
+    # Now apply for Monday (2026-06-29) to Wednesday (2026-07-01) -> 3 days.
+    # Tue-Thu (3 days) + Friday (Holiday, skipped) + Sat/Sun (Weekend, skipped) + Mon-Wed (3 days) = 6 days
+    # This should FAIL
+    payload_6 = {
+        "employee_id": emp.id,
+        "leave_type": "paid",
+        "start_date": "2026-06-29",
+        "end_date": "2026-07-01",
+        "reason": "Split bridging weekend and holiday (6 days total)"
+    }
+    resp = client.post("/api/leaves", json=payload_6)
     assert resp.status_code == 400
     assert "Safe guard triggered" in resp.json()["detail"]
 

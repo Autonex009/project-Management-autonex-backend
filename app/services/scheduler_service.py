@@ -69,6 +69,11 @@ CHECKIN_REMINDER_HOUR = int(os.getenv("CHECKIN_REMINDER_HOUR", "10"))
 CHECKIN_REMINDER_MINUTE = int(os.getenv("CHECKIN_REMINDER_MINUTE", "0"))
 PM_CONFIRM_REMINDER_HOUR = int(os.getenv("PM_CONFIRM_REMINDER_HOUR", "12"))
 PM_CONFIRM_REMINDER_MINUTE = int(os.getenv("PM_CONFIRM_REMINDER_MINUTE", "0"))
+LATE_WARNING_HOUR = int(os.getenv("LATE_WARNING_HOUR", "10"))
+LATE_WARNING_MINUTE = int(os.getenv("LATE_WARNING_MINUTE", "45"))
+ADMIN_REPORT_HOUR = int(os.getenv("ADMIN_REPORT_HOUR", "11"))
+ADMIN_REPORT_MINUTE = int(os.getenv("ADMIN_REPORT_MINUTE", "10"))
+LATE_CHECKIN_CHANNEL_ID = os.getenv("LATE_CHECKIN_CHANNEL_ID", "C0BV91K4PD5")
 
 # Onboarding checks
 ONBOARDING_DAY5_CHECK_HOUR = int(os.getenv("ONBOARDING_DAY5_CHECK_HOUR", "10"))
@@ -246,7 +251,8 @@ def _scheduled_checkin_reminders() -> None:
     """Nudge every active employee who hasn't checked in yet today."""
     db = SessionLocal()
     try:
-        from datetime import date
+        from app.utils.business_time import today_ist
+        from app.constants.leave_types import is_fixed_holiday, is_weekend
         from app.models.employee import Employee
         from app.models.leave import Leave
         from app.models.daily_checkin import DailyCheckIn
@@ -254,36 +260,49 @@ def _scheduled_checkin_reminders() -> None:
             try_get_or_cache_employee_slack_user_id,
             try_send_checkin_reminder_message,
         )
-
-        today = date.today()
-
-        checked_in_ids = {
-            row[0] for row in db.query(DailyCheckIn.employee_id).filter(
-                DailyCheckIn.checkin_date == today
-            ).all()
-        }
-        on_leave_ids = {
-            row[0] for row in db.query(Leave.employee_id).filter(
-                Leave.status == "approved",
-                Leave.start_date <= today,
-                Leave.end_date >= today,
-            ).all()
-        }
-
+        from sqlalchemy import not_
         import time
-        employees = db.query(Employee).filter(Employee.status == "active").all()
+
+        today = today_ist()
+
+        if is_weekend(today) or is_fixed_holiday(today):
+            logger.info("[scheduler] Skipping check-in reminders because today is a weekend or holiday.")
+            return
+
+        checked_in_query = db.query(DailyCheckIn.employee_id).filter(
+            DailyCheckIn.checkin_date == today
+        )
+        on_leave_query = db.query(Leave.employee_id).filter(
+            Leave.status == "approved",
+            Leave.start_date <= today,
+            Leave.end_date >= today,
+        )
+
+        employees = db.query(Employee).filter(
+            Employee.status == "active",
+            not_(Employee.id.in_(checked_in_query)),
+            not_(Employee.id.in_(on_leave_query))
+        ).all()
+
         sent = 0
         for employee in employees:
-            if employee.id in checked_in_ids or employee.id in on_leave_ids:
-                continue
             slack_id = try_get_or_cache_employee_slack_user_id(db, employee)
             if not slack_id:
                 continue
-            if try_send_checkin_reminder_message(
-                employee_slack_user_id=slack_id, employee_name=employee.name
-            ):
-                sent += 1
-                time.sleep(1.5)  # Avoid Slack API rate limit (conversations.open is 50/min)
+            
+            try:
+                if try_send_checkin_reminder_message(
+                    employee_slack_user_id=slack_id, employee_name=employee.name
+                ):
+                    sent += 1
+                    time.sleep(1.5)  # Base sleep to avoid rate limits
+            except Exception as exc:
+                if "429" in str(exc) or "rate" in str(exc).lower():
+                    logger.warning("[scheduler] Rate limit hit sending reminder to %s, sleeping...", employee.email)
+                    time.sleep(10)
+                else:
+                    logger.error("[scheduler] Failed sending checkin reminder to %s: %s", employee.email, exc)
+
         logger.info("[scheduler] Check-in reminders sent to %s employee(s)", sent)
     except Exception as exc:
         logger.error("[scheduler] Check-in reminder job failed: %s", exc)
@@ -343,55 +362,231 @@ def _scheduled_pm_confirm_reminders() -> None:
     """Nudge every PM/lead who still has unconfirmed check-ins on their roster."""
     db = SessionLocal()
     try:
-        from datetime import date
+        from app.utils.business_time import today_ist
+        from app.constants.leave_types import is_fixed_holiday, is_weekend
         from app.models.user import User
         from app.models.employee import Employee
         from app.models.daily_checkin import DailyCheckIn
-        from app.api.checkins import _scoped_roster
+        from app.models.allocation import Allocation
+        from app.api.checkins import _get_scoped_project_ids
         from app.services.slack_service import (
             try_get_or_cache_employee_slack_user_id,
             try_send_pm_confirm_reminder_message,
         )
+        import time
 
-        today = date.today()
+        today = today_ist()
+
+        if is_weekend(today) or is_fixed_holiday(today):
+            logger.info("[scheduler] Skipping PM confirm reminders because today is a weekend or holiday.")
+            return
+
         pm_users = (
             db.query(User)
             .filter(User.role.in_(["pm", "team_lead"]), User.employee_id.isnot(None))
             .all()
         )
 
-        import time
+        # Pre-fetch all check-ins for today to avoid querying inside the loop
+        all_today_checkins = db.query(
+            DailyCheckIn.employee_id, 
+            DailyCheckIn.project_ids, 
+            DailyCheckIn.pm_confirmed_at
+        ).filter(
+            DailyCheckIn.checkin_date == today
+        ).all()
+        
+        # Pre-fetch all active allocations
+        all_active_allocations = db.query(
+            Allocation.employee_id, 
+            Allocation.sub_project_id
+        ).filter(
+            Allocation.is_active == True
+        ).all()
+
         sent = 0
         for pm_user in pm_users:
-            roster = _scoped_roster(db, pm_user)
-            if not roster:
+            scoped_project_ids = _get_scoped_project_ids(db, pm_user)
+            if not scoped_project_ids:
                 continue
-            employee_ids = list(roster.keys())
-            pending = (
-                db.query(DailyCheckIn)
-                .filter(
-                    DailyCheckIn.employee_id.in_(employee_ids),
-                    DailyCheckIn.checkin_date == today,
-                    DailyCheckIn.pm_confirmed_at.is_(None),
-                )
-                .count()
+                
+            allocated_emp_ids = {
+                a.employee_id for a in all_active_allocations 
+                if a.employee_id and a.sub_project_id in scoped_project_ids
+            }
+            
+            checked_in_emp_ids = set()
+            for c in all_today_checkins:
+                if set(c.project_ids or []).intersection(scoped_project_ids):
+                    checked_in_emp_ids.add(c.employee_id)
+                    
+            visible_emp_ids = allocated_emp_ids.union(checked_in_emp_ids)
+            if not visible_emp_ids:
+                continue
+                
+            pending = sum(
+                1 for c in all_today_checkins 
+                if c.employee_id in visible_emp_ids and c.pm_confirmed_at is None
             )
+            
             if pending == 0:
                 continue
+
             pm_employee = db.query(Employee).filter(Employee.id == pm_user.employee_id).first()
             if not pm_employee:
                 continue
             slack_id = try_get_or_cache_employee_slack_user_id(db, pm_employee)
             if not slack_id:
                 continue
-            if try_send_pm_confirm_reminder_message(
-                pm_slack_user_id=slack_id, pm_name=pm_employee.name, pending_count=pending
-            ):
-                sent += 1
-                time.sleep(1.5)  # Avoid Slack API rate limit
+            
+            try:
+                if try_send_pm_confirm_reminder_message(
+                    pm_slack_user_id=slack_id, pm_name=pm_employee.name, pending_count=pending
+                ):
+                    sent += 1
+                    time.sleep(1.5)  # Avoid Slack API rate limit
+            except Exception as exc:
+                if "429" in str(exc) or "rate" in str(exc).lower():
+                    logger.warning("[scheduler] Rate limit hit sending PM reminder, sleeping...")
+                    time.sleep(10)
+                else:
+                    logger.error("[scheduler] Failed sending PM reminder: %s", exc)
+                    
         logger.info("[scheduler] PM confirm reminders sent to %s manager(s)", sent)
     except Exception as exc:
         logger.error("[scheduler] PM confirm reminder job failed: %s", exc)
+    finally:
+        db.close()
+
+
+def _scheduled_late_warning() -> None:
+    """Nudge active employees who still haven't checked in by the late warning time."""
+    db = SessionLocal()
+    try:
+        from app.utils.business_time import today_ist
+        from app.constants.leave_types import is_fixed_holiday, is_weekend
+        from app.models.employee import Employee
+        from app.models.leave import Leave
+        from app.models.daily_checkin import DailyCheckIn
+        from app.services.slack_service import (
+            try_get_or_cache_employee_slack_user_id,
+            try_send_late_warning_message,
+        )
+        from sqlalchemy import not_
+        import time
+
+        today = today_ist()
+
+        if is_weekend(today) or is_fixed_holiday(today):
+            logger.info("[scheduler] Skipping late warning because today is a weekend or holiday.")
+            return
+
+        checked_in_query = db.query(DailyCheckIn.employee_id).filter(
+            DailyCheckIn.checkin_date == today
+        )
+        on_leave_query = db.query(Leave.employee_id).filter(
+            Leave.status == "approved",
+            Leave.start_date <= today,
+            Leave.end_date >= today,
+        )
+
+        employees = db.query(Employee).filter(
+            Employee.status == "active",
+            not_(Employee.id.in_(checked_in_query)),
+            not_(Employee.id.in_(on_leave_query))
+        ).all()
+
+        sent = 0
+        for employee in employees:
+            slack_id = try_get_or_cache_employee_slack_user_id(db, employee)
+            if not slack_id:
+                continue
+            
+            try:
+                if try_send_late_warning_message(
+                    employee_slack_user_id=slack_id, employee_name=employee.name
+                ):
+                    sent += 1
+                    time.sleep(1.5)
+            except Exception as exc:
+                if "429" in str(exc) or "rate" in str(exc).lower():
+                    time.sleep(10)
+                else:
+                    logger.error("[scheduler] Failed sending late warning to %s: %s", employee.email, exc)
+
+        logger.info("[scheduler] Late check-in warnings sent to %s employee(s)", sent)
+    except Exception as exc:
+        logger.error("[scheduler] Late warning job failed: %s", exc)
+    finally:
+        db.close()
+
+
+def _scheduled_admin_report() -> None:
+    """Compile and send a list of all active employees who missed the final check-in deadline."""
+    db = SessionLocal()
+    try:
+        from app.utils.business_time import today_ist
+        from app.constants.leave_types import is_fixed_holiday, is_weekend
+        from app.models.employee import Employee
+        from app.models.leave import Leave
+        from app.models.daily_checkin import DailyCheckIn
+        from app.services.slack_service import try_send_admin_late_list
+        from sqlalchemy import not_
+        from datetime import datetime, time as dtime, timezone
+        from zoneinfo import ZoneInfo
+
+        today = today_ist()
+
+        if is_weekend(today) or is_fixed_holiday(today):
+            logger.info("[scheduler] Skipping admin report because today is a weekend or holiday.")
+            return
+
+        checked_in_query = db.query(DailyCheckIn.employee_id).filter(
+            DailyCheckIn.checkin_date == today
+        )
+        on_leave_query = db.query(Leave.employee_id).filter(
+            Leave.status == "approved",
+            Leave.start_date <= today,
+            Leave.end_date >= today,
+        )
+
+        # 1. Pending: Did not check in and not on leave
+        pending_employees = db.query(Employee).filter(
+            Employee.status == "active",
+            not_(Employee.id.in_(checked_in_query)),
+            not_(Employee.id.in_(on_leave_query))
+        ).all()
+        pending_list = [(emp.name, emp.email) for emp in pending_employees]
+
+        # 2. Late Check-in: Checked in today, but after 11:00 AM IST
+        IST = ZoneInfo("Asia/Kolkata")
+        late_threshold_ist = datetime.combine(today, dtime(11, 0), tzinfo=IST)
+        late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
+
+        late_checkins = db.query(Employee, DailyCheckIn.checked_in_at).join(
+            DailyCheckIn, Employee.id == DailyCheckIn.employee_id
+        ).filter(
+            Employee.status == "active",
+            DailyCheckIn.checkin_date == today,
+            DailyCheckIn.checked_in_at > late_threshold_utc
+        ).all()
+        late_checkin_list = [
+            (emp.name, emp.email, checkin_time.astimezone(IST).strftime("%I:%M %p") if checkin_time else "—")
+            for emp, checkin_time in late_checkins
+        ]
+
+        if late_checkin_list or pending_list:
+            try_send_admin_late_list(
+                channel_id=LATE_CHECKIN_CHANNEL_ID,
+                late_checkins=late_checkin_list,
+                pending_checkins=pending_list
+            )
+            logger.info("[scheduler] Sent admin report (Late: %s, Pending: %s)", len(late_checkin_list), len(pending_list))
+        else:
+            logger.info("[scheduler] No late or pending check-ins today! Admin report skipped.")
+
+    except Exception as exc:
+        logger.error("[scheduler] Admin report job failed: %s", exc)
     finally:
         db.close()
 
@@ -481,6 +676,30 @@ def start_scheduler() -> None:
         hour=PM_CONFIRM_REMINDER_HOUR,
         minute=PM_CONFIRM_REMINDER_MINUTE,
         id="pm_confirm_reminder",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    _scheduler.add_job(
+        _scheduled_late_warning,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=LATE_WARNING_HOUR,
+        minute=LATE_WARNING_MINUTE,
+        id="late_warning_reminder",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    _scheduler.add_job(
+        _scheduled_admin_report,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=ADMIN_REPORT_HOUR,
+        minute=ADMIN_REPORT_MINUTE,
+        id="late_admin_report",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

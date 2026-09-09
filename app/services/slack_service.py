@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import asyncio
+from datetime import datetime
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -199,6 +200,214 @@ def try_send_leave_applied_message(**kwargs) -> bool:
         return False
 
 
+def get_leave_balances_text(db, employee) -> str:
+    from app.constants.leave_types import is_intern_or_contractor
+    from app.models.leave import Leave
+    from datetime import date, timedelta
+    
+    is_contractor = is_intern_or_contractor(employee.employee_type)
+    current_year = date.today().year
+    current_month = date.today().month
+    
+    leaves = db.query(Leave).filter(
+        Leave.employee_id == employee.id,
+        Leave.status != "rejected"
+    ).all()
+
+    def calc_days(l: Leave):
+        if not getattr(l, "start_date", None) or not getattr(l, "end_date", None):
+            return 0
+        if getattr(l, "is_half_day", False) or l.leave_type in ("first_half", "second_half"):
+            return 0.5
+        d = 0
+        curr = l.start_date
+        while curr <= l.end_date:
+            if curr.weekday() < 5:
+                d += 1
+            curr += timedelta(days=1)
+        return d
+
+    used_this_month = 0
+    used_cl = 0
+    used_floater = 0
+    used_paid = 0
+
+    for l in leaves:
+        if not getattr(l, "start_date", None):
+            continue
+        if l.start_date.year != current_year:
+            continue
+        
+        days = calc_days(l)
+        l_type = l.leave_type or ""
+        
+        if l_type == "casual_sick":
+            used_cl += days
+        elif l_type == "floater":
+            used_floater += days
+        else:
+            used_paid += days
+            if l.start_date.month == current_month:
+                used_this_month += days
+
+    if is_contractor:
+        return (
+            f"• *Monthly Leave:* 1 / 1 this month ({used_this_month} used)\n"
+            f"• *Casual/Sick Leave:* 0 / 0 days left ({used_cl} used in {current_year})\n"
+            f"• *Floater Leave:* 2 / 2 days left ({used_floater} used in {current_year})"
+        )
+    else:
+        paid_left = max(0, 12 - used_paid)
+        cl_left = max(0, 6 - used_cl)
+        floater_left = max(0, 2 - used_floater)
+        return (
+            f"• *Paid Leave:* {paid_left} / 12 days left ({used_paid} used in {current_year})\n"
+            f"• *Casual/Sick Leave:* {cl_left} / 6 days left ({used_cl} used in {current_year})\n"
+            f"• *Floater Leave:* {floater_left} / 2 days left ({used_floater} used in {current_year})"
+        )
+
+def get_wfh_balances_text(db, employee) -> str:
+    from app.models.wfh import WFHRequest
+    from datetime import date, timedelta
+    from app.constants.leave_types import is_intern_or_contractor
+    
+    is_contractor = is_intern_or_contractor(employee.employee_type)
+    today = date.today()
+    current_year = today.year
+    current_month = today.month
+    
+    # Calculate Monday of the current week
+    current_monday = today - timedelta(days=today.weekday())
+    
+    wfhs = db.query(WFHRequest).filter(
+        WFHRequest.employee_id == employee.id,
+        WFHRequest.status != "rejected"
+    ).all()
+    
+    used_this_month = 0
+    used_this_week = 0
+    
+    for r in wfhs:
+        r_end = r.end_date or r.wfh_date
+        curr_d = r.wfh_date
+        while curr_d <= r_end:
+            if curr_d.weekday() < 5:
+                if curr_d.year == current_year and curr_d.month == current_month:
+                    used_this_month += 1
+                r_monday = curr_d - timedelta(days=curr_d.weekday())
+                if r_monday == current_monday:
+                    used_this_week += 1
+            curr_d += timedelta(days=1)
+
+    if is_contractor:
+        return f"• *Monthly:* {used_this_month} / 2 this month ({used_this_month} used)"
+    else:
+        return (
+            f"• *Monthly:* {used_this_month} / 4 this month ({used_this_month} used)\n"
+            f"• *Weekly:* {used_this_week} / 1 this week ({used_this_week} used)"
+        )
+
+
+def build_leave_request_blocks(
+    pm_name: str,
+    employee_name: str,
+    employee_email: str,
+    employee_designation: str | None,
+    leave_type: str,
+    start_date: str,
+    end_date: str,
+    duration_days: int,
+    reason: str | None,
+    impacted_projects: list[str] | None,
+    leave_id: int,
+    exceeds_limit: bool,
+    leave_balances_text: str | None,
+    exceeds_limit_text: str | None,
+) -> tuple[str, list]:
+    projects_text = ", ".join(impacted_projects) if impacted_projects else "No active project mapping found"
+    normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "No reason provided"
+
+    designation_text = employee_designation or "Employee"
+    def fmt_dt(ds):
+        try:
+            return datetime.strptime(ds, "%Y-%m-%d").strftime("%b %d, %Y")
+        except:
+            return ds
+
+    if start_date == end_date:
+        date_str = f"{start_date} ({fmt_dt(start_date)})"
+    else:
+        date_str = f"{start_date} to {end_date} ({fmt_dt(start_date)} to {fmt_dt(end_date)})"
+    
+    full_text = f"*New {leave_type} Request: {employee_name}* ({designation_text})"
+    if exceeds_limit:
+        warning_msg = exceeds_limit_text or "Approval requires a mandatory remark."
+        full_text += f"\n⚠️ *Limit Exceeded:* {warning_msg}"
+
+    full_text += f"\n\n*Request Details*\n• *Duration:* {duration_days} Day(s) ({date_str})\n• *Reason:* {normalized_reason}\n• *Projects Impacted:* {projects_text}"
+
+    if leave_balances_text:
+        full_text += f"\n\n*Leave Balances*\n{leave_balances_text}"
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": full_text,
+            },
+        }
+    ]
+
+    pm_portal_url = (os.getenv("FRONTEND_URL") or "http://localhost:5173").strip().rstrip("/") + "/pm/leaves"
+
+    elements = []
+    
+    if not exceeds_limit:
+        elements.extend([
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Approve",
+                    "emoji": True
+                },
+                "style": "primary",
+                "value": json.dumps({"action": "approve", "type": "leave", "id": leave_id}),
+                "action_id": "approve_leave"
+            },
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Reject",
+                    "emoji": True
+                },
+                "style": "danger",
+                "value": json.dumps({"action": "reject", "type": "leave", "id": leave_id}),
+                "action_id": "reject_leave"
+            }
+        ])
+    
+    elements.append({
+        "type": "button",
+        "text": {
+            "type": "plain_text",
+            "text": "Review in PM Portal",
+            "emoji": True
+        },
+        "url": pm_portal_url,
+        "action_id": "review_in_portal"
+    })
+
+    blocks.append({
+        "type": "actions",
+        "elements": elements
+    })
+
+    text = f"New leave request from {employee_name} ({start_date} to {end_date})"
+    return text, blocks
+
 def send_pm_leave_request_message(
     *,
     pm_slack_user_id: str,
@@ -214,109 +423,15 @@ def send_pm_leave_request_message(
     impacted_projects: list[str] | None = None,
     leave_id: int,
     exceeds_limit: bool = False,
-) -> bool:
+    leave_balances_text: str | None = None,
+    exceeds_limit_text: str | None = None,
+) -> tuple[str | None, str | None]:
     channel_id = open_direct_message_channel(pm_slack_user_id)
-    project_lines = impacted_projects or ["No active project mapping found"]
-    projects_text = "\n".join(f"• {line}" for line in project_lines)
-    normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "No reason provided"
-
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*New leave request received*\n{employee_name} has submitted a leave request in Autonex.",
-            },
-        },
-        {
-            "type": "section",
-            "fields": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"*PM*\n{pm_name}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Employee*\n{employee_name}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Email*\n{employee_email}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Designation*\n{employee_designation or 'N/A'}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Leave Type*\n{leave_type}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Duration*\n{duration_days} day(s)",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Start Date*\n{start_date}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*End Date*\n{end_date}",
-                },
-            ],
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Reason*\n{normalized_reason}",
-            },
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Impacted Projects*\n{projects_text}",
-            },
-        }
-    ]
-
-    if exceeds_limit:
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "⚠️ *Limit Exceeded:* This user has exceeded their allowed leave limit. Approval requires a mandatory remark. Please visit the Autonex PM Portal to review and approve this request."
-            }
-        })
-    else:
-        blocks.append({
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "Approve",
-                        "emoji": True
-                    },
-                    "style": "primary",
-                    "value": json.dumps({"action": "approve", "type": "leave", "id": leave_id}),
-                    "action_id": "approve_leave"
-                },
-                {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "Reject",
-                        "emoji": True
-                    },
-                    "style": "danger",
-                    "value": json.dumps({"action": "reject", "type": "leave", "id": leave_id}),
-                    "action_id": "reject_leave"
-                }
-            ]
-        })
+    text, blocks = build_leave_request_blocks(
+        pm_name, employee_name, employee_email, employee_designation,
+        leave_type, start_date, end_date, duration_days, reason, impacted_projects,
+        leave_id, exceeds_limit, leave_balances_text, exceeds_limit_text
+    )
 
     response = _slack_request(
         "/chat.postMessage",
@@ -328,18 +443,202 @@ def send_pm_leave_request_message(
     )
 
     if response.get("ok"):
-        return True
+        return (response.get("ts"), channel_id)
+    
+    logger.error(f"Failed to send PM leave request DM: {response.get('error')}")
+    return (None, None)
 
-    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
-
-
-def try_send_pm_leave_request_message(**kwargs) -> bool:
+def try_update_pm_leave_request_message(
+    *,
+    ts: str,
+    channel_id: str,
+    pm_name: str,
+    employee_name: str,
+    employee_email: str,
+    employee_designation: str | None,
+    leave_type: str,
+    start_date: str,
+    end_date: str,
+    duration_days: int,
+    reason: str | None,
+    impacted_projects: list[str] | None = None,
+    leave_id: int,
+    exceeds_limit: bool = False,
+    leave_balances_text: str | None = None,
+    exceeds_limit_text: str | None = None,
+) -> bool:
     try:
-        return send_pm_leave_request_message(**kwargs)
-    except Exception as exc:
-        logger.warning("Slack PM leave request notification skipped: %s", exc)
+        text, blocks = build_leave_request_blocks(
+            pm_name, employee_name, employee_email, employee_designation,
+            leave_type, start_date, end_date, duration_days, reason, impacted_projects,
+            leave_id, exceeds_limit, leave_balances_text, exceeds_limit_text
+        )
+        response = _slack_request(
+            "/chat.update",
+            {
+                "channel": channel_id,
+                "ts": ts,
+                "text": text,
+                "blocks": blocks,
+            },
+        )
+        if response.get("ok"):
+            return True
+        logger.error(f"Failed to update PM leave request DM: {response.get('error')}")
+        return False
+    except Exception as e:
+        logger.error(f"Error in try_update_pm_leave_request_message: {e}")
         return False
 
+
+def try_send_pm_leave_request_message(*args, **kwargs) -> tuple[str | None, str | None]:
+    try:
+        return send_pm_leave_request_message(*args, **kwargs)
+    except Exception as e:
+        logger.error(f"Error in send_pm_leave_request_message: {e}")
+        return (None, None)
+
+
+
+def build_wfh_request_blocks(
+    pm_name: str,
+    employee_name: str,
+    employee_email: str,
+    employee_designation: str | None,
+    start_date: str,
+    end_date: str,
+    duration_days: int,
+    reason: str | None,
+    impacted_projects: list[str] | None,
+    wfh_id: int,
+    exceeds_limit: bool,
+    wfh_balances_text: str | None,
+    exceeds_limit_text: str | None,
+) -> tuple[str, list]:
+    projects_text = ", ".join(impacted_projects) if impacted_projects else "No active project mapping found"
+    normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "No reason provided"
+
+    designation_text = employee_designation or "Employee"
+    def fmt_dt(ds):
+        try:
+            return datetime.strptime(ds, "%Y-%m-%d").strftime("%b %d, %Y")
+        except:
+            return ds
+
+    if start_date == end_date:
+        date_str = f"{start_date} ({fmt_dt(start_date)})"
+    else:
+        date_str = f"{start_date} to {end_date} ({fmt_dt(start_date)} to {fmt_dt(end_date)})"
+    
+    full_text = f"*New WFH Request: {employee_name}* ({designation_text})"
+    if exceeds_limit:
+        warning_msg = exceeds_limit_text or "Approval requires a mandatory remark."
+        full_text += f"\n⚠️ *Limit Exceeded:* {warning_msg}"
+
+    full_text += f"\n\n*Request Details*\n• *Duration:* {duration_days} Day(s) ({date_str})\n• *Reason:* {normalized_reason}\n• *Projects Impacted:* {projects_text}"
+
+    if wfh_balances_text:
+        full_text += f"\n\n*WFH Balances*\n{wfh_balances_text}"
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": full_text,
+            },
+        }
+    ]
+
+    pm_portal_url = (os.getenv("FRONTEND_URL") or "http://localhost:5173").strip().rstrip("/") + "/pm/leaves"
+
+    elements = []
+    
+    if not exceeds_limit:
+        elements.extend([
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Approve",
+                    "emoji": True
+                },
+                "style": "primary",
+                "value": json.dumps({"action": "approve", "type": "wfh", "id": wfh_id}),
+                "action_id": "approve_wfh"
+            },
+            {
+                "type": "button",
+                "text": {
+                    "type": "plain_text",
+                    "text": "Reject",
+                    "emoji": True
+                },
+                "style": "danger",
+                "value": json.dumps({"action": "reject", "type": "wfh", "id": wfh_id}),
+                "action_id": "reject_wfh"
+            }
+        ])
+    
+    elements.append({
+        "type": "button",
+        "text": {
+            "type": "plain_text",
+            "text": "Review in PM Portal",
+            "emoji": True
+        },
+        "url": pm_portal_url,
+        "action_id": "review_in_portal_wfh"
+    })
+
+    blocks.append({
+        "type": "actions",
+        "elements": elements
+    })
+
+    text = f"New WFH request from {employee_name} ({start_date} to {end_date})"
+    return text, blocks
+
+def try_update_pm_wfh_request_message(
+    *,
+    ts: str,
+    channel_id: str,
+    pm_name: str,
+    employee_name: str,
+    employee_email: str,
+    employee_designation: str | None,
+    start_date: str,
+    end_date: str,
+    duration_days: int,
+    reason: str | None,
+    impacted_projects: list[str] | None = None,
+    wfh_id: int,
+    exceeds_limit: bool = False,
+    wfh_balances_text: str | None = None,
+    exceeds_limit_text: str | None = None,
+) -> bool:
+    try:
+        text, blocks = build_wfh_request_blocks(
+            pm_name, employee_name, employee_email, employee_designation,
+            start_date, end_date, duration_days, reason, impacted_projects,
+            wfh_id, exceeds_limit, wfh_balances_text, exceeds_limit_text
+        )
+        response = _slack_request(
+            "/chat.update",
+            {
+                "channel": channel_id,
+                "ts": ts,
+                "text": text,
+                "blocks": blocks,
+            },
+        )
+        if response.get("ok"):
+            return True
+        logger.error(f"Failed to update PM WFH request DM: {response.get('error')}")
+        return False
+    except Exception as e:
+        logger.error(f"Error in try_update_pm_wfh_request_message: {e}")
+        return False
 
 def send_pm_wfh_request_message(
     *,
@@ -355,127 +654,37 @@ def send_pm_wfh_request_message(
     impacted_projects: list[str] | None = None,
     wfh_id: int,
     exceeds_limit: bool = False,
-) -> bool:
+    wfh_balances_text: str | None = None,
+    exceeds_limit_text: str | None = None,
+) -> tuple[str | None, str | None]:
     channel_id = open_direct_message_channel(pm_slack_user_id)
-    project_lines = impacted_projects or ["No active project mapping found"]
-    projects_text = "\n".join(f"• {line}" for line in project_lines)
-    normalized_reason = reason.strip() if isinstance(reason, str) and reason.strip() else "No reason provided"
-
-    blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*New WFH request received*\n{employee_name} has submitted a WFH request in Autonex.",
-            },
-        },
-        {
-            "type": "section",
-            "fields": [
-                {
-                    "type": "mrkdwn",
-                    "text": f"*PM*\n{pm_name}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Employee*\n{employee_name}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Email*\n{employee_email}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Designation*\n{employee_designation or 'N/A'}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Duration*\n{duration_days} day(s)",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*Start Date*\n{start_date}",
-                },
-                {
-                    "type": "mrkdwn",
-                    "text": f"*End Date*\n{end_date}",
-                },
-            ],
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Reason*\n{normalized_reason}",
-            },
-        },
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": f"*Impacted Projects*\n{projects_text}",
-            },
-        }
-    ]
-
-    if exceeds_limit:
-        blocks.append({
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": "⚠️ *Limit Exceeded:* This user has exceeded their allowed WFH limit. Approval requires a mandatory remark. Please visit the Autonex PM Portal to review and approve this request."
-            }
-        })
-    else:
-        blocks.append({
-            "type": "actions",
-            "elements": [
-                {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "Approve",
-                        "emoji": True
-                    },
-                    "style": "primary",
-                    "value": json.dumps({"action": "approve", "type": "wfh", "id": wfh_id}),
-                    "action_id": "approve_wfh"
-                },
-                {
-                    "type": "button",
-                    "text": {
-                        "type": "plain_text",
-                        "text": "Reject",
-                        "emoji": True
-                    },
-                    "style": "danger",
-                    "value": json.dumps({"action": "reject", "type": "wfh", "id": wfh_id}),
-                    "action_id": "reject_wfh"
-                }
-            ]
-        })
+    text, blocks = build_wfh_request_blocks(
+        pm_name, employee_name, employee_email, employee_designation,
+        start_date, end_date, duration_days, reason, impacted_projects,
+        wfh_id, exceeds_limit, wfh_balances_text, exceeds_limit_text
+    )
 
     response = _slack_request(
         "/chat.postMessage",
         {
             "channel": channel_id,
-            "text": f"New WFH request from {employee_name} ({start_date} to {end_date})",
+            "text": text,
             "blocks": blocks,
         },
     )
 
     if response.get("ok"):
-        return True
+        return (response.get("ts"), channel_id)
+    
+    logger.error(f"Failed to send PM WFH request DM: {response.get('error')}")
+    return (None, None)
 
-    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
-
-
-def try_send_pm_wfh_request_message(**kwargs) -> bool:
+def try_send_pm_wfh_request_message(*args, **kwargs) -> tuple[str | None, str | None]:
     try:
-        return send_pm_wfh_request_message(**kwargs)
-    except Exception as exc:
-        logger.warning("Slack PM WFH request notification skipped: %s", exc)
-        return False
+        return send_pm_wfh_request_message(*args, **kwargs)
+    except Exception as e:
+        logger.error(f"Error in send_pm_wfh_request_message: {e}")
+        return (None, None)
 
 
 def send_leave_status_message(*, employee_email: str, employee_name: str, start_date: str, end_date: str, pm_name: str, approved: bool) -> bool:
@@ -1078,6 +1287,140 @@ def try_send_checkin_reminder_message(**kwargs) -> bool:
         return False
 
 
+def send_late_warning_message(*, employee_slack_user_id: str, employee_name: str) -> bool:
+    """DM an employee who hasn't checked in yet, warning them of escalation."""
+    channel_id = open_direct_message_channel(employee_slack_user_id)
+    response = _slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": f"Warning: {employee_name}, you haven't checked in yet.",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"Hi {employee_name}, you haven't checked in yet. If you do not check in now, your name will be added to the late check-in list and sent to the admins in a few minutes. Please check in immediately.",
+                    },
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {"type": "plain_text", "text": "Check In Now"},
+                            "style": "danger",
+                            "url": _checkin_frontend_url(),
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+    if response.get("ok"):
+        return True
+    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+
+
+def try_send_late_warning_message(**kwargs) -> bool:
+    try:
+        return send_late_warning_message(**kwargs)
+    except Exception as exc:
+        logger.warning("Slack late check-in warning skipped for %s: %s", kwargs.get("employee_name"), exc)
+        return False
+
+
+def send_admin_late_list(*, channel_id: str, late_checkins: list[tuple[str, str, str]], pending_checkins: list[tuple[str, str]]) -> bool:
+    """Send the late check-in report to a specific channel (e.g. admins)."""
+    if not late_checkins and not pending_checkins:
+        return True
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"Daily Late Check-in Report (Late: {len(late_checkins)} | Pending: {len(pending_checkins)})",
+                "emoji": True
+            }
+        }
+    ]
+
+    def make_cell(text):
+        return {"type": "raw_text", "text": str(text)}
+
+    def add_table_section(title, employee_list, is_late_list=False):
+        if not employee_list:
+            return
+        
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*{title} ({len(employee_list)})*"
+            }
+        })
+        
+        chunk_size = 50
+        for i in range(0, len(employee_list), chunk_size):
+            chunk = employee_list[i:i + chunk_size]
+            
+            if is_late_list:
+                rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email"), make_cell("Time")]]
+                for idx, record in enumerate(chunk):
+                    name, email, time_str = record
+                    rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email), make_cell(time_str)])
+                
+                blocks.append({
+                    "type": "table",
+                    "rows": rows,
+                    "column_settings": [
+                        {"align": "center"},
+                        {"align": "left", "is_wrapped": True},
+                        {"align": "left", "is_wrapped": True},
+                        {"align": "right"}
+                    ]
+                })
+            else:
+                rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email")]]
+                for idx, record in enumerate(chunk):
+                    name, email = record
+                    rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email)])
+
+                blocks.append({
+                    "type": "table",
+                    "rows": rows,
+                    "column_settings": [
+                        {"align": "center"},
+                        {"align": "left", "is_wrapped": True},
+                        {"align": "left", "is_wrapped": True}
+                    ]
+                })
+
+    add_table_section("Checked In Late (After 11:00 AM)", late_checkins, is_late_list=True)
+    add_table_section("Pending (Not Checked In Yet)", pending_checkins, is_late_list=False)
+
+    response = _slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": f"Daily Late Check-in Report (Late: {len(late_checkins)} | Pending: {len(pending_checkins)})",
+            "blocks": blocks,
+        },
+    )
+    if response.get("ok"):
+        return True
+    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+
+
+def try_send_admin_late_list(**kwargs) -> bool:
+    try:
+        return send_admin_late_list(**kwargs)
+    except Exception as exc:
+        logger.warning("Slack admin late list report skipped: %s", exc)
+        return False
+
+
 def send_pm_confirm_reminder_message(*, pm_slack_user_id: str, pm_name: str, pending_count: int) -> bool:
     """DM a PM/lead who still has unconfirmed check-ins on their roster."""
     channel_id = open_direct_message_channel(pm_slack_user_id)
@@ -1194,3 +1537,23 @@ def send_channel_message(channel: str, text: str, blocks: list | None = None) ->
     except Exception as e:
         logger.error(f"Exception while sending Slack channel message: {e}")
         return False
+
+def try_overwrite_deleted_message(channel_id: str, ts: str):
+    try:
+        _slack_request(
+            "/chat.update",
+            {
+                "channel": channel_id,
+                "ts": ts,
+                "text": "🗑️ This request was deleted by the employee.",
+                "blocks": [{
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "🗑️ *This request was deleted by the employee.*"
+                    }
+                }]
+            }
+        )
+    except Exception as e:
+        logger.error(f"Failed to overwrite deleted slack message: {e}")
