@@ -123,7 +123,7 @@ async def slack_interactions(request: Request, db: Session = Depends(get_db)):
                 approve_leave(leave_id=req_id, http_request=request, approved_by=user.id, body=body, db=db, current_user=user)
                 respond_success("Leave request approved")
             elif action_type == "reject":
-                reject_leave(leave_id=req_id, http_request=request, approved_by=user.id, body=body, db=db, current_user=user)
+                reject_leave(leave_id=req_id, http_request=request, approved_by=user.id, db=db, current_user=user)
                 respond_success("Leave request rejected")
     except HTTPException as e:
         _respond_to_slack(response_url, f"Error: {e.detail}")

@@ -21,5 +21,8 @@ class Leave(Base):
     is_half_day = Column(Boolean, default=False, nullable=True)
     half_day_slot = Column(String, nullable=True)
 
+    slack_pm_message_ts = Column(String, nullable=True)
+    slack_pm_channel_id = Column(String, nullable=True)
+
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now())

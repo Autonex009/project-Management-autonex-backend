@@ -86,10 +86,18 @@ def client_and_db():
     app.dependency_overrides[database.get_db] = override_get_db
     app.dependency_overrides[get_current_user] = override_get_current_user
 
+    # Mock trigger_wfh_revalidation to prevent hanging in background threads
+    import app.api.wfh as wfh_module
+    original_trigger = wfh_module.trigger_wfh_revalidation
+    wfh_module.trigger_wfh_revalidation = lambda x: None
+
     db = TestingSessionLocal()
-    yield TestClient(app), db
-    db.close()
-    Base.metadata.drop_all(bind=engine)
+    try:
+        yield TestClient(app), db
+    finally:
+        wfh_module.trigger_wfh_revalidation = original_trigger
+        db.close()
+        Base.metadata.drop_all(bind=engine)
 
 
 def _seed(db):
@@ -174,6 +182,7 @@ def test_pm_paid_leave_over_monthly_limit_is_flagged(client_and_db):
     client, db = client_and_db
     ids = _seed(db)
     pm_emp_id = ids["pm_emp"].id
+    admin_user_id = ids["admin_user"].id
 
     # Three single-day paid leaves on distinct weekdays in the same month
     base = _next_weekday(date.today().replace(day=1) + timedelta(days=40))
@@ -195,7 +204,11 @@ def test_pm_paid_leave_over_monthly_limit_is_flagged(client_and_db):
             "reason": "Test reason",
         })
         assert resp.status_code == 201, resp.text
-        flags.append(resp.json()["flagged"])
+        data = resp.json()
+        flags.append(data["flagged"])
+        
+        # Approve the request so it counts towards the limit for subsequent requests
+        client.patch(f"/api/leaves/{data['leave_id']}/approve", params={"approved_by": admin_user_id})
 
     assert flags[0] is False and flags[1] is False
     assert flags[2] is True, "3rd paid leave in a month must be flagged for PMs too"
@@ -333,6 +346,7 @@ def test_employee_wfh_routes_to_pm(client_and_db):
 def test_wfh_limits_fulltime(client_and_db):
     client, db = client_and_db
     ids = _seed(db)
+    admin_user_id = ids["admin_user"].id
     emp = Employee(name="FT Employee", email="ft@x.com", status="active",
                    employee_type="Full-time")
     db.add(emp)
@@ -351,6 +365,7 @@ def test_wfh_limits_fulltime(client_and_db):
         "reason": "Reason 1",
     })
     assert resp.status_code == 201, resp.text
+    client.patch(f"/api/wfh/{resp.json()['id']}/approve", params={"approved_by": admin_user_id})
 
     # Second request in the same week: accepted but flagged (limit 1/week).
     # Over-limit WFH is no longer rejected outright — it goes through flagged so
@@ -367,6 +382,7 @@ def test_wfh_limits_fulltime(client_and_db):
 def test_wfh_limits_intern_and_contractor(client_and_db):
     client, db = client_and_db
     ids = _seed(db)
+    admin_user_id = ids["admin_user"].id
     
     # Test Intern
     intern = Employee(name="Intern Employee", email="intern@x.com", status="active",
@@ -400,6 +416,7 @@ def test_wfh_limits_intern_and_contractor(client_and_db):
         "reason": "Reason 1",
     })
     assert resp.status_code == 201, resp.text
+    client.patch(f"/api/wfh/{resp.json()['id']}/approve", params={"approved_by": admin_user_id})
 
     # Second WFH
     resp = client.post("/api/wfh", json={
@@ -408,6 +425,7 @@ def test_wfh_limits_intern_and_contractor(client_and_db):
         "reason": "Reason 2",
     })
     assert resp.status_code == 201, resp.text
+    client.patch(f"/api/wfh/{resp.json()['id']}/approve", params={"approved_by": admin_user_id})
 
     # Third WFH: accepted but flagged (limit 2/month)
     resp = client.post("/api/wfh", json={
@@ -432,6 +450,7 @@ def test_wfh_limits_intern_and_contractor(client_and_db):
         "reason": "Reason 1",
     })
     assert resp.status_code == 201, resp.text
+    client.patch(f"/api/wfh/{resp.json()['id']}/approve", params={"approved_by": admin_user_id})
 
     # Second WFH
     resp = client.post("/api/wfh", json={
@@ -440,6 +459,7 @@ def test_wfh_limits_intern_and_contractor(client_and_db):
         "reason": "Reason 2",
     })
     assert resp.status_code == 201, resp.text
+    client.patch(f"/api/wfh/{resp.json()['id']}/approve", params={"approved_by": admin_user_id})
 
     # Third WFH: accepted but flagged (limit 2/month)
     resp = client.post("/api/wfh", json={
