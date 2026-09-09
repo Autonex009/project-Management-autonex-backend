@@ -1122,7 +1122,9 @@ def _revalidate_pending_wfh_background(employee_id: int, db: Session):
 
 def trigger_wfh_revalidation(employee_id: int):
     import threading
-    from app.database import SessionLocal
+
+
+    from app.db.database import SessionLocal
     def worker():
         db = SessionLocal()
         try:
