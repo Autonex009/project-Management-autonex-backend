@@ -89,6 +89,12 @@ CREATE_PARTITION_MINUTE = int(os.getenv("CREATE_PARTITION_MINUTE", "0"))
 # Hiring sync interval
 HIRING_SYNC_INTERVAL_HOURS = int(os.getenv("HIRING_SYNC_INTERVAL_HOURS", "12"))
 
+# Checkin Lunch
+LUNCH_REPORT_HOUR = int(os.getenv("LUNCH_REPORT_HOUR", "11"))
+LUNCH_REPORT_MINUTE = int(os.getenv("LUNCH_REPORT_MINUTE", "0"))
+LUNCH_REPORT_PRIMARY_EMAIL = os.getenv("LUNCH_REPORT_PRIMARY_EMAIL", "jadhavashish061@gmail.com")
+LUNCH_REPORT_FALLBACK_EMAIL = os.getenv("LUNCH_REPORT_FALLBACK_EMAIL", "kisanjena40@gmail.com")
+
 
 def _scheduled_hiring_sync() -> None:
     db = SessionLocal()
@@ -746,11 +752,54 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
+        # Daily Lunch Order PDF report – weekdays at 11:00 AM IST
+    _scheduler.add_job(
+        _scheduled_lunch_report,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=LUNCH_REPORT_HOUR,
+        minute=LUNCH_REPORT_MINUTE,
+        id="daily_lunch_report",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     logger.info(
         "[scheduler] Started — Encord sync every %s min; hiring sync %s",
         ENCORD_SYNC_MINUTE,
         "ENABLED (every 12h)" if os.getenv("ENABLE_HIRING_SYNC") else "disabled",
     )
+
+def _scheduled_lunch_report() -> None:
+    """Generate and email the daily lunch order PDF (WFO + tiffin/canteen)."""
+    db = SessionLocal()
+    try:
+        from app.utils.business_time import today_ist
+        from app.constants.leave_types import is_fixed_holiday, is_weekend
+        from app.services.lunch_report_service import generate_and_send_lunch_report
+
+        today = today_ist()
+
+        if is_weekend(today) or is_fixed_holiday(today):
+            logger.info("[scheduler] Skipping lunch report because today is a weekend or holiday.")
+            return
+
+        # Send to both primary + fallback
+        emails = [LUNCH_REPORT_PRIMARY_EMAIL, LUNCH_REPORT_FALLBACK_EMAIL]
+        # Remove duplicates if both are the same
+        emails = list(dict.fromkeys(emails))
+
+        success = generate_and_send_lunch_report(db, to_emails=emails)
+
+        if success:
+            logger.info("[scheduler] Lunch report emailed successfully to %s", emails)
+        else:
+            logger.error("[scheduler] Lunch report email failed for one or more recipients")
+    except Exception as exc:
+        logger.exception("[scheduler] Lunch report job crashed: %s", exc)
+    finally:
+        db.close()
 
 
 def shutdown_scheduler() -> None:

@@ -30,6 +30,12 @@ class DailyCheckIn(Base):
     work_mode = Column(Text, nullable=False)  # WFO, WFH
     project_ids = Column(JSONB, default=[])
     mood = Column(Text, nullable=True)  # great, okay, low, stressed
+    
+    # NEW FIELDS - Only relevant when work_mode is WFO
+    office_floor = Column(Text, nullable=True)  # "7", "9", "17"
+    lunch_preference = Column(Text, nullable=True)  # "order_tiffin", "canteen", "none"
+    tiffin_type = Column(Text, nullable=True)  # "full_meal", "no_rice", "dal_and_rice" (only if lunch_preference is "order_tiffin")
+    
     checked_in_at = Column(UTCDateTime, nullable=True)
     checked_out_at = Column(UTCDateTime, nullable=True)
     pm_confirmed_at = Column(UTCDateTime, nullable=True)
