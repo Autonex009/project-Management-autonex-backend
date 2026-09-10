@@ -269,6 +269,7 @@ def get_team_today(
     search: str = "",
     status: str = "",
     work_mode: str = "",
+    office_floor: str = "",
     project_id: int = None,
     time_filter: str = "",
     db: Session = Depends(get_db),
@@ -322,6 +323,8 @@ def get_team_today(
         query = query.filter(DailyCheckIn.id.is_(None))
     if work_mode:
         query = query.filter(DailyCheckIn.work_mode == work_mode)
+    if office_floor:
+        query = query.filter(DailyCheckIn.office_floor == office_floor)
         
     if project_id:
         allocs_proj = db.query(Allocation.employee_id).filter(
@@ -401,6 +404,7 @@ def get_admin_checkins_paginated(
     search: str = "",
     status: str = "",
     work_mode: str = "",
+    office_floor: str = "",
     project_id: int = None,
     time_filter: str = "",
     db: Session = Depends(get_db),
@@ -431,6 +435,8 @@ def get_admin_checkins_paginated(
         query = query.filter(DailyCheckIn.id.is_(None))
     if work_mode:
         query = query.filter(DailyCheckIn.work_mode == work_mode)
+    if office_floor:
+        query = query.filter(DailyCheckIn.office_floor == office_floor)
         
     if project_id:
         allocs_proj = db.query(Allocation.employee_id).filter(
