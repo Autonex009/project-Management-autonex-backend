@@ -621,7 +621,7 @@ def request_slack_oauth(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee record not found.")
 
-    # Generate signed JWT confirmation token (3 minutes expiry)
+    # Generate signed JWT confirmation token (30 seconds expiry)
     token = create_checkin_confirmation_token(
         employee_id=employee_id,
         portal_ip=portal_ip,
@@ -629,7 +629,7 @@ def request_slack_oauth(
         project_ids=payload.project_ids,
         mood=payload.mood,
         checkin_date=str(today),
-        expires_seconds=180,
+        expires_seconds=30,
         office_floor=payload.office_floor,
         lunch_preference=payload.lunch_preference,
         tiffin_type=payload.tiffin_type,
@@ -638,8 +638,8 @@ def request_slack_oauth(
     redirect_uri = get_slack_oauth_redirect_uri(http_request)
     oauth_url = build_slack_oauth_authorize_url(state=token, redirect_uri=redirect_uri)
 
-    logger.info("[checkin] Generated Slack OAuth authorize URL for employee_id=%s, redirect_uri=%s", employee_id, redirect_uri)
-    return SlackOAuthRequestResponse(oauth_url=oauth_url)
+    logger.info("[checkin] Generated Slack OAuth authorize URL for employee_id=%s, redirect_uri=%s (30s expiry)", employee_id, redirect_uri)
+    return SlackOAuthRequestResponse(oauth_url=oauth_url, expires_in=30)
 
 
 @router.get("/slack-oauth-callback")
@@ -657,22 +657,22 @@ def slack_oauth_callback(
 
     if error:
         logger.warning("[slack-oauth-callback] Slack returned error: %s - %s", error, error_description)
-        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=slack_access_denied")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=slack_access_denied&oauth_popup=1")
 
     if not code or not state:
         logger.warning("[slack-oauth-callback] Missing code or state")
-        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=invalid_request")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=invalid_request&oauth_popup=1")
 
     try:
         payload = decode_checkin_confirmation_token(state)
     except Exception as exc:
         logger.warning("[slack-oauth-callback] Invalid or expired token: %s", exc)
-        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=token_expired")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=token_expired&oauth_popup=1")
 
     jti = payload.get("jti")
     if not jti or is_checkin_token_burned(jti):
         logger.warning("[slack-oauth-callback] Token already burned: jti=%s", jti)
-        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=token_already_used")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=token_already_used&oauth_popup=1")
 
     employee_id = payload.get("employee_id")
     work_mode = payload.get("work_mode")
@@ -692,22 +692,22 @@ def slack_oauth_callback(
             portal_ip,
             client_ip,
         )
-        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=ip_mismatch&portal_ip={portal_ip}&client_ip={client_ip}")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=ip_mismatch&portal_ip={portal_ip}&client_ip={client_ip}&oauth_popup=1")
 
     if work_mode == "WFO" and not _is_office_ip(client_ip):
         logger.warning("[slack-oauth-callback] Blocked WFO checkin from non-office IP '%s' for employee_id=%s", client_ip, employee_id)
-        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=office_ip_required&ip={client_ip}")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=office_ip_required&ip={client_ip}&oauth_popup=1")
 
     redirect_uri = get_slack_oauth_redirect_uri(request)
     try:
         token_resp = exchange_slack_oauth_code(code=code, redirect_uri=redirect_uri)
     except Exception as exc:
         logger.error("[slack-oauth-callback] Token exchange error: %s", exc)
-        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=slack_exchange_failed")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=slack_exchange_failed&oauth_popup=1")
 
     if not token_resp.get("ok"):
         logger.error("[slack-oauth-callback] Slack returned not ok: %s", token_resp)
-        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=slack_exchange_failed")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=slack_exchange_failed&oauth_popup=1")
 
     slack_sub = token_resp.get("sub")
     if not slack_sub and "id_token" in token_resp:
@@ -720,7 +720,7 @@ def slack_oauth_callback(
 
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
-        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=employee_not_found")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=employee_not_found&oauth_popup=1")
 
     # If employee record does not have a cached slack_user_id, try to fetch it
     if not employee.slack_user_id:
@@ -734,7 +734,7 @@ def slack_oauth_callback(
             employee.id,
             employee.slack_user_id,
         )
-        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=account_mismatch")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=account_mismatch&oauth_popup=1")
 
     burn_checkin_token(jti)
 
@@ -760,7 +760,7 @@ def slack_oauth_callback(
         db.refresh(checkin)
 
     logger.info("[slack-oauth-callback] Successfully checked in employee_id=%s via Slack OAuth!", employee_id)
-    return RedirectResponse(f"{frontend_url}/dashboard?checkin_result=success")
+    return RedirectResponse(f"{frontend_url}/dashboard?checkin_result=success&oauth_popup=1")
 
 
 @router.post("/checkout", response_model=CheckInResponse)

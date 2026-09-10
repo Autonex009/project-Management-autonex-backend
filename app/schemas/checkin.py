@@ -123,6 +123,7 @@ class SlackConfirmRequest(BaseModel):
 
 class SlackOAuthRequestResponse(BaseModel):
     oauth_url: str
+    expires_in: int = 30
 
 
 class TeamCheckInRow(BaseModel):
