@@ -30,6 +30,7 @@ from app.models.side_project import SideProject
 from app.models.user import User
 from app.models.wfh import WFHRequest
 from app.models.payroll import Salary
+from app.models.daily_checkin import DailyCheckIn
 from app.schemas.employee import (
     EmployeeCreate,
     EmployeeUpdate,
@@ -586,9 +587,39 @@ def list_employees_paginated(
                 e_dict["managers"] = []
             if pm_name not in e_dict["managers"]:
                 e_dict["managers"].append(pm_name)
+
+    
+        # ── Today's check-in (time + floor) for the visible page only ────────────
+    # One batched query; never N+1. Used by the Employees table column that
+    # replaced Skills. Other list endpoints are left alone.
+    today = today_ist()
+    if emp_ids:
+        today_checkins = (
+            db.query(DailyCheckIn)
+            .filter(
+                DailyCheckIn.employee_id.in_(emp_ids),
+                DailyCheckIn.checkin_date == today,
+            )
+            .all()
+        )
+        checkin_by_emp = {c.employee_id: c for c in today_checkins}
+
+        for eid, e_dict in emp_dict.items():
+            chk = checkin_by_emp.get(eid)
+            if chk:
+                e_dict["today_checked_in_at"] = (
+                    chk.checked_in_at.isoformat() if chk.checked_in_at else None
+                )
+                e_dict["today_office_floor"] = chk.office_floor
+                e_dict["today_work_mode"] = chk.work_mode
+            else:
+                e_dict["today_checked_in_at"] = None
+                e_dict["today_office_floor"] = None
+                e_dict["today_work_mode"] = None
     
     # Convert dict values to a sorted list to match the original `items` order
     final_items = [emp_dict[e.id] for e in items]
+
     
     return {
         "items": final_items,

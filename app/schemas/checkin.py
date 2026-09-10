@@ -1,40 +1,79 @@
-
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator
 from datetime import date, datetime
 from typing import List, Optional, Union
 
 WORK_MODE_CHOICES = ["WFO", "WFH"]
 MOOD_CHOICES = ["great", "okay", "low", "stressed"]
+OFFICE_FLOOR_CHOICES = ["7", "9", "17"]
+LUNCH_PREFERENCE_CHOICES = ["order_tiffin", "canteen", "none"]
+TIFFIN_TYPE_CHOICES = ["full_meal", "no_rice", "dal_and_rice"]
 
 
 class CheckInCreate(BaseModel):
     work_mode: str
     project_ids: List[Union[int, str]] = Field(default_factory=list)
     mood: Optional[str] = None
+    office_floor: Optional[str] = None  # Required if work_mode is "WFO"
+    lunch_preference: Optional[str] = None  # Required if work_mode is "WFO"
+    tiffin_type: Optional[str] = None  # Required if lunch_preference is "order_tiffin"
 
-    @validator("work_mode")
+    @field_validator("work_mode")
+    @classmethod
     def validate_work_mode(cls, v):
         if v not in WORK_MODE_CHOICES:
             raise ValueError(f"work_mode must be one of: {', '.join(WORK_MODE_CHOICES)}")
         return v
 
-    @validator("project_ids")
+    @field_validator("project_ids")
+    @classmethod
     def validate_project_ids(cls, v):
         if not v:
             raise ValueError("Select at least one project you're working on today.")
         return v
 
-    @validator("mood")
+    @field_validator("mood")
+    @classmethod
     def validate_mood(cls, v):
         if v is not None and v not in MOOD_CHOICES:
             raise ValueError(f"mood must be one of: {', '.join(MOOD_CHOICES)}")
+        return v
+
+    @field_validator("office_floor")
+    @classmethod
+    def validate_office_floor(cls, v, info):
+        if info.data.get("work_mode") == "WFO":
+            if not v:
+                raise ValueError("Please select your office floor.")
+            if v not in OFFICE_FLOOR_CHOICES:
+                raise ValueError(f"office_floor must be one of: {', '.join(OFFICE_FLOOR_CHOICES)}")
+        return v
+
+    @field_validator("lunch_preference")
+    @classmethod
+    def validate_lunch_preference(cls, v, info):
+        if info.data.get("work_mode") == "WFO":
+            if not v:
+                raise ValueError("Please select your lunch preference.")
+            if v not in LUNCH_PREFERENCE_CHOICES:
+                raise ValueError(f"lunch_preference must be one of: {', '.join(LUNCH_PREFERENCE_CHOICES)}")
+        return v
+
+    @field_validator("tiffin_type")
+    @classmethod
+    def validate_tiffin_type(cls, v, info):
+        if info.data.get("lunch_preference") == "order_tiffin":
+            if not v:
+                raise ValueError("Please select your tiffin preference.")
+            if v not in TIFFIN_TYPE_CHOICES:
+                raise ValueError(f"tiffin_type must be one of: {', '.join(TIFFIN_TYPE_CHOICES)}")
         return v
 
 
 class CheckOutUpdate(BaseModel):
     mood: Optional[str] = None
 
-    @validator("mood")
+    @field_validator("mood")
+    @classmethod
     def validate_mood(cls, v):
         if v is not None and v not in MOOD_CHOICES:
             raise ValueError(f"mood must be one of: {', '.join(MOOD_CHOICES)}")
@@ -48,6 +87,9 @@ class CheckInResponse(BaseModel):
     work_mode: str
     project_ids: List[Union[int, str]] = []
     mood: Optional[str] = None
+    office_floor: Optional[str] = None
+    lunch_preference: Optional[str] = None
+    tiffin_type: Optional[str] = None
     checked_in_at: Optional[datetime] = None
     checked_out_at: Optional[datetime] = None
 
@@ -89,6 +131,9 @@ class TeamCheckInRow(BaseModel):
     checked_in: bool
     work_mode: Optional[str] = None
     mood: Optional[str] = None
+    office_floor: Optional[str] = None
+    lunch_preference: Optional[str] = None
+    tiffin_type: Optional[str] = None
     checked_in_at: Optional[datetime] = None
     checked_out_at: Optional[datetime] = None
     pm_confirmed_at: Optional[datetime] = None
@@ -116,12 +161,14 @@ class PaginatedTeamCheckIns(BaseModel):
 class ConfirmResult(BaseModel):
     confirmed: int
 
+
 class MatrixRow(BaseModel):
     employee_id: int
     name: str
     avatar_url: Optional[str] = None
     designation: Optional[str] = None
     checkins: dict  # {"1": {"time": "10:00", "mode": "WFO"}, ...}
+
 
 class MatrixResponse(BaseModel):
     month_year: str

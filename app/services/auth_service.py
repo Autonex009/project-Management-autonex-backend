@@ -114,6 +114,9 @@ def create_checkin_confirmation_token(
     checkin_date: str,
     expires_seconds: int = 90,
     expires_minutes: Optional[int] = None,
+    office_floor: Optional[str] = None,
+    lunch_preference: Optional[str] = None,
+    tiffin_type: Optional[str] = None,
 ) -> str:
     """Generates a signed JWT token carrying check-in details, initiator portal IP, and unique jti."""
     if expires_minutes is not None:
@@ -128,6 +131,9 @@ def create_checkin_confirmation_token(
         "work_mode": work_mode,
         "project_ids": project_ids,
         "mood": mood,
+        "office_floor": office_floor,
+        "lunch_preference": lunch_preference,
+        "tiffin_type": tiffin_type,
         "checkin_date": checkin_date,
         "jti": uuid.uuid4().hex,
         "exp": expire,

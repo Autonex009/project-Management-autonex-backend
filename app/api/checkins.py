@@ -146,6 +146,84 @@ def _get_scoped_project_ids(db: Session, user: User) -> set[int]:
     return scoped
 
 
+def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kpis: dict, scoped_project_ids=None):
+    import time
+    t0 = time.time()
+    total = base_query.count()
+    t1 = time.time()
+    results = base_query.order_by(Employee.name).offset((page - 1) * limit).limit(limit).all()
+    t2 = time.time()
+    
+    if not results:
+        return PaginatedTeamCheckIns(
+            total=total, page=page, limit=limit, items=[],
+            kpi_total=kpis.get("total", 0), kpi_checked_in=kpis.get("checked_in", 0), kpi_confirmed=kpis.get("confirmed", 0)
+        )
+        
+    emp_ids = [emp.id for emp, _ in results]
+    
+    allocs = db.query(Allocation, Project.name).join(Project, Allocation.sub_project_id == Project.id).filter(
+        Allocation.employee_id.in_(emp_ids), 
+        Allocation.is_active == True
+    ).all()
+    t3 = time.time()
+    
+    proj_map = {}
+    alloc_proj_ids = {}
+    for a, p_name in allocs:
+        proj_map.setdefault(a.employee_id, []).append(p_name)
+        alloc_proj_ids.setdefault(a.employee_id, set()).add(a.sub_project_id)
+        
+    all_proj = {p.id: p.name for p in db.query(Project.id, Project.name).all()}
+    t4 = time.time()
+    
+    items = []
+    for emp, chk in results:
+        alloc_pnames = proj_map.get(emp.id, [])
+        emp_alloc_pids = alloc_proj_ids.get(emp.id, set())
+        
+        is_officially_allocated = True
+        
+        if chk and chk.project_ids:
+            chk_pnames = [all_proj[pid] for pid in chk.project_ids if pid in all_proj]
+            if "other" in chk.project_ids:
+                chk_pnames.append("Other")
+            if scoped_project_ids is not None:
+                chk_pids = set(pid for pid in chk.project_ids if isinstance(pid, int))
+                overlap = chk_pids.intersection(scoped_project_ids)
+                if overlap and not overlap.intersection(emp_alloc_pids):
+                    is_officially_allocated = False
+        else:
+            chk_pnames = []
+            
+        pnames = list(set(alloc_pnames + chk_pnames))
+        
+        items.append(TeamCheckInRow(
+            employee_id=emp.id,
+            name=emp.name,
+            avatar_url=getattr(emp, "avatar_url", None),
+            designation=emp.designation,
+            project_names=pnames,
+            checked_in=chk is not None,
+            work_mode=chk.work_mode if chk else None,
+            mood=chk.mood if chk else None,
+            office_floor=chk.office_floor if chk else None,  # NEW
+            lunch_preference=chk.lunch_preference if chk else None,  # NEW
+            tiffin_type=chk.tiffin_type if chk else None,  # NEW
+            checked_in_at=chk.checked_in_at if chk else None,
+            checked_out_at=chk.checked_out_at if chk else None,
+            pm_confirmed_at=chk.pm_confirmed_at if chk else None,
+            is_officially_allocated=is_officially_allocated,
+        ))
+    t5 = time.time()
+    print(f"PROFILE build: count={t1-t0:.3f}s results={t2-t1:.3f}s allocs={t3-t2:.3f}s all_proj={t4-t3:.3f}s loop={t5-t4:.3f}s")
+        
+    return PaginatedTeamCheckIns(
+        total=total, page=page, limit=limit, items=items,
+        kpi_total=kpis.get("total", 0), kpi_checked_in=kpis.get("checked_in", 0), kpi_confirmed=kpis.get("confirmed", 0)
+    )
+
+
 @router.get("/today", response_model=TodayCheckInStatus)
 def get_today_status(
     response: Response,
@@ -238,6 +316,9 @@ def submit_checkin(
         work_mode=payload.work_mode,
         project_ids=payload.project_ids,
         mood=payload.mood,
+        office_floor=payload.office_floor,
+        lunch_preference=payload.lunch_preference,
+        tiffin_type=payload.tiffin_type,
         checked_in_at=_get_ist_now(),
     )
     db.add(checkin)
@@ -296,6 +377,9 @@ def request_checkin_confirmation(
             work_mode=payload.work_mode,
             project_ids=payload.project_ids,
             mood=payload.mood,
+            office_floor=payload.office_floor,
+            lunch_preference=payload.lunch_preference,
+            tiffin_type=payload.tiffin_type,
             checked_in_at=_get_ist_now(),
         )
         db.add(checkin)
@@ -316,6 +400,9 @@ def request_checkin_confirmation(
         mood=payload.mood,
         checkin_date=str(today),
         expires_seconds=90,
+        office_floor=payload.office_floor,
+        lunch_preference=payload.lunch_preference,
+        tiffin_type=payload.tiffin_type,
     )
 
     origin = http_request.headers.get("origin") or http_request.headers.get("referer") or ""
@@ -355,6 +442,9 @@ def request_checkin_confirmation(
             work_mode=payload.work_mode,
             project_ids=payload.project_ids,
             mood=payload.mood,
+            office_floor=payload.office_floor,
+            lunch_preference=payload.lunch_preference,
+            tiffin_type=payload.tiffin_type,
             checked_in_at=_get_ist_now(),
         )
         db.add(checkin)
@@ -473,6 +563,9 @@ def confirm_slack_checkin(
         work_mode=work_mode,
         project_ids=payload.get("project_ids", []),
         mood=payload.get("mood"),
+        office_floor=payload.get("office_floor"),
+        lunch_preference=payload.get("lunch_preference"),
+        tiffin_type=payload.get("tiffin_type"),
         checked_in_at=_get_ist_now(),
     )
     db.add(checkin)
@@ -511,82 +604,6 @@ def submit_checkout(
     db.commit()
     db.refresh(checkin)
     return checkin
-
-
-def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kpis: dict, scoped_project_ids=None):
-    import time
-    t0 = time.time()
-    total = base_query.count()
-    t1 = time.time()
-    results = base_query.order_by(Employee.name).offset((page - 1) * limit).limit(limit).all()
-    t2 = time.time()
-    
-    if not results:
-        return PaginatedTeamCheckIns(
-            total=total, page=page, limit=limit, items=[],
-            kpi_total=kpis.get("total", 0), kpi_checked_in=kpis.get("checked_in", 0), kpi_confirmed=kpis.get("confirmed", 0)
-        )
-        
-    emp_ids = [emp.id for emp, _ in results]
-    
-    allocs = db.query(Allocation, Project.name).join(Project, Allocation.sub_project_id == Project.id).filter(
-        Allocation.employee_id.in_(emp_ids), 
-        Allocation.is_active == True
-    ).all()
-    t3 = time.time()
-    
-    proj_map = {}
-    alloc_proj_ids = {}
-    for a, p_name in allocs:
-        proj_map.setdefault(a.employee_id, []).append(p_name)
-        alloc_proj_ids.setdefault(a.employee_id, set()).add(a.sub_project_id)
-        
-    all_proj = {p.id: p.name for p in db.query(Project.id, Project.name).all()}
-    t4 = time.time()
-    
-    items = []
-    for emp, chk in results:
-        alloc_pnames = proj_map.get(emp.id, [])
-        emp_alloc_pids = alloc_proj_ids.get(emp.id, set())
-        
-        is_officially_allocated = True
-        
-        if chk and chk.project_ids:
-            chk_pnames = [all_proj[pid] for pid in chk.project_ids if pid in all_proj]
-            if "other" in chk.project_ids:
-                chk_pnames.append("Other")
-            if scoped_project_ids is not None:
-                chk_pids = set(pid for pid in chk.project_ids if isinstance(pid, int))
-                overlap = chk_pids.intersection(scoped_project_ids)
-                if overlap and not overlap.intersection(emp_alloc_pids):
-                    is_officially_allocated = False
-        else:
-            chk_pnames = []
-            
-        pnames = list(set(alloc_pnames + chk_pnames))
-        
-        items.append(TeamCheckInRow(
-            employee_id=emp.id,
-            name=emp.name,
-            avatar_url=getattr(emp, "avatar_url", None),
-            designation=emp.designation,
-            project_names=pnames,
-            checked_in=chk is not None,
-            work_mode=chk.work_mode if chk else None,
-            mood=chk.mood if chk else None,
-            checked_in_at=chk.checked_in_at if chk else None,
-            checked_out_at=chk.checked_out_at if chk else None,
-            pm_confirmed_at=chk.pm_confirmed_at if chk else None,
-            is_officially_allocated=is_officially_allocated,
-        ))
-    t5 = time.time()
-    print(f"PROFILE build: count={t1-t0:.3f}s results={t2-t1:.3f}s allocs={t3-t2:.3f}s all_proj={t4-t3:.3f}s loop={t5-t4:.3f}s")
-        
-    return PaginatedTeamCheckIns(
-        total=total, page=page, limit=limit, items=items,
-        kpi_total=kpis.get("total", 0), kpi_checked_in=kpis.get("checked_in", 0), kpi_confirmed=kpis.get("confirmed", 0)
-    )
-
 
 @router.get("/team-today", response_model=PaginatedTeamCheckIns)
 def get_team_today(
