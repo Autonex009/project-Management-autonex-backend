@@ -384,4 +384,48 @@ def test_slack_oauth_callback_success(monkeypatch):
     assert mock_db.commit.called
 
 
+def test_slack_oauth_callback_extracts_sub_from_id_token(monkeypatch):
+    from app.api.checkins import slack_oauth_callback
+    from app.services.auth_service import create_checkin_confirmation_token
+    from jose import jwt
+
+    fake_id_token = jwt.encode({"sub": "U_EMPLOYEE_101", "aud": "client_123"}, "secret", algorithm="HS256")
+
+    token = create_checkin_confirmation_token(
+        employee_id=101,
+        portal_ip="38.20.140.122",
+        work_mode="WFO",
+        project_ids=[1],
+        mood="great",
+        checkin_date="2026-09-10",
+        office_floor="9",
+        lunch_preference="order_tiffin",
+        tiffin_type="full_meal",
+    )
+
+    # Mock exchange_slack_oauth_code returning only id_token and access_token (real Slack response)
+    monkeypatch.setattr(
+        "app.api.checkins.exchange_slack_oauth_code",
+        lambda code, redirect_uri: {"ok": True, "id_token": fake_id_token, "access_token": "xoxp-123"}
+    )
+
+    mock_db = MagicMock()
+    mock_employee = MagicMock(id=101, slack_user_id="U_EMPLOYEE_101")
+    def mock_query(model):
+        m = MagicMock()
+        if "DailyCheckIn" in str(model):
+            m.filter.return_value.first.return_value = None
+        else:
+            m.filter.return_value.first.return_value = mock_employee
+        return m
+    mock_db.query.side_effect = mock_query
+
+    req = MagicMock()
+    req.headers = {"x-forwarded-for": "38.20.140.122"}
+
+    resp = slack_oauth_callback(req, code="test_code", state=token, db=mock_db)
+    assert "checkin_result=success" in resp.headers["location"]
+    assert mock_db.add.called
+
+
 

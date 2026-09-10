@@ -85,6 +85,15 @@ def exchange_slack_oauth_code(code: str, redirect_uri: str) -> dict:
             body = json.loads(resp.read().decode("utf-8"))
             if not body.get("ok"):
                 logger.error("[slack_oauth] openid.connect.token error: %s", body)
+            else:
+                if "id_token" in body and not body.get("sub"):
+                    try:
+                        from jose import jwt
+                        claims = jwt.get_unverified_claims(body["id_token"])
+                        body["sub"] = claims.get("sub") or claims.get("https://slack.com/user_id")
+                        logger.info("[slack_oauth] Extracted sub '%s' from id_token", body.get("sub"))
+                    except Exception as exc:
+                        logger.warning("[slack_oauth] Failed to decode id_token: %s", exc)
             return body
     except Exception as exc:
         logger.error("[slack_oauth] openid.connect.token failed: %s", exc)

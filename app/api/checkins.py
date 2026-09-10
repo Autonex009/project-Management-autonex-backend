@@ -699,29 +699,29 @@ def slack_oauth_callback(
         return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=slack_exchange_failed")
 
     slack_sub = token_resp.get("sub")
-    slack_email = token_resp.get("email")
+    if not slack_sub and "id_token" in token_resp:
+        try:
+            from jose import jwt
+            claims = jwt.get_unverified_claims(token_resp["id_token"])
+            slack_sub = claims.get("sub") or claims.get("https://slack.com/user_id")
+        except Exception as exc:
+            logger.warning("[slack-oauth-callback] Failed to decode id_token: %s", exc)
 
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
         return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=employee_not_found")
 
-    is_match = False
-    if employee.slack_user_id and employee.slack_user_id == slack_sub:
-        is_match = True
-    elif employee.email and slack_email and employee.email.strip().lower() == slack_email.strip().lower():
-        is_match = True
-        if not employee.slack_user_id:
-            employee.slack_user_id = slack_sub
-            db.commit()
+    # If employee record does not have a cached slack_user_id, try to fetch it
+    if not employee.slack_user_id:
+        employee.slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
 
-    if not is_match:
+    # STRICT CHECK: Match ONLY on Slack user ID (no email check)
+    if not slack_sub or not employee.slack_user_id or employee.slack_user_id != slack_sub:
         logger.warning(
-            "[slack-oauth-callback] PROXY ATTEMPT: Authenticated Slack user (%s / %s) does not match employee %s (%s / %s)",
+            "[slack-oauth-callback] PROXY ATTEMPT: Authenticated Slack user ID '%s' does not match employee %s (expected slack_user_id='%s')",
             slack_sub,
-            slack_email,
             employee.id,
             employee.slack_user_id,
-            employee.email,
         )
         return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=account_mismatch")
 
