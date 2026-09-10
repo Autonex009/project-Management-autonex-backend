@@ -66,6 +66,81 @@ def create_password_reset_token(user_id: int, expires_delta: Optional[timedelta]
 def hash_reset_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
+import threading
+import time
+
+class TokenRevocationStore:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._burned_tokens: dict[str, float] = {}  # jti -> expiry_timestamp
+
+    def burn(self, jti: str, ttl_seconds: int = 300):
+        if not jti:
+            return
+        now = time.time()
+        with self._lock:
+            self._cleanup_locked(now)
+            self._burned_tokens[jti] = now + ttl_seconds
+
+    def is_burned(self, jti: str) -> bool:
+        if not jti:
+            return False
+        now = time.time()
+        with self._lock:
+            self._cleanup_locked(now)
+            return jti in self._burned_tokens
+
+    def _cleanup_locked(self, now: float):
+        expired = [k for k, exp in self._burned_tokens.items() if exp < now]
+        for k in expired:
+            del self._burned_tokens[k]
+
+_checkin_token_store = TokenRevocationStore()
+
+def burn_checkin_token(jti: str, ttl_seconds: int = 300):
+    """Mark a check-in token as consumed/invalidated immediately."""
+    _checkin_token_store.burn(jti, ttl_seconds)
+
+def is_checkin_token_burned(jti: str) -> bool:
+    """Check if a check-in token has already been consumed/burned."""
+    return _checkin_token_store.is_burned(jti)
+
+def create_checkin_confirmation_token(
+    employee_id: int,
+    portal_ip: str,
+    work_mode: str,
+    project_ids: list,
+    mood: Optional[str],
+    checkin_date: str,
+    expires_seconds: int = 90,
+    expires_minutes: Optional[int] = None,
+) -> str:
+    """Generates a signed JWT token carrying check-in details, initiator portal IP, and unique jti."""
+    if expires_minutes is not None:
+        delta = timedelta(minutes=expires_minutes)
+    else:
+        delta = timedelta(seconds=expires_seconds)
+    expire = datetime.utcnow() + delta
+    payload = {
+        "purpose": "checkin_confirmation",
+        "employee_id": employee_id,
+        "portal_ip": portal_ip,
+        "work_mode": work_mode,
+        "project_ids": project_ids,
+        "mood": mood,
+        "checkin_date": checkin_date,
+        "jti": uuid.uuid4().hex,
+        "exp": expire,
+    }
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_checkin_confirmation_token(token: str) -> dict:
+    """Decodes and validates a check-in confirmation JWT token."""
+    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    if payload.get("purpose") != "checkin_confirmation":
+        raise ValueError("Invalid token purpose")
+    return payload
+
 import secrets
 
 def create_refresh_token(user_id: int, db: Session, expires_days: int = 7) -> str:

@@ -61,9 +61,22 @@ class TodayCheckInStatus(BaseModel):
     checkin: Optional[CheckInResponse] = None
     project_options: List[dict] = []  # [{project_id, project_name}]
     suggested_work_mode: str = "WFO"  # "WFH" if an approved WFH request covers today
+    is_office_network: Optional[bool] = None
+    has_slack: bool = False
 
     class Config:
         from_attributes = True
+
+
+class CheckInConfirmationResponse(BaseModel):
+    status: str  # "completed" or "pending_slack"
+    message: str
+    checkin: Optional[CheckInResponse] = None
+    expires_in: Optional[int] = None  # seconds
+
+
+class SlackConfirmRequest(BaseModel):
+    token: str
 
 
 class TeamCheckInRow(BaseModel):

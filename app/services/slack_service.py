@@ -1557,3 +1557,137 @@ def try_overwrite_deleted_message(channel_id: str, ts: str):
         )
     except Exception as e:
         logger.error(f"Failed to overwrite deleted slack message: {e}")
+
+
+def send_checkin_confirmation_message(
+    *,
+    slack_user_id: str,
+    employee_name: str,
+    work_mode: str,
+    project_names: list[str],
+    portal_ip: str,
+    verification_url: str,
+    expires_seconds: int = 90,
+    employee_id: int | None = None,
+) -> bool:
+    """Send a daily check-in confirmation link/button to the employee via DM from Autonex-PMT-Bot."""
+    try:
+        channel_id = open_direct_message_channel(slack_user_id)
+        if not channel_id:
+            return False
+
+        proj_str = ", ".join(project_names) if project_names else "None specified"
+        blocks = [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": "📌 Daily Check-In Confirmation",
+                    "emoji": True,
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"Hi *{employee_name}*, a check-in request was initiated for your account.\n"
+                        f"Please confirm that this is you to complete your check-in."
+                    ),
+                },
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Work Mode:*\n`{work_mode}`"},
+                    {"type": "mrkdwn", "text": f"*Initiated From IP:*\n`{portal_ip}`"},
+                    {"type": "mrkdwn", "text": f"*Projects:*\n{proj_str}"},
+                    {"type": "mrkdwn", "text": f"*Valid For:*\n⏳ {expires_seconds}s (Single-Use)"},
+                ],
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {
+                            "type": "plain_text",
+                            "text": "✅ Confirm Check-In",
+                            "emoji": True,
+                        },
+                        "style": "primary",
+                        "url": verification_url,
+                        "action_id": "confirm_checkin_button",
+                    }
+                ],
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": (
+                            "🔒 *Single-Use & Network Match*: This link will be invalidated upon first access and expires in 90 seconds. "
+                            "You must open this from your own account and on the same Wi-Fi. *Do not forward this link.*"
+                        ),
+                    }
+                ],
+            },
+        ]
+
+        payload = {
+            "channel": channel_id,
+            "username": "Autonex-PMT-Bot",
+            "text": f"Daily Check-In Confirmation for {employee_name} ({work_mode})",
+            "blocks": blocks,
+        }
+
+        response = _slack_request("/chat.postMessage", payload)
+        if not response.get("ok"):
+            logger.error("Failed to send checkin confirmation DM to %s: %s", slack_user_id, response.get("error"))
+            return False
+
+        message_ts = response.get("ts")
+        if message_ts and employee_id is not None:
+            _latest_slack_checkin_messages[employee_id] = (channel_id, message_ts)
+
+        return True
+    except Exception as e:
+        logger.error("Exception sending checkin confirmation DM to %s: %s", slack_user_id, e)
+        return False
+
+
+_latest_slack_checkin_messages = {}
+
+
+def expire_slack_checkin_message(employee_id: int, employee_name: str = ""):
+    """Updates the Slack message to remove the button and mark the link expired/verified."""
+    if employee_id not in _latest_slack_checkin_messages:
+        return
+    channel_id, message_ts = _latest_slack_checkin_messages.pop(employee_id, (None, None))
+    if not channel_id or not message_ts:
+        return
+    try:
+        _slack_request(
+            "/chat.update",
+            {
+                "channel": channel_id,
+                "ts": message_ts,
+                "text": f"✅ Check-in verified for {employee_name}. Verification button deactivated.",
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"✅ *Check-In Verified & Recorded*\n"
+                                f"Attendance for *{employee_name}* is confirmed. The single-use verification link has been deactivated."
+                            ),
+                        },
+                    }
+                ],
+            },
+        )
+    except Exception as exc:
+        logger.warning("[slack_service] Could not update/expire Slack message: %s", exc)
+

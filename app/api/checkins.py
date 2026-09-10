@@ -1,11 +1,13 @@
 """Daily check-in/check-out API — attendance mode + today's project(s) + mood."""
+import os
+import ipaddress
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional, List
 from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response, Request
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -16,7 +18,19 @@ from app.models.wfh import WFHRequest
 from app.models.daily_checkin import DailyCheckIn
 from app.models.employee import Employee
 from app.models.user import User
-from app.services.auth_service import get_current_user, require_role
+from app.services.auth_service import (
+    get_current_user,
+    require_role,
+    create_checkin_confirmation_token,
+    decode_checkin_confirmation_token,
+    burn_checkin_token,
+    is_checkin_token_burned,
+)
+from app.services.slack_service import (
+    send_checkin_confirmation_message,
+    try_get_or_cache_employee_slack_user_id,
+    expire_slack_checkin_message,
+)
 from app.services.project_scope import can_act_on_project, has_full_access
 from app.schemas.checkin import (
     CheckInCreate,
@@ -26,12 +40,64 @@ from app.schemas.checkin import (
     TeamCheckInRow,
     PaginatedTeamCheckIns,
     ConfirmResult,
+    CheckInConfirmationResponse,
+    SlackConfirmRequest,
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/checkins", tags=["checkins"], dependencies=[Depends(get_current_user)])
+router = APIRouter(prefix="/api/checkins", tags=["checkins"])
 
 IST = ZoneInfo("Asia/Kolkata")
+
+DEFAULT_OFFICE_IPS = "38.20.140.122,103.54.189.22,27.0.150.66"
+
+
+def _get_office_ips() -> set[str]:
+    raw = os.getenv("OFFICE_IPS", DEFAULT_OFFICE_IPS)
+    return {ip.strip() for ip in raw.split(",") if ip.strip()}
+
+
+def _get_client_ip(request: Request) -> str:
+    """Extract client IP handling reverse proxies, Cloudflare, and direct connections."""
+    if not request:
+        return ""
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+def _is_office_ip(client_ip: str) -> bool:
+    """Verify if client IP matches authorized office public IPs or CIDR blocks."""
+    if os.getenv("BYPASS_OFFICE_IP_CHECK", "false").lower() in ("true", "1"):
+        return True
+    if not client_ip:
+        return False
+    office_ips = _get_office_ips()
+    if client_ip in office_ips:
+        return True
+    try:
+        ip_obj = ipaddress.ip_address(client_ip)
+        for allowed in office_ips:
+            try:
+                if "/" in allowed:
+                    if ip_obj in ipaddress.ip_network(allowed, strict=False):
+                        return True
+                else:
+                    if ip_obj == ipaddress.ip_address(allowed):
+                        return True
+            except ValueError:
+                continue
+    except ValueError:
+        pass
+    return False
+
 
 def _get_ist_today():
     return datetime.now(IST).date()
@@ -83,6 +149,7 @@ def _get_scoped_project_ids(db: Session, user: User) -> set[int]:
 @router.get("/today", response_model=TodayCheckInStatus)
 def get_today_status(
     response: Response,
+    http_request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -116,17 +183,28 @@ def get_today_status(
         .first()
     )
 
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    slack_id = employee.slack_user_id if employee else None
+    if not slack_id and employee:
+        slack_id = try_get_or_cache_employee_slack_user_id(db, employee)
+
+    client_ip = _get_client_ip(http_request)
+    is_office = _is_office_ip(client_ip)
+
     return TodayCheckInStatus(
         already_checked_in=existing is not None,
         checkin=existing,
         project_options=project_options,
         suggested_work_mode="WFH" if approved_wfh_today else "WFO",
+        is_office_network=is_office,
+        has_slack=bool(slack_id),
     )
 
 
 @router.post("", response_model=CheckInResponse)
 def submit_checkin(
     payload: CheckInCreate,
+    http_request: Request,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -141,6 +219,19 @@ def submit_checkin(
     if existing:
         raise HTTPException(status_code=400, detail="You've already checked in today.")
 
+    if payload.work_mode == "WFO":
+        client_ip = _get_client_ip(http_request)
+        if not _is_office_ip(client_ip):
+            logger.warning(
+                "[checkin] Blocked WFO check-in for employee_id=%s from non-office IP '%s'",
+                employee_id,
+                client_ip,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Please connect to the office Wi-Fi or disconnect VPN service.",
+            )
+
     checkin = DailyCheckIn(
         employee_id=employee_id,
         checkin_date=today,
@@ -152,6 +243,246 @@ def submit_checkin(
     db.add(checkin)
     db.commit()
     db.refresh(checkin)
+    return checkin
+
+
+@router.post("/request-confirmation", response_model=CheckInConfirmationResponse)
+def request_checkin_confirmation(
+    payload: CheckInCreate,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Initiate check-in. If employee has Slack, send confirmation link to Slack DM. Otherwise check in automatically."""
+    employee_id = _require_employee(current_user)
+    today = _get_ist_today()
+
+    existing = (
+        db.query(DailyCheckIn)
+        .filter(DailyCheckIn.employee_id == employee_id, DailyCheckIn.checkin_date == today)
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="You've already checked in today.")
+
+    portal_ip = _get_client_ip(http_request)
+
+    if payload.work_mode == "WFO":
+        if not _is_office_ip(portal_ip):
+            logger.warning(
+                "[checkin] Blocked WFO request-confirmation for employee_id=%s from non-office IP '%s'",
+                employee_id,
+                portal_ip,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Please connect to the office Wi-Fi or disconnect VPN service.",
+            )
+
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee record not found.")
+
+    slack_id = employee.slack_user_id
+    if not slack_id:
+        slack_id = try_get_or_cache_employee_slack_user_id(db, employee)
+
+    # If employee does not have a Slack ID, check them in automatically!
+    if not slack_id:
+        logger.info("[checkin] Employee %s has no Slack ID; checking in automatically.", employee_id)
+        checkin = DailyCheckIn(
+            employee_id=employee_id,
+            checkin_date=today,
+            work_mode=payload.work_mode,
+            project_ids=payload.project_ids,
+            mood=payload.mood,
+            checked_in_at=_get_ist_now(),
+        )
+        db.add(checkin)
+        db.commit()
+        db.refresh(checkin)
+        return CheckInConfirmationResponse(
+            status="completed",
+            message="Checked in successfully!",
+            checkin=checkin,
+        )
+
+    # Generate signed JWT confirmation token (90 seconds expiry)
+    token = create_checkin_confirmation_token(
+        employee_id=employee_id,
+        portal_ip=portal_ip,
+        work_mode=payload.work_mode,
+        project_ids=payload.project_ids,
+        mood=payload.mood,
+        checkin_date=str(today),
+        expires_seconds=90,
+    )
+
+    origin = http_request.headers.get("origin") or http_request.headers.get("referer") or ""
+    if origin:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+    else:
+        base_url = (os.getenv("FRONTEND_URL") or "http://localhost:5173").strip().rstrip("/")
+
+    verification_url = f"{base_url}/verify-checkin?token={token}"
+
+    proj_names = []
+    if payload.project_ids:
+        projs = db.query(Project).filter(Project.id.in_(payload.project_ids)).all()
+        proj_names = [p.name for p in projs]
+
+    sent = send_checkin_confirmation_message(
+        slack_user_id=slack_id,
+        employee_name=employee.name,
+        work_mode=payload.work_mode,
+        project_names=proj_names,
+        portal_ip=portal_ip,
+        verification_url=verification_url,
+        expires_seconds=90,
+        employee_id=employee_id,
+    )
+
+    if not sent:
+        logger.warning(
+            "[checkin] Slack message failed for employee_id=%s. Checking in automatically as fallback.",
+            employee_id,
+        )
+        checkin = DailyCheckIn(
+            employee_id=employee_id,
+            checkin_date=today,
+            work_mode=payload.work_mode,
+            project_ids=payload.project_ids,
+            mood=payload.mood,
+            checked_in_at=_get_ist_now(),
+        )
+        db.add(checkin)
+        db.commit()
+        db.refresh(checkin)
+        return CheckInConfirmationResponse(
+            status="completed",
+            message="Slack message could not be sent. Checked in automatically!",
+            checkin=checkin,
+        )
+
+    return CheckInConfirmationResponse(
+        status="pending_slack",
+        message="Confirmation link sent to your Slack DM. Please click it within 90 seconds to complete check-in.",
+        expires_in=90,
+    )
+
+
+@router.post("/confirm-slack", response_model=CheckInResponse)
+def confirm_slack_checkin(
+    req: SlackConfirmRequest,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Validates Slack confirmation token, single-use burn, user identity, IP matching, and finalizes check-in."""
+    try:
+        payload = decode_checkin_confirmation_token(req.token)
+    except Exception as exc:
+        logger.warning("[checkin/confirm-slack] Invalid or expired token: %s", exc)
+        raise HTTPException(
+            status_code=400,
+            detail="Confirmation link is invalid or expired. Please initiate a new check-in from the portal.",
+        )
+
+    # Verify that the logged-in user matches the employee for whom the token was issued
+    user_employee_id = _require_employee(current_user)
+    employee_id = payload.get("employee_id")
+    if user_employee_id != employee_id:
+        logger.warning(
+            "[checkin/confirm-slack] Account mismatch: current_user.employee_id=%s != token.employee_id=%s",
+            user_employee_id,
+            employee_id,
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="Account mismatch: This verification link was generated for another employee. You cannot verify someone else's check-in.",
+        )
+
+    from datetime import date
+    checkin_date_str = payload.get("checkin_date")
+    today = date.fromisoformat(checkin_date_str) if checkin_date_str else _get_ist_today()
+
+    # If the user is already checked in for today, return existing record idempotently
+    existing = (
+        db.query(DailyCheckIn)
+        .filter(DailyCheckIn.employee_id == employee_id, DailyCheckIn.checkin_date == today)
+        .first()
+    )
+    if existing:
+        return existing
+
+    jti = payload.get("jti")
+    if not jti or is_checkin_token_burned(jti):
+        logger.warning("[checkin/confirm-slack] Token already burned / used: jti=%s", jti)
+        raise HTTPException(
+            status_code=400,
+            detail="This confirmation link has already been used or invalidated. Please request a new confirmation link from the portal.",
+        )
+
+    # Immediately burn the token so that any concurrent or subsequent requests are blocked
+    burn_checkin_token(jti)
+
+    portal_ip = payload.get("portal_ip")
+    click_ip = _get_client_ip(http_request)
+    work_mode = payload.get("work_mode")
+
+    logger.info(
+        "[checkin/confirm-slack] Verifying check-in for employee_id=%s. portal_ip=%s, click_ip=%s",
+        employee_id,
+        portal_ip,
+        click_ip,
+    )
+
+    # ONLY check in when both IPs match
+    if portal_ip and click_ip != portal_ip:
+        logger.warning(
+            "[checkin/confirm-slack] IP MISMATCH for employee_id=%s: portal_ip '%s' != click_ip '%s'",
+            employee_id,
+            portal_ip,
+            click_ip,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"IP mismatch: Check-in was requested from IP {portal_ip}, but confirmation was clicked from IP {click_ip}. "
+                "Both actions must be performed from the same Wi-Fi / IP network."
+            ),
+        )
+
+    # For WFO, click_ip must also be an authorized office IP
+    if work_mode == "WFO" and not _is_office_ip(click_ip):
+        logger.warning(
+            "[checkin/confirm-slack] Blocked WFO confirm for employee_id=%s: click_ip '%s' not in office IPs",
+            employee_id,
+            click_ip,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="Please connect to the office Wi-Fi or disconnect VPN service.",
+        )
+
+    checkin = DailyCheckIn(
+        employee_id=employee_id,
+        checkin_date=today,
+        work_mode=work_mode,
+        project_ids=payload.get("project_ids", []),
+        mood=payload.get("mood"),
+        checked_in_at=_get_ist_now(),
+    )
+    db.add(checkin)
+    db.commit()
+    db.refresh(checkin)
+
+    # Deactivate the Slack message so the button is removed and cannot be reused
+    expire_slack_checkin_message(employee_id, getattr(current_user, "name", ""))
+
+    logger.info("[checkin/confirm-slack] Check-in successfully recorded for employee_id=%s", employee_id)
     return checkin
 
 
