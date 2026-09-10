@@ -548,11 +548,28 @@ def list_employees_paginated(
         hierarchy_sub_projects = db.query(HierarchySubProject).filter(HierarchySubProject.id.in_(hsp_ids)).all()
         hsp_by_id = {hsp.id: hsp for hsp in hierarchy_sub_projects}
         
-        manager_emp_ids = list(set(
-            [mp.program_manager_id for mp in main_projects if mp.program_manager_id] +
-            [hsp.pm_id for hsp in hierarchy_sub_projects if hsp.pm_id]
-        ))
-        managers = db.query(Employee).filter(Employee.id.in_(manager_emp_ids)).all()
+        manager_emp_ids = set()
+        for mp in main_projects:
+            if getattr(mp, "program_manager_ids", None):
+                for pm_id in mp.program_manager_ids:
+                    try:
+                        manager_emp_ids.add(int(pm_id))
+                    except (TypeError, ValueError):
+                        pass
+            elif getattr(mp, "program_manager_id", None):
+                manager_emp_ids.add(mp.program_manager_id)
+        for hsp in hierarchy_sub_projects:
+            if getattr(hsp, "pm_id", None):
+                manager_emp_ids.add(hsp.pm_id)
+        for ds in daily_sheets:
+            if getattr(ds, "assigned_employee_ids", None):
+                for pm_id in ds.assigned_employee_ids:
+                    try:
+                        manager_emp_ids.add(int(pm_id))
+                    except (TypeError, ValueError):
+                        pass
+                
+        managers = db.query(Employee).filter(Employee.id.in_(list(manager_emp_ids))).all()
         manager_by_id = {m.id: m for m in managers}
         
         for alloc in allocations:
@@ -560,22 +577,41 @@ def list_employees_paginated(
             if not ds: continue
             
             proj_name = ds.name
-            pm_name = None
+            pm_names = []
             
-            if ds.main_project_id:
+            # 1. Project-level assignment wins (Daily Sheet)
+            if getattr(ds, "assigned_employee_ids", None):
+                for pm_id in ds.assigned_employee_ids:
+                    try:
+                        m = manager_by_id.get(int(pm_id))
+                        if m: pm_names.append(m.name)
+                    except (TypeError, ValueError):
+                        pass
+                        
+            # 2. Main Project PM
+            if not pm_names and ds.main_project_id:
                 mp = mp_by_id.get(ds.main_project_id)
-                if mp and mp.program_manager_id:
-                    m = manager_by_id.get(mp.program_manager_id)
-                    if m: pm_name = m.name
+                if mp:
+                    if getattr(mp, "program_manager_ids", None):
+                        for pm_id in mp.program_manager_ids:
+                            try:
+                                m = manager_by_id.get(int(pm_id))
+                                if m: pm_names.append(m.name)
+                            except (TypeError, ValueError):
+                                pass
+                    elif getattr(mp, "program_manager_id", None):
+                        m = manager_by_id.get(mp.program_manager_id)
+                        if m: pm_names.append(m.name)
             
-            if not pm_name and ds.sub_project_id:
+            # 3. Intermediate Sub Project PM
+            if not pm_names and ds.sub_project_id:
                 hsp = hsp_by_id.get(ds.sub_project_id)
-                if hsp and hsp.pm_id:
+                if hsp and getattr(hsp, "pm_id", None):
                     m = manager_by_id.get(hsp.pm_id)
-                    if m: pm_name = m.name
+                    if m: pm_names.append(m.name)
                     
-            if not pm_name:
-                pm_name = "Unassigned"
+            if not pm_names:
+                pm_names = ["Unassigned"]
                 
             e_dict = emp_dict[alloc.employee_id]
             if "assigned_projects" not in e_dict or not e_dict["assigned_projects"]:
@@ -585,8 +621,19 @@ def list_employees_paginated(
                 
             if "managers" not in e_dict or not e_dict["managers"]:
                 e_dict["managers"] = []
-            if pm_name not in e_dict["managers"]:
-                e_dict["managers"].append(pm_name)
+            for pm_name in pm_names:
+                if pm_name not in e_dict["managers"]:
+                    e_dict["managers"].append(pm_name)
+
+        active_admins = db.query(Employee).filter(Employee.designation.ilike('Admin'), Employee.status == 'active').all()
+        admin_names = [a.name for a in active_admins]
+
+        for eid, e_dict in emp_dict.items():
+            desig = (e_dict.get("designation") or "").lower()
+            if desig in ("admin", "hr"):
+                e_dict["managers"] = []
+            elif "program manager" in desig or desig == "pm":
+                e_dict["managers"] = admin_names.copy()
 
     
         # ── Today's check-in (time + floor) for the visible page only ────────────
