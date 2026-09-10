@@ -297,7 +297,7 @@ def test_slack_oauth_callback_blocks_non_office_ip():
 
     token = create_checkin_confirmation_token(
         employee_id=101,
-        portal_ip="38.20.140.122",
+        portal_ip="198.51.100.99",
         work_mode="WFO",
         project_ids=[1],
         mood="great",
@@ -426,6 +426,29 @@ def test_slack_oauth_callback_extracts_sub_from_id_token(monkeypatch):
     resp = slack_oauth_callback(req, code="test_code", state=token, db=mock_db)
     assert "checkin_result=success" in resp.headers["location"]
     assert mock_db.add.called
+
+
+def test_slack_oauth_callback_detects_ip_mismatch():
+    from app.api.checkins import slack_oauth_callback
+    from app.services.auth_service import create_checkin_confirmation_token
+
+    # Token initiated from office IP 1
+    token = create_checkin_confirmation_token(
+        employee_id=101,
+        portal_ip="38.20.140.122",
+        work_mode="WFO",
+        project_ids=[1],
+        mood="great",
+        checkin_date="2026-09-10",
+    )
+
+    # Callback redirected from different IP (e.g. office IP 2 or other network)
+    req = MagicMock()
+    req.headers = {"x-forwarded-for": "103.54.189.22"}  # different IP
+    mock_db = MagicMock()
+
+    resp = slack_oauth_callback(req, code="test_code", state=token, db=mock_db)
+    assert "checkin_error=ip_mismatch" in resp.headers["location"]
 
 
 

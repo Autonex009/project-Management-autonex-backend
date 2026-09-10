@@ -680,8 +680,19 @@ def slack_oauth_callback(
     from datetime import date
     today = date.fromisoformat(checkin_date_str) if checkin_date_str else _get_ist_today()
 
+    portal_ip = payload.get("portal_ip")
     client_ip = _get_client_ip(request)
-    logger.info("[slack-oauth-callback] Callback received from client_ip=%s for employee_id=%s, work_mode=%s", client_ip, employee_id, work_mode)
+    logger.info("[slack-oauth-callback] Callback received: portal_ip=%s, client_ip=%s, employee_id=%s, work_mode=%s", portal_ip, client_ip, employee_id, work_mode)
+
+    # STRICT CHECK: Confirmation must originate from the exact same network as initiation
+    if portal_ip and client_ip != portal_ip:
+        logger.warning(
+            "[slack-oauth-callback] IP MISMATCH for employee_id=%s: portal_ip '%s' != client_ip '%s'",
+            employee_id,
+            portal_ip,
+            client_ip,
+        )
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=ip_mismatch&portal_ip={portal_ip}&client_ip={client_ip}")
 
     if work_mode == "WFO" and not _is_office_ip(client_ip):
         logger.warning("[slack-oauth-callback] Blocked WFO checkin from non-office IP '%s' for employee_id=%s", client_ip, employee_id)
