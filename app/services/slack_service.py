@@ -21,6 +21,76 @@ def get_slack_signing_secret() -> str | None:
     return os.getenv("SLACK_SIGNING_SECRET")
 
 
+def get_slack_client_id() -> str | None:
+    val = os.getenv("SLACK_CLIENT_ID")
+    return val.strip().replace('"', '') if val else None
+
+
+def get_slack_client_secret() -> str | None:
+    val = os.getenv("SLACK_CLIENT_SECRET")
+    return val.strip().replace('"', '') if val else None
+
+
+def get_slack_oauth_redirect_uri(request=None) -> str:
+    override = os.getenv("SLACK_OAUTH_REDIRECT_URI")
+    if override and override.strip():
+        return override.strip().replace('"', '')
+
+    if request:
+        proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+        host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+        if host:
+            return f"{proto}://{host}/api/checkins/slack-oauth-callback"
+
+    backend_url = (os.getenv("BACKEND_URL") or os.getenv("APP_URL") or "http://localhost:8000").strip()
+    backend_url = backend_url.replace("\\n", "").replace("\n", "").replace('"', '').rstrip("/")
+    return f"{backend_url}/api/checkins/slack-oauth-callback"
+
+
+def build_slack_oauth_authorize_url(state: str, redirect_uri: str) -> str:
+    client_id = get_slack_client_id()
+    if not client_id:
+        raise RuntimeError("SLACK_CLIENT_ID is not configured in backend environment")
+
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "scope": "openid profile email",
+        "redirect_uri": redirect_uri,
+        "state": state,
+    }
+    return f"https://slack.com/openid/connect/authorize?{urlencode(params)}"
+
+
+def exchange_slack_oauth_code(code: str, redirect_uri: str) -> dict:
+    client_id = get_slack_client_id()
+    client_secret = get_slack_client_secret()
+    if not client_id or not client_secret:
+        raise RuntimeError("SLACK_CLIENT_ID or SLACK_CLIENT_SECRET is missing")
+
+    url = f"{SLACK_API_BASE}/openid.connect.token"
+    payload = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code.strip(),
+        "redirect_uri": redirect_uri.strip(),
+    }
+    data = urlencode(payload).encode("utf-8")
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    req = Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+            if not body.get("ok"):
+                logger.error("[slack_oauth] openid.connect.token error: %s", body)
+            return body
+    except Exception as exc:
+        logger.error("[slack_oauth] openid.connect.token failed: %s", exc)
+        raise RuntimeError(f"Failed to exchange Slack OAuth code: {exc}") from exc
+
+
 def _slack_request(path: str, payload: dict | None = None, method: str = "POST", use_json: bool = True) -> dict:
     token = _get_bot_token()
     if not token:

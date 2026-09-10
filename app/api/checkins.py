@@ -8,6 +8,7 @@ from typing import Optional, List
 from pydantic import BaseModel
 
 from fastapi import APIRouter, Depends, HTTPException, Response, Request
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -30,6 +31,9 @@ from app.services.slack_service import (
     send_checkin_confirmation_message,
     try_get_or_cache_employee_slack_user_id,
     expire_slack_checkin_message,
+    get_slack_oauth_redirect_uri,
+    build_slack_oauth_authorize_url,
+    exchange_slack_oauth_code,
 )
 from app.services.project_scope import can_act_on_project, has_full_access
 from app.schemas.checkin import (
@@ -42,6 +46,7 @@ from app.schemas.checkin import (
     ConfirmResult,
     CheckInConfirmationResponse,
     SlackConfirmRequest,
+    SlackOAuthRequestResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -577,6 +582,174 @@ def confirm_slack_checkin(
 
     logger.info("[checkin/confirm-slack] Check-in successfully recorded for employee_id=%s", employee_id)
     return checkin
+
+
+@router.post("/request-slack-oauth", response_model=SlackOAuthRequestResponse)
+def request_slack_oauth(
+    payload: CheckInCreate,
+    http_request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Initiates check-in via Slack OpenID Connect (OAuth 2.0)."""
+    employee_id = _require_employee(current_user)
+    today = _get_ist_today()
+
+    existing = (
+        db.query(DailyCheckIn)
+        .filter(DailyCheckIn.employee_id == employee_id, DailyCheckIn.checkin_date == today)
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="You've already checked in today.")
+
+    portal_ip = _get_client_ip(http_request)
+
+    if payload.work_mode == "WFO":
+        if not _is_office_ip(portal_ip):
+            logger.warning(
+                "[checkin] Blocked WFO request-slack-oauth for employee_id=%s from non-office IP '%s'",
+                employee_id,
+                portal_ip,
+            )
+            raise HTTPException(
+                status_code=400,
+                detail="Please connect to the office Wi-Fi or disconnect VPN service.",
+            )
+
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee record not found.")
+
+    # Generate signed JWT confirmation token (3 minutes expiry)
+    token = create_checkin_confirmation_token(
+        employee_id=employee_id,
+        portal_ip=portal_ip,
+        work_mode=payload.work_mode,
+        project_ids=payload.project_ids,
+        mood=payload.mood,
+        checkin_date=str(today),
+        expires_seconds=180,
+        office_floor=payload.office_floor,
+        lunch_preference=payload.lunch_preference,
+        tiffin_type=payload.tiffin_type,
+    )
+
+    redirect_uri = get_slack_oauth_redirect_uri(http_request)
+    oauth_url = build_slack_oauth_authorize_url(state=token, redirect_uri=redirect_uri)
+
+    logger.info("[checkin] Generated Slack OAuth authorize URL for employee_id=%s, redirect_uri=%s", employee_id, redirect_uri)
+    return SlackOAuthRequestResponse(oauth_url=oauth_url)
+
+
+@router.get("/slack-oauth-callback")
+def slack_oauth_callback(
+    request: Request,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Callback endpoint redirected from Slack OpenID Connect authorization."""
+    frontend_url = (os.getenv("FRONTEND_URL") or os.getenv("APP_URL") or "http://localhost:5173").strip()
+    frontend_url = frontend_url.replace("\\n", "").replace("\n", "").replace('"', '').rstrip("/")
+
+    if error:
+        logger.warning("[slack-oauth-callback] Slack returned error: %s - %s", error, error_description)
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=slack_access_denied")
+
+    if not code or not state:
+        logger.warning("[slack-oauth-callback] Missing code or state")
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=invalid_request")
+
+    try:
+        payload = decode_checkin_confirmation_token(state)
+    except Exception as exc:
+        logger.warning("[slack-oauth-callback] Invalid or expired token: %s", exc)
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=token_expired")
+
+    jti = payload.get("jti")
+    if not jti or is_checkin_token_burned(jti):
+        logger.warning("[slack-oauth-callback] Token already burned: jti=%s", jti)
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=token_already_used")
+
+    employee_id = payload.get("employee_id")
+    work_mode = payload.get("work_mode")
+    checkin_date_str = payload.get("checkin_date")
+    from datetime import date
+    today = date.fromisoformat(checkin_date_str) if checkin_date_str else _get_ist_today()
+
+    client_ip = _get_client_ip(request)
+    logger.info("[slack-oauth-callback] Callback received from client_ip=%s for employee_id=%s, work_mode=%s", client_ip, employee_id, work_mode)
+
+    if work_mode == "WFO" and not _is_office_ip(client_ip):
+        logger.warning("[slack-oauth-callback] Blocked WFO checkin from non-office IP '%s' for employee_id=%s", client_ip, employee_id)
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=office_ip_required&ip={client_ip}")
+
+    redirect_uri = get_slack_oauth_redirect_uri(request)
+    try:
+        token_resp = exchange_slack_oauth_code(code=code, redirect_uri=redirect_uri)
+    except Exception as exc:
+        logger.error("[slack-oauth-callback] Token exchange error: %s", exc)
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=slack_exchange_failed")
+
+    if not token_resp.get("ok"):
+        logger.error("[slack-oauth-callback] Slack returned not ok: %s", token_resp)
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=slack_exchange_failed")
+
+    slack_sub = token_resp.get("sub")
+    slack_email = token_resp.get("email")
+
+    employee = db.query(Employee).filter(Employee.id == employee_id).first()
+    if not employee:
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=employee_not_found")
+
+    is_match = False
+    if employee.slack_user_id and employee.slack_user_id == slack_sub:
+        is_match = True
+    elif employee.email and slack_email and employee.email.strip().lower() == slack_email.strip().lower():
+        is_match = True
+        if not employee.slack_user_id:
+            employee.slack_user_id = slack_sub
+            db.commit()
+
+    if not is_match:
+        logger.warning(
+            "[slack-oauth-callback] PROXY ATTEMPT: Authenticated Slack user (%s / %s) does not match employee %s (%s / %s)",
+            slack_sub,
+            slack_email,
+            employee.id,
+            employee.slack_user_id,
+            employee.email,
+        )
+        return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=account_mismatch")
+
+    burn_checkin_token(jti)
+
+    existing = (
+        db.query(DailyCheckIn)
+        .filter(DailyCheckIn.employee_id == employee_id, DailyCheckIn.checkin_date == today)
+        .first()
+    )
+    if not existing:
+        checkin = DailyCheckIn(
+            employee_id=employee_id,
+            checkin_date=today,
+            work_mode=work_mode,
+            project_ids=payload.get("project_ids", []),
+            mood=payload.get("mood"),
+            office_floor=payload.get("office_floor"),
+            lunch_preference=payload.get("lunch_preference"),
+            tiffin_type=payload.get("tiffin_type"),
+            checked_in_at=_get_ist_now(),
+        )
+        db.add(checkin)
+        db.commit()
+        db.refresh(checkin)
+
+    logger.info("[slack-oauth-callback] Successfully checked in employee_id=%s via Slack OAuth!", employee_id)
+    return RedirectResponse(f"{frontend_url}/dashboard?checkin_result=success")
 
 
 @router.post("/checkout", response_model=CheckInResponse)

@@ -121,6 +121,10 @@ class SlackConfirmRequest(BaseModel):
     token: str
 
 
+class SlackOAuthRequestResponse(BaseModel):
+    oauth_url: str
+
+
 class TeamCheckInRow(BaseModel):
     """One employee's today-status on a PM/lead's roster view."""
     employee_id: int

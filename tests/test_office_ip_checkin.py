@@ -245,3 +245,143 @@ def test_request_confirmation_auto_checkin_without_slack():
     assert res.checkin is not None
 
 
+def test_request_slack_oauth_blocks_non_office_ip():
+    from app.api.checkins import request_slack_oauth
+    from app.schemas.checkin import CheckInCreate
+    from fastapi import HTTPException
+
+    mock_db = MagicMock()
+    mock_db.query.return_value.filter.return_value.first.return_value = None
+    mock_user = MagicMock(employee_id=101)
+
+    req = MagicMock()
+    req.headers = {"x-forwarded-for": "198.51.100.99"}
+    payload = CheckInCreate(work_mode="WFO", project_ids=[1], mood="great", office_floor="7", lunch_preference="none")
+
+    with pytest.raises(HTTPException) as exc_info:
+        request_slack_oauth(payload, req, mock_db, mock_user)
+
+    assert exc_info.value.status_code == 400
+    assert "office Wi-Fi" in exc_info.value.detail
+
+
+def test_request_slack_oauth_success():
+    from app.api.checkins import request_slack_oauth
+    from app.schemas.checkin import CheckInCreate
+
+    mock_db = MagicMock()
+    mock_db.query.return_value.filter.return_value.first.return_value = MagicMock(id=101, slack_user_id="U101")
+    # For daily checkin existing check
+    def mock_query(model):
+        m = MagicMock()
+        if "DailyCheckIn" in str(model):
+            m.filter.return_value.first.return_value = None
+        else:
+            m.filter.return_value.first.return_value = MagicMock(id=101, slack_user_id="U101")
+        return m
+    mock_db.query.side_effect = mock_query
+    mock_user = MagicMock(employee_id=101)
+
+    req = MagicMock()
+    req.headers = {"x-forwarded-for": "38.20.140.122"}
+    payload = CheckInCreate(work_mode="WFO", project_ids=[1], mood="great", office_floor="7", lunch_preference="none")
+
+    res = request_slack_oauth(payload, req, mock_db, mock_user)
+    assert "slack.com/openid/connect/authorize" in res.oauth_url
+    assert "state=" in res.oauth_url
+
+
+def test_slack_oauth_callback_blocks_non_office_ip():
+    from app.api.checkins import slack_oauth_callback
+    from app.services.auth_service import create_checkin_confirmation_token
+
+    token = create_checkin_confirmation_token(
+        employee_id=101,
+        portal_ip="38.20.140.122",
+        work_mode="WFO",
+        project_ids=[1],
+        mood="great",
+        checkin_date="2026-09-10",
+    )
+
+    req = MagicMock()
+    req.headers = {"x-forwarded-for": "198.51.100.99"}  # non-office IP
+    mock_db = MagicMock()
+
+    resp = slack_oauth_callback(req, code="test_code", state=token, db=mock_db)
+    assert "checkin_error=office_ip_required" in resp.headers["location"]
+
+
+def test_slack_oauth_callback_detects_proxy_mismatch(monkeypatch):
+    from app.api.checkins import slack_oauth_callback
+    from app.services.auth_service import create_checkin_confirmation_token
+
+    token = create_checkin_confirmation_token(
+        employee_id=101,
+        portal_ip="38.20.140.122",
+        work_mode="WFO",
+        project_ids=[1],
+        mood="great",
+        checkin_date="2026-09-10",
+    )
+
+    # Mock exchange_slack_oauth_code returning Colleague's Slack account
+    monkeypatch.setattr(
+        "app.api.checkins.exchange_slack_oauth_code",
+        lambda code, redirect_uri: {"ok": True, "sub": "U_COLLEAGUE_999", "email": "colleague@autonex.com"}
+    )
+
+    mock_db = MagicMock()
+    mock_employee = MagicMock(id=101, slack_user_id="U_EMPLOYEE_101", email="emp101@autonex.com")
+    mock_db.query.return_value.filter.return_value.first.return_value = mock_employee
+
+    req = MagicMock()
+    req.headers = {"x-forwarded-for": "38.20.140.122"}
+
+    resp = slack_oauth_callback(req, code="test_code", state=token, db=mock_db)
+    assert "checkin_error=account_mismatch" in resp.headers["location"]
+
+
+def test_slack_oauth_callback_success(monkeypatch):
+    from app.api.checkins import slack_oauth_callback
+    from app.services.auth_service import create_checkin_confirmation_token
+
+    token = create_checkin_confirmation_token(
+        employee_id=101,
+        portal_ip="38.20.140.122",
+        work_mode="WFO",
+        project_ids=[1],
+        mood="great",
+        checkin_date="2026-09-10",
+        office_floor="9",
+        lunch_preference="order_tiffin",
+        tiffin_type="full_meal",
+    )
+
+    # Mock exchange_slack_oauth_code returning legitimate Employee's Slack account
+    monkeypatch.setattr(
+        "app.api.checkins.exchange_slack_oauth_code",
+        lambda code, redirect_uri: {"ok": True, "sub": "U_EMPLOYEE_101", "email": "emp101@autonex.com"}
+    )
+
+    mock_db = MagicMock()
+    mock_employee = MagicMock(id=101, slack_user_id="U_EMPLOYEE_101", email="emp101@autonex.com")
+    def mock_query(model):
+        m = MagicMock()
+        if "DailyCheckIn" in str(model):
+            m.filter.return_value.first.return_value = None
+        else:
+            m.filter.return_value.first.return_value = mock_employee
+        return m
+    mock_db.query.side_effect = mock_query
+
+    req = MagicMock()
+    req.headers = {"x-forwarded-for": "38.20.140.122"}
+
+    resp = slack_oauth_callback(req, code="test_code", state=token, db=mock_db)
+    assert "checkin_result=success" in resp.headers["location"]
+    assert mock_db.add.called
+    assert mock_db.commit.called
+
+
+
