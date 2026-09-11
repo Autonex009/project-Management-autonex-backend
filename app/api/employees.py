@@ -429,9 +429,7 @@ def list_employees_paginated(
                 func.trim(Employee.encord_id).ilike(term),
                 DailySheet.name.ilike(term),
                 MainProject.name.ilike(term),
-                HierarchySubProject.name.ilike(term),
-                MainProjectManager.name.ilike(term),
-                HierarchyManager.name.ilike(term)
+                HierarchySubProject.name.ilike(term)
             )
         )
         # Prevent duplicates from joins
@@ -651,8 +649,11 @@ def list_employees_paginated(
         )
         checkin_by_emp = {c.employee_id: c for c in today_checkins}
 
+        on_leave_set = {r[0] for r in on_leave_ids.all()}
+
         for eid, e_dict in emp_dict.items():
             chk = checkin_by_emp.get(eid)
+            e_dict["is_on_leave"] = eid in on_leave_set
             if chk:
                 e_dict["today_checked_in_at"] = (
                     chk.checked_in_at.isoformat() if chk.checked_in_at else None
