@@ -106,7 +106,11 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
             kpi_mood_great=kpis.get("mood_great", 0),
             kpi_mood_okay=kpis.get("mood_okay", 0),
             kpi_mood_low=kpis.get("mood_low", 0),
-            kpi_mood_stressed=kpis.get("mood_stressed", 0)
+            kpi_mood_stressed=kpis.get("mood_stressed", 0),
+            kpi_approved_leaves_count=kpis.get("approved_leaves_count", 0),
+            kpi_pending_leaves_count=kpis.get("pending_leaves_count", 0),
+            kpi_approved_leaves_names=kpis.get("approved_leaves_names", []),
+            kpi_pending_leaves_names=kpis.get("pending_leaves_names", []),
         )
         
     emp_ids = [emp.id for emp, _ in results]
@@ -195,7 +199,11 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
         kpi_mood_great=kpis.get("mood_great", 0),
         kpi_mood_okay=kpis.get("mood_okay", 0),
         kpi_mood_low=kpis.get("mood_low", 0),
-        kpi_mood_stressed=kpis.get("mood_stressed", 0)
+        kpi_mood_stressed=kpis.get("mood_stressed", 0),
+        kpi_approved_leaves_count=kpis.get("approved_leaves_count", 0),
+        kpi_pending_leaves_count=kpis.get("pending_leaves_count", 0),
+        kpi_approved_leaves_names=kpis.get("approved_leaves_names", []),
+        kpi_pending_leaves_names=kpis.get("pending_leaves_names", []),
     )
 
 
@@ -311,8 +319,9 @@ def get_team_today(
     status: str = "",
     work_mode: str = "",
     office_floor: str = "",
-    project_id: int = None,
+    project_id: str = "",
     time_filter: str = "",
+    sentiment: str = "",
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("pm", "team_lead")),
 ):
@@ -359,6 +368,16 @@ def get_team_today(
     late_threshold_ist = datetime.combine(today, dtime(10, 0), tzinfo=IST)
     late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
     
+    from app.models.leave import Leave
+    all_leaves = db.query(Leave.employee_id, Leave.status, Employee.name).join(Employee, Leave.employee_id == Employee.id).filter(
+        Leave.employee_id.in_(list(visible_emp_ids)),
+        Leave.start_date <= today,
+        Leave.end_date >= today
+    ).all() if visible_emp_ids else []
+    
+    approved_leaves = [{"id": r[0], "name": r[2]} for r in all_leaves if r[1] == "approved"]
+    pending_leaves = [{"id": r[0], "name": r[2]} for r in all_leaves if r[1] == "pending"]
+
     kpis = {
         "total": len(visible_emp_ids),
         "checked_in": len(checked_in_emp_ids.intersection(visible_emp_ids)),
@@ -375,7 +394,11 @@ def get_team_today(
         "mood_great": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.mood == "great"),
         "mood_okay": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.mood == "okay"),
         "mood_low": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.mood == "low"),
-        "mood_stressed": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.mood == "stressed")
+        "mood_stressed": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.mood == "stressed"),
+        "approved_leaves_count": len(approved_leaves),
+        "pending_leaves_count": len(pending_leaves),
+        "approved_leaves_names": [l["name"] for l in approved_leaves],
+        "pending_leaves_names": [l["name"] for l in pending_leaves],
     }
     t3 = time.time()
         
@@ -386,27 +409,45 @@ def get_team_today(
     
     if search:
         query = query.filter(Employee.name.ilike(f"%{search}%"))
-    if status == "checked_in":
-        query = query.filter(DailyCheckIn.id.isnot(None))
-    elif status == "pending":
-        query = query.filter(DailyCheckIn.id.is_(None))
+    if status:
+        statuses = [s.strip() for s in status.split(",")]
+        conds = []
+        if "checked_in" in statuses:
+            conds.append(DailyCheckIn.id.isnot(None))
+        if "pending" in statuses:
+            conds.append(DailyCheckIn.id.is_(None))
+        if conds:
+            from sqlalchemy import or_
+            query = query.filter(or_(*conds))
     if work_mode:
-        query = query.filter(DailyCheckIn.work_mode == work_mode)
+        modes = [m.strip() for m in work_mode.split(",")]
+        query = query.filter(DailyCheckIn.work_mode.in_(modes))
     if office_floor:
-        query = query.filter(DailyCheckIn.office_floor == office_floor)
+        floors = [f.strip() for f in office_floor.split(",")]
+        query = query.filter(DailyCheckIn.office_floor.in_(floors))
+    if sentiment:
+        sentiments = [s.strip() for s in sentiment.split(",")]
+        query = query.filter(DailyCheckIn.mood.in_(sentiments))
         
     if project_id:
-        allocs_proj = db.query(Allocation.employee_id).filter(
-            Allocation.sub_project_id == project_id, 
-            Allocation.is_active == True
-        ).all()
-        proj_emp_ids = {a.employee_id for a in allocs_proj if a.employee_id}
-        chk_proj = db.query(DailyCheckIn.employee_id).filter(
-            DailyCheckIn.checkin_date == today,
-            DailyCheckIn.project_ids.contains([project_id])
-        ).all()
-        proj_emp_ids.update({c.employee_id for c in chk_proj})
-        query = query.filter(Employee.id.in_(proj_emp_ids))
+        pids = [int(p.strip()) for p in project_id.split(",") if p.strip().isdigit()]
+        if pids:
+            allocs_proj = db.query(Allocation.employee_id).filter(
+                Allocation.sub_project_id.in_(pids), 
+                Allocation.is_active == True
+            ).all()
+            proj_emp_ids = {a.employee_id for a in allocs_proj if a.employee_id}
+            from sqlalchemy import or_
+            chk_proj_conds = []
+            for pid in pids:
+                chk_proj_conds.append(DailyCheckIn.project_ids.contains([pid]))
+                chk_proj_conds.append(DailyCheckIn.project_ids.contains([str(pid)]))
+            chk_proj = db.query(DailyCheckIn.employee_id).filter(
+                DailyCheckIn.checkin_date == today,
+                or_(*chk_proj_conds)
+            ).all()
+            proj_emp_ids.update({c.employee_id for c in chk_proj})
+            query = query.filter(Employee.id.in_(list(proj_emp_ids) if proj_emp_ids else [-1]))
         
     if time_filter == "late":
         from datetime import time as dtime
@@ -474,8 +515,9 @@ def get_admin_checkins_paginated(
     status: str = "",
     work_mode: str = "",
     office_floor: str = "",
-    project_id: int = None,
+    project_id: str = "",
     time_filter: str = "",
+    sentiment: str = "",
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "hr")),
 ):
@@ -503,6 +545,16 @@ def get_admin_checkins_paginated(
     late_threshold_ist = datetime.combine(today, dtime(10, 0), tzinfo=IST)
     late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
 
+    from app.models.leave import Leave
+    all_leaves = db.query(Leave.employee_id, Leave.status, Employee.name).join(Employee, Leave.employee_id == Employee.id).filter(
+        Employee.status == "active",
+        Leave.start_date <= today,
+        Leave.end_date >= today
+    ).all()
+    
+    approved_leaves = [{"id": r[0], "name": r[2]} for r in all_leaves if r[1] == "approved"]
+    pending_leaves = [{"id": r[0], "name": r[2]} for r in all_leaves if r[1] == "pending"]
+
     kpis = {
         "total": total_active,
         "checked_in": checked_in_active,
@@ -519,7 +571,11 @@ def get_admin_checkins_paginated(
         "mood_great": sum(1 for c in checked_in_records if c.mood == "great"),
         "mood_okay": sum(1 for c in checked_in_records if c.mood == "okay"),
         "mood_low": sum(1 for c in checked_in_records if c.mood == "low"),
-        "mood_stressed": sum(1 for c in checked_in_records if c.mood == "stressed")
+        "mood_stressed": sum(1 for c in checked_in_records if c.mood == "stressed"),
+        "approved_leaves_count": len(approved_leaves),
+        "pending_leaves_count": len(pending_leaves),
+        "approved_leaves_names": [l["name"] for l in approved_leaves],
+        "pending_leaves_names": [l["name"] for l in pending_leaves],
     }
     
     query = db.query(Employee, DailyCheckIn).outerjoin(
@@ -529,27 +585,45 @@ def get_admin_checkins_paginated(
     
     if search:
         query = query.filter(Employee.name.ilike(f"%{search}%"))
-    if status == "checked_in":
-        query = query.filter(DailyCheckIn.id.isnot(None))
-    elif status == "pending":
-        query = query.filter(DailyCheckIn.id.is_(None))
+    if status:
+        statuses = [s.strip() for s in status.split(",")]
+        conds = []
+        if "checked_in" in statuses:
+            conds.append(DailyCheckIn.id.isnot(None))
+        if "pending" in statuses:
+            conds.append(DailyCheckIn.id.is_(None))
+        if conds:
+            from sqlalchemy import or_
+            query = query.filter(or_(*conds))
     if work_mode:
-        query = query.filter(DailyCheckIn.work_mode == work_mode)
+        modes = [m.strip() for m in work_mode.split(",")]
+        query = query.filter(DailyCheckIn.work_mode.in_(modes))
     if office_floor:
-        query = query.filter(DailyCheckIn.office_floor == office_floor)
+        floors = [f.strip() for f in office_floor.split(",")]
+        query = query.filter(DailyCheckIn.office_floor.in_(floors))
+    if sentiment:
+        sentiments = [s.strip() for s in sentiment.split(",")]
+        query = query.filter(DailyCheckIn.mood.in_(sentiments))
         
     if project_id:
-        allocs_proj = db.query(Allocation.employee_id).filter(
-            Allocation.sub_project_id == project_id, 
-            Allocation.is_active == True
-        ).all()
-        proj_emp_ids = {a.employee_id for a in allocs_proj if a.employee_id}
-        chk_proj = db.query(DailyCheckIn.employee_id).filter(
-            DailyCheckIn.checkin_date == today,
-            DailyCheckIn.project_ids.contains([project_id])
-        ).all()
-        proj_emp_ids.update({c.employee_id for c in chk_proj})
-        query = query.filter(Employee.id.in_(proj_emp_ids))
+        pids = [int(p.strip()) for p in project_id.split(",") if p.strip().isdigit()]
+        if pids:
+            allocs_proj = db.query(Allocation.employee_id).filter(
+                Allocation.sub_project_id.in_(pids), 
+                Allocation.is_active == True
+            ).all()
+            proj_emp_ids = {a.employee_id for a in allocs_proj if a.employee_id}
+            from sqlalchemy import or_
+            chk_proj_conds = []
+            for pid in pids:
+                chk_proj_conds.append(DailyCheckIn.project_ids.contains([pid]))
+                chk_proj_conds.append(DailyCheckIn.project_ids.contains([str(pid)]))
+            chk_proj = db.query(DailyCheckIn.employee_id).filter(
+                DailyCheckIn.checkin_date == today,
+                or_(*chk_proj_conds)
+            ).all()
+            proj_emp_ids.update({c.employee_id for c in chk_proj})
+            query = query.filter(Employee.id.in_(list(proj_emp_ids) if proj_emp_ids else [-1]))
         
     if time_filter == "late":
         from datetime import time as dtime

@@ -156,6 +156,10 @@ class PaginatedTeamCheckIns(BaseModel):
     kpi_mood_okay: int = 0
     kpi_mood_low: int = 0
     kpi_mood_stressed: int = 0
+    kpi_approved_leaves_count: int = 0
+    kpi_pending_leaves_count: int = 0
+    kpi_approved_leaves_names: list[str] = []
+    kpi_pending_leaves_names: list[str] = []
     items: List[TeamCheckInRow] = []
 
 
