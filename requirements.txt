@@ -22,3 +22,4 @@ numpy>=1.26.0
 encord>=0.1.150
 arq>=0.25.0
 redis>=5.0.0
+reportlab>=4.0.0

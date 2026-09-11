@@ -125,6 +125,7 @@ class TeamCheckInRow(BaseModel):
     checked_out_at: Optional[datetime] = None
     pm_confirmed_at: Optional[datetime] = None
     is_officially_allocated: bool = True
+    is_on_leave: bool = False
 
 
 class TeamCheckInSummary(BaseModel):
@@ -141,7 +142,20 @@ class PaginatedTeamCheckIns(BaseModel):
     limit: int
     kpi_total: int = 0
     kpi_checked_in: int = 0
+    kpi_wfo: int = 0
+    kpi_wfh: int = 0
     kpi_confirmed: int = 0
+    kpi_late: int = 0
+    kpi_checked_out: int = 0
+    kpi_floor_7: int = 0
+    kpi_floor_9: int = 0
+    kpi_floor_17: int = 0
+    kpi_order_tiffin: int = 0
+    kpi_canteen: int = 0
+    kpi_mood_great: int = 0
+    kpi_mood_okay: int = 0
+    kpi_mood_low: int = 0
+    kpi_mood_stressed: int = 0
     items: List[TeamCheckInRow] = []
 
 

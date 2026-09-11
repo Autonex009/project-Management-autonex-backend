@@ -896,8 +896,22 @@ def autonex_overview(
     active_reviewers = {u for (d, u), s in rev_day.items() if s > ACTIVE_THRESHOLD_SECONDS}
 
     name_by_email = _names_for(db, user_seconds.keys())
+    
+    # [NEW] Fetch employee_id to allow direct dashboard navigation
+    emails = {e for e in user_seconds.keys() if e}
+    id_by_email = {}
+    if emails:
+        emp_rows = db.query(Employee.encord_id, Employee.id).filter(_encord_id_matches(emails)).all()
+        id_by_norm = {_norm_encord(enc): eid for enc, eid in emp_rows if enc}
+        id_by_email = {e: id_by_norm.get(_norm_encord(e)) for e in emails}
+
     top_users = [
-        {"user_email": u, "employee_name": name_by_email.get(u), "hours": _hours(s)}
+        {
+            "user_email": u, 
+            "employee_name": name_by_email.get(u), 
+            "employee_id": id_by_email.get(u), 
+            "hours": _hours(s)
+        }
         for u, s in sorted(user_seconds.items(), key=lambda kv: kv[1], reverse=True)
     ][:5]
 

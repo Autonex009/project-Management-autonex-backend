@@ -91,7 +91,22 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
     if not results:
         return PaginatedTeamCheckIns(
             total=total, page=page, limit=limit, items=[],
-            kpi_total=kpis.get("total", 0), kpi_checked_in=kpis.get("checked_in", 0), kpi_confirmed=kpis.get("confirmed", 0)
+            kpi_total=kpis.get("total", 0), 
+            kpi_checked_in=kpis.get("checked_in", 0), 
+            kpi_wfo=kpis.get("wfo", 0),
+            kpi_wfh=kpis.get("wfh", 0),
+            kpi_confirmed=kpis.get("confirmed", 0),
+            kpi_late=kpis.get("late", 0),
+            kpi_checked_out=kpis.get("checked_out", 0),
+            kpi_floor_7=kpis.get("floor_7", 0),
+            kpi_floor_9=kpis.get("floor_9", 0),
+            kpi_floor_17=kpis.get("floor_17", 0),
+            kpi_order_tiffin=kpis.get("order_tiffin", 0),
+            kpi_canteen=kpis.get("canteen", 0),
+            kpi_mood_great=kpis.get("mood_great", 0),
+            kpi_mood_okay=kpis.get("mood_okay", 0),
+            kpi_mood_low=kpis.get("mood_low", 0),
+            kpi_mood_stressed=kpis.get("mood_stressed", 0)
         )
         
     emp_ids = [emp.id for emp, _ in results]
@@ -109,6 +124,16 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
         alloc_proj_ids.setdefault(a.employee_id, set()).add(a.sub_project_id)
         
     all_proj = {p.id: p.name for p in db.query(Project.id, Project.name).all()}
+    
+    from app.models.leave import Leave
+    today = _get_ist_today()
+    on_leave_ids_query = db.query(Leave.employee_id).filter(
+        Leave.employee_id.in_(emp_ids),
+        Leave.start_date <= today,
+        Leave.end_date >= today,
+        Leave.status != "rejected"
+    ).all()
+    on_leave_set = {r[0] for r in on_leave_ids_query}
     t4 = time.time()
     
     items = []
@@ -141,20 +166,36 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
             checked_in=chk is not None,
             work_mode=chk.work_mode if chk else None,
             mood=chk.mood if chk else None,
-            office_floor=chk.office_floor if chk else None,  # NEW
-            lunch_preference=chk.lunch_preference if chk else None,  # NEW
-            tiffin_type=chk.tiffin_type if chk else None,  # NEW
+            office_floor=chk.office_floor if chk else None,
+            lunch_preference=chk.lunch_preference if chk else None,
+            tiffin_type=chk.tiffin_type if chk else None,
             checked_in_at=chk.checked_in_at if chk else None,
             checked_out_at=chk.checked_out_at if chk else None,
             pm_confirmed_at=chk.pm_confirmed_at if chk else None,
             is_officially_allocated=is_officially_allocated,
+            is_on_leave=emp.id in on_leave_set,
         ))
     t5 = time.time()
     print(f"PROFILE build: count={t1-t0:.3f}s results={t2-t1:.3f}s allocs={t3-t2:.3f}s all_proj={t4-t3:.3f}s loop={t5-t4:.3f}s")
         
     return PaginatedTeamCheckIns(
         total=total, page=page, limit=limit, items=items,
-        kpi_total=kpis.get("total", 0), kpi_checked_in=kpis.get("checked_in", 0), kpi_confirmed=kpis.get("confirmed", 0)
+        kpi_total=kpis.get("total", 0), 
+        kpi_checked_in=kpis.get("checked_in", 0), 
+        kpi_wfo=kpis.get("wfo", 0),
+        kpi_wfh=kpis.get("wfh", 0),
+        kpi_confirmed=kpis.get("confirmed", 0),
+        kpi_late=kpis.get("late", 0),
+        kpi_checked_out=kpis.get("checked_out", 0),
+        kpi_floor_7=kpis.get("floor_7", 0),
+        kpi_floor_9=kpis.get("floor_9", 0),
+        kpi_floor_17=kpis.get("floor_17", 0),
+        kpi_order_tiffin=kpis.get("order_tiffin", 0),
+        kpi_canteen=kpis.get("canteen", 0),
+        kpi_mood_great=kpis.get("mood_great", 0),
+        kpi_mood_okay=kpis.get("mood_okay", 0),
+        kpi_mood_low=kpis.get("mood_low", 0),
+        kpi_mood_stressed=kpis.get("mood_stressed", 0)
     )
 
 
@@ -269,6 +310,7 @@ def get_team_today(
     search: str = "",
     status: str = "",
     work_mode: str = "",
+    office_floor: str = "",
     project_id: int = None,
     time_filter: str = "",
     db: Session = Depends(get_db),
@@ -290,7 +332,17 @@ def get_team_today(
     ).all()
     allocated_emp_ids = {a.employee_id for a in allocs if a.employee_id}
 
-    all_today_checkins = db.query(DailyCheckIn.employee_id, DailyCheckIn.project_ids, DailyCheckIn.pm_confirmed_at).filter(DailyCheckIn.checkin_date == today).all()
+    all_today_checkins = db.query(
+        DailyCheckIn.employee_id, 
+        DailyCheckIn.project_ids, 
+        DailyCheckIn.pm_confirmed_at, 
+        DailyCheckIn.work_mode,
+        DailyCheckIn.checked_in_at,
+        DailyCheckIn.checked_out_at,
+        DailyCheckIn.office_floor,
+        DailyCheckIn.lunch_preference,
+        DailyCheckIn.mood
+    ).filter(DailyCheckIn.checkin_date == today).all()
     checked_in_emp_ids = set()
     for c in all_today_checkins:
         if set(c.project_ids or []).intersection(scoped_project_ids):
@@ -302,10 +354,28 @@ def get_team_today(
     if not visible_emp_ids:
         return PaginatedTeamCheckIns(total=0, page=page, limit=limit, items=[])
 
+    from datetime import time as dtime
+    from datetime import timezone
+    late_threshold_ist = datetime.combine(today, dtime(10, 0), tzinfo=IST)
+    late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
+    
     kpis = {
         "total": len(visible_emp_ids),
         "checked_in": len(checked_in_emp_ids.intersection(visible_emp_ids)),
-        "confirmed": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.pm_confirmed_at is not None)
+        "wfo": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.work_mode == "WFO"),
+        "wfh": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.work_mode == "WFH"),
+        "confirmed": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.pm_confirmed_at is not None),
+        "late": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.checked_in_at and c.checked_in_at > late_threshold_utc),
+        "checked_out": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.checked_out_at is not None),
+        "floor_7": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.office_floor == "7"),
+        "floor_9": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.office_floor == "9"),
+        "floor_17": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.office_floor == "17"),
+        "order_tiffin": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.lunch_preference == "order_tiffin"),
+        "canteen": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.lunch_preference == "canteen"),
+        "mood_great": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.mood == "great"),
+        "mood_okay": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.mood == "okay"),
+        "mood_low": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.mood == "low"),
+        "mood_stressed": sum(1 for c in all_today_checkins if c.employee_id in visible_emp_ids and c.mood == "stressed")
     }
     t3 = time.time()
         
@@ -322,6 +392,8 @@ def get_team_today(
         query = query.filter(DailyCheckIn.id.is_(None))
     if work_mode:
         query = query.filter(DailyCheckIn.work_mode == work_mode)
+    if office_floor:
+        query = query.filter(DailyCheckIn.office_floor == office_floor)
         
     if project_id:
         allocs_proj = db.query(Allocation.employee_id).filter(
@@ -401,6 +473,7 @@ def get_admin_checkins_paginated(
     search: str = "",
     status: str = "",
     work_mode: str = "",
+    office_floor: str = "",
     project_id: int = None,
     time_filter: str = "",
     db: Session = Depends(get_db),
@@ -409,13 +482,44 @@ def get_admin_checkins_paginated(
     today = _get_ist_today()
     
     total_active = db.query(Employee).filter(Employee.status == "active").count()
-    checked_in_active = db.query(DailyCheckIn.employee_id).join(Employee, DailyCheckIn.employee_id == Employee.id).filter(Employee.status == "active", DailyCheckIn.checkin_date == today).count()
+    
+    checked_in_records = db.query(
+        DailyCheckIn.employee_id, 
+        DailyCheckIn.work_mode,
+        DailyCheckIn.checked_in_at,
+        DailyCheckIn.checked_out_at,
+        DailyCheckIn.office_floor,
+        DailyCheckIn.lunch_preference,
+        DailyCheckIn.mood
+    ).join(Employee, DailyCheckIn.employee_id == Employee.id).filter(Employee.status == "active", DailyCheckIn.checkin_date == today).all()
+    checked_in_active = len(checked_in_records)
+    wfo_active = sum(1 for c in checked_in_records if c.work_mode == "WFO")
+    wfh_active = sum(1 for c in checked_in_records if c.work_mode == "WFH")
+    
     confirmed_active = db.query(DailyCheckIn.employee_id).join(Employee, DailyCheckIn.employee_id == Employee.id).filter(Employee.status == "active", DailyCheckIn.checkin_date == today, DailyCheckIn.pm_confirmed_at.isnot(None)).count()
     
+    from datetime import time as dtime
+    from datetime import timezone
+    late_threshold_ist = datetime.combine(today, dtime(10, 0), tzinfo=IST)
+    late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
+
     kpis = {
         "total": total_active,
         "checked_in": checked_in_active,
-        "confirmed": confirmed_active
+        "wfo": wfo_active,
+        "wfh": wfh_active,
+        "confirmed": confirmed_active,
+        "late": sum(1 for c in checked_in_records if c.checked_in_at and c.checked_in_at > late_threshold_utc),
+        "checked_out": sum(1 for c in checked_in_records if c.checked_out_at is not None),
+        "floor_7": sum(1 for c in checked_in_records if c.office_floor == "7"),
+        "floor_9": sum(1 for c in checked_in_records if c.office_floor == "9"),
+        "floor_17": sum(1 for c in checked_in_records if c.office_floor == "17"),
+        "order_tiffin": sum(1 for c in checked_in_records if c.lunch_preference == "order_tiffin"),
+        "canteen": sum(1 for c in checked_in_records if c.lunch_preference == "canteen"),
+        "mood_great": sum(1 for c in checked_in_records if c.mood == "great"),
+        "mood_okay": sum(1 for c in checked_in_records if c.mood == "okay"),
+        "mood_low": sum(1 for c in checked_in_records if c.mood == "low"),
+        "mood_stressed": sum(1 for c in checked_in_records if c.mood == "stressed")
     }
     
     query = db.query(Employee, DailyCheckIn).outerjoin(
@@ -431,6 +535,8 @@ def get_admin_checkins_paginated(
         query = query.filter(DailyCheckIn.id.is_(None))
     if work_mode:
         query = query.filter(DailyCheckIn.work_mode == work_mode)
+    if office_floor:
+        query = query.filter(DailyCheckIn.office_floor == office_floor)
         
     if project_id:
         allocs_proj = db.query(Allocation.employee_id).filter(
