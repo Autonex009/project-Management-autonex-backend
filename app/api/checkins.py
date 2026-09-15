@@ -804,10 +804,10 @@ def get_admin_sentiment_analytics(
     project_id: Optional[str] = None,
     work_mode: Optional[str] = None,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "hr")),
+    current_user: User = Depends(require_role("admin", "hr", "pm", "team_lead")),
 ):
     """
-    Detailed Mood/Sentiment analytics for Admin across Daily, Weekly, and Monthly views,
+    Detailed Mood/Sentiment analytics for Admin and PM across Daily, Weekly, and Monthly views,
     with project/work_mode filtering, date range presets, employee mood lists, and executive summary.
     """
     if target_date:
@@ -819,6 +819,33 @@ def get_admin_sentiment_analytics(
         t_date = _get_ist_today()
 
     active_emp_ids = {e.id for e in db.query(Employee.id).filter(Employee.status == "active").all()}
+
+    # Scope to PM's projects and employees if current user is PM/Team Lead
+    from app.services.project_scope import has_full_access
+    if not has_full_access(current_user):
+        pm_scoped_proj_ids = _get_scoped_project_ids(db, current_user)
+        if not pm_scoped_proj_ids:
+            active_emp_ids = set()
+        else:
+            pm_emp_ids = {a.employee_id for a in db.query(Allocation.employee_id).filter(
+                Allocation.sub_project_id.in_(pm_scoped_proj_ids),
+                Allocation.is_active == True
+            ).all() if a.employee_id}
+            
+            from sqlalchemy import or_
+            chk_proj_conds = []
+            for pid in pm_scoped_proj_ids:
+                chk_proj_conds.append(DailyCheckIn.project_ids.contains([pid]))
+                chk_proj_conds.append(DailyCheckIn.project_ids.contains([str(pid)]))
+            
+            if chk_proj_conds:
+                pm_chk_emp_ids = {c.employee_id for c in db.query(DailyCheckIn.employee_id).filter(
+                    DailyCheckIn.checkin_date == t_date,
+                    or_(*chk_proj_conds)
+                ).all() if c.employee_id}
+                pm_emp_ids.update(pm_chk_emp_ids)
+                
+            active_emp_ids = active_emp_ids.intersection(pm_emp_ids)
 
     # Project filtering if requested
     if project_id:

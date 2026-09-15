@@ -292,13 +292,13 @@ class PerfEvalResponse(BaseModel):
 
 @router.get("", response_model=dict)
 def list_evals(
-    project_id: Optional[int] = None,
+    project_id: Optional[str] = None,
     employee_id: Optional[int] = None,
     period: Optional[str] = None,
     status: Optional[str] = None,
     search: Optional[str] = None,
     role_filter: Optional[str] = None,
-    pm_id: Optional[int] = None,
+    pm_id: Optional[str] = None,
     type: Optional[str] = None,  # 'employee' (exclude pm self evals), 'pm' (only pm self evals), 'bonus'
     page: int = Query(1, ge=1),
     limit: int = Query(25, ge=1, le=500),
@@ -321,23 +321,35 @@ def list_evals(
                 if not emp or emp.email != current_user.email:
                     raise HTTPException(status_code=403, detail="Access denied")
     q = db.query(PerfEvaluation)
-    if project_id:
-        q = q.filter(PerfEvaluation.project_id == project_id)
-    elif pm_id:
-        main_projects = db.query(MainProject).all()
-        daily_sheets = db.query(DailySheet).all()
-        allocations = db.query(Allocation).filter(Allocation.employee_id == pm_id).all()
-        pm_sub_projects = _get_pm_sub_projects(daily_sheets, main_projects, pm_id, allocations)
-        pm_sub_project_ids = [sp.id for sp in pm_sub_projects]
-        if not pm_sub_project_ids:
-            return {"items": [], "total": 0, "page": page, "limit": limit}
-        q = q.filter(PerfEvaluation.project_id.in_(pm_sub_project_ids))
+    if project_id and str(project_id) != "all":
+        p_ids = [int(p.strip()) for p in str(project_id).split(",") if p.strip().isdigit()]
+        if len(p_ids) == 1:
+            q = q.filter(PerfEvaluation.project_id == p_ids[0])
+        elif len(p_ids) > 1:
+            q = q.filter(PerfEvaluation.project_id.in_(p_ids))
+    elif pm_id and str(pm_id) != "all":
+        pm_ids = [int(p.strip()) for p in str(pm_id).split(",") if p.strip().isdigit()]
+        if pm_ids:
+            main_projects = db.query(MainProject).all()
+            daily_sheets = db.query(DailySheet).all()
+            allocations = db.query(Allocation).filter(Allocation.employee_id.in_(pm_ids)).all()
+            all_pm_sub_project_ids = set()
+            for pid in pm_ids:
+                pm_sub_projects = _get_pm_sub_projects(daily_sheets, main_projects, pid, allocations)
+                all_pm_sub_project_ids.update([sp.id for sp in pm_sub_projects])
+            if not all_pm_sub_project_ids:
+                return {"items": [], "total": 0, "page": page, "limit": limit}
+            q = q.filter(PerfEvaluation.project_id.in_(list(all_pm_sub_project_ids)))
     if employee_id:
         q = q.filter(PerfEvaluation.employee_id == employee_id)
     if period:
         q = q.filter(PerfEvaluation.period == period)
-    if status:
-        q = q.filter(PerfEvaluation.status == status)
+    if status and str(status) != "all":
+        statuses = [s.strip() for s in str(status).split(",") if s.strip()]
+        if len(statuses) == 1:
+            q = q.filter(PerfEvaluation.status == statuses[0])
+        elif len(statuses) > 1:
+            q = q.filter(PerfEvaluation.status.in_(statuses))
 
     if type == "bonus":
         q = q.filter(PerfEvaluation.bonus_suggested == True)
@@ -351,25 +363,30 @@ def list_evals(
             
         if search and search.strip():
             q = q.filter(Employee.name.ilike(f"%{search.strip()}%"))
-        if role_filter and role_filter != "all":
-            if role_filter.lower() == "admin":
-                q = q.filter(Employee.designation.ilike("%admin%"))
-            elif role_filter.lower() == "pm":
-                q = q.filter(Employee.designation.ilike("%manager%"))
-            elif role_filter.lower() == "team_lead":
-                q = q.filter(Employee.designation.ilike("%lead%"))
-            elif role_filter.lower() == "hr":
-                q = q.filter(Employee.designation.ilike("%hr%"))
-            elif role_filter.lower() == "annotator":
-                q = q.filter(Employee.designation.ilike("%annotator%"))
-            elif role_filter.lower() in ["full-time", "intern"]:
-                q = q.filter(Employee.employee_type.ilike(role_filter))
-                if role_filter.lower() == "full-time":
-                    q = q.filter(~Employee.designation.ilike("%manager%"))
-                    q = q.filter(~Employee.designation.ilike("%hr%"))
-                    q = q.filter(~Employee.designation.ilike("%lead%"))
-            elif role_filter.lower() == "contract":
-                q = q.filter(Employee.employee_type.ilike("contract%"))
+        if role_filter and str(role_filter) != "all":
+            from sqlalchemy import or_, and_
+            roles = [r.strip().lower() for r in str(role_filter).split(",") if r.strip()]
+            role_conds = []
+            for r in roles:
+                if r == "admin":
+                    role_conds.append(Employee.designation.ilike("%admin%"))
+                elif r == "pm":
+                    role_conds.append(Employee.designation.ilike("%manager%"))
+                elif r == "team_lead":
+                    role_conds.append(Employee.designation.ilike("%lead%"))
+                elif r == "hr":
+                    role_conds.append(Employee.designation.ilike("%hr%"))
+                elif r == "annotator":
+                    role_conds.append(Employee.designation.ilike("%annotator%"))
+                elif r in ["full-time", "intern"]:
+                    cond = Employee.employee_type.ilike(r)
+                    if r == "full-time":
+                        cond = and_(cond, ~Employee.designation.ilike("%manager%"), ~Employee.designation.ilike("%hr%"), ~Employee.designation.ilike("%lead%"))
+                    role_conds.append(cond)
+                elif r == "contract":
+                    role_conds.append(Employee.employee_type.ilike("contract%"))
+            if role_conds:
+                q = q.filter(or_(*role_conds))
 
     
     # Filter by read privacy first
@@ -415,7 +432,7 @@ from sqlalchemy import func
 @router.get("/admin-kpi", response_model=dict)
 def get_admin_perf_kpi(
     period: Optional[str] = None,
-    project_id: Optional[int] = None,
+    project_id: Optional[str] = None,
     role_filter: Optional[str] = None,
     search: Optional[str] = None,
     type: Optional[str] = None,
@@ -425,8 +442,12 @@ def get_admin_perf_kpi(
     q = db.query(PerfEvaluation)
     if period:
         q = q.filter(PerfEvaluation.period == period)
-    if project_id:
-        q = q.filter(PerfEvaluation.project_id == project_id)
+    if project_id and str(project_id) != "all":
+        p_ids = [int(p.strip()) for p in str(project_id).split(",") if p.strip().isdigit()]
+        if len(p_ids) == 1:
+            q = q.filter(PerfEvaluation.project_id == p_ids[0])
+        elif len(p_ids) > 1:
+            q = q.filter(PerfEvaluation.project_id.in_(p_ids))
         
     if type in ["pm", "hr"] or search or role_filter:
         q = q.outerjoin(Employee, Employee.id == PerfEvaluation.employee_id)
@@ -437,25 +458,30 @@ def get_admin_perf_kpi(
             
         if search and search.strip():
             q = q.filter(Employee.name.ilike(f"%{search.strip()}%"))
-        if role_filter and role_filter != "all":
-            if role_filter.lower() == "admin":
-                q = q.filter(Employee.designation.ilike("%admin%"))
-            elif role_filter.lower() == "pm":
-                q = q.filter(Employee.designation.ilike("%manager%"))
-            elif role_filter.lower() == "team_lead":
-                q = q.filter(Employee.designation.ilike("%lead%"))
-            elif role_filter.lower() == "hr":
-                q = q.filter(Employee.designation.ilike("%hr%"))
-            elif role_filter.lower() == "annotator":
-                q = q.filter(Employee.designation.ilike("%annotator%"))
-            elif role_filter.lower() in ["full-time", "intern"]:
-                q = q.filter(Employee.employee_type.ilike(role_filter))
-                if role_filter.lower() == "full-time":
-                    q = q.filter(~Employee.designation.ilike("%manager%"))
-                    q = q.filter(~Employee.designation.ilike("%hr%"))
-                    q = q.filter(~Employee.designation.ilike("%lead%"))
-            elif role_filter.lower() == "contract":
-                q = q.filter(Employee.employee_type.ilike("contract%"))
+        if role_filter and str(role_filter) != "all":
+            from sqlalchemy import or_, and_
+            roles = [r.strip().lower() for r in str(role_filter).split(",") if r.strip()]
+            role_conds = []
+            for r in roles:
+                if r == "admin":
+                    role_conds.append(Employee.designation.ilike("%admin%"))
+                elif r == "pm":
+                    role_conds.append(Employee.designation.ilike("%manager%"))
+                elif r == "team_lead":
+                    role_conds.append(Employee.designation.ilike("%lead%"))
+                elif r == "hr":
+                    role_conds.append(Employee.designation.ilike("%hr%"))
+                elif r == "annotator":
+                    role_conds.append(Employee.designation.ilike("%annotator%"))
+                elif r in ["full-time", "intern"]:
+                    cond = Employee.employee_type.ilike(r)
+                    if r == "full-time":
+                        cond = and_(cond, ~Employee.designation.ilike("%manager%"), ~Employee.designation.ilike("%hr%"), ~Employee.designation.ilike("%lead%"))
+                    role_conds.append(cond)
+                elif r == "contract":
+                    role_conds.append(Employee.employee_type.ilike("contract%"))
+            if role_conds:
+                q = q.filter(or_(*role_conds))
     
     # KPIs for the admin dashboard
     total = q.count()
