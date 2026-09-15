@@ -63,6 +63,7 @@ class DailySheet(Base):
     # Team composition (manual, informational). required_manpower is auto-computed
     # as autonex_annotators + autonex_reviewers + qc_count.
     annotators_total = Column(Integer, default=0)
+    workforce_annotators = Column(Integer, default=0)
     workforce_vendors = Column(JSON, nullable=True, default=list)   # list of vendor names
     autonex_annotators = Column(Integer, default=0)
     autonex_reviewers = Column(Integer, default=0)

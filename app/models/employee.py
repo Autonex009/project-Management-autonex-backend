@@ -15,6 +15,8 @@ class Employee(Base):
     razorpay_email = Column(Text, nullable=True)
     phone = Column(String(32), nullable=True)
     employee_type = Column(Text, nullable=False)  # Full-time, Part-time, Intern, Contract
+    work_model = Column(String(16), server_default="WFO", nullable=True)
+    work_description = Column(Text, nullable=True)
     
     # Designation: Program Manager, Annotator, Developer, QA, Reviewer
     designation = Column(Text, default="Annotator")

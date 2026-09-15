@@ -1493,7 +1493,7 @@ def send_admin_late_list(*, channel_id: str, stats_payload: dict) -> bool:
             
         blocks.append({"type": "divider"})
 
-    def add_table_section(title, employee_list, is_late_list=False):
+    def add_table_section(title, employee_list, list_type="pending"):
         if not employee_list:
             return
         blocks.append({
@@ -1506,29 +1506,34 @@ def send_admin_late_list(*, channel_id: str, stats_payload: dict) -> bool:
         chunk_size = 50
         for i in range(0, len(employee_list), chunk_size):
             chunk = employee_list[i:i + chunk_size]
-            if is_late_list:
+            if list_type == "late":
                 rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email"), make_cell("Time")]]
                 for idx, record in enumerate(chunk):
                     name, email, time_str = record
                     rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email), make_cell(time_str)])
-                blocks.append({
-                    "type": "table",
-                    "rows": rows,
-                    "column_settings": [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}, {"align": "right"}]
-                })
+                col_settings = [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}, {"align": "right"}]
+            elif list_type == "sentiment":
+                rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email"), make_cell("Sentiment")]]
+                for idx, record in enumerate(chunk):
+                    name, email, mood_str = record
+                    rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email), make_cell(mood_str)])
+                col_settings = [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}, {"align": "left"}]
             else:
                 rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email")]]
                 for idx, record in enumerate(chunk):
                     name, email = record
                     rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email)])
-                blocks.append({
-                    "type": "table",
-                    "rows": rows,
-                    "column_settings": [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}]
-                })
+                col_settings = [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}]
+                
+            blocks.append({
+                "type": "table",
+                "rows": rows,
+                "column_settings": col_settings
+            })
 
-    add_table_section("Checked In Late (After 11:00 AM)", late_checkins, is_late_list=True)
-    add_table_section("Pending (Not Checked In Yet)", pending_checkins, is_late_list=False)
+    add_table_section("Checked In Late (After 11:00 AM)", late_checkins, list_type="late")
+    add_table_section("Pending (Not Checked In Yet)", pending_checkins, list_type="pending")
+    add_table_section("⚠️ Low Sentiment Check-ins", stats_payload.get("low_sentiment_list", []), list_type="sentiment")
 
     max_blocks = 40
     main_message_ts = None
