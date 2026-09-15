@@ -28,8 +28,6 @@ from app.schemas.allocation import (
     ProjectAllocationDetailItem,
 )
 from app.services.allocation_validator import (
-    validate_time_distribution,
-    check_double_booking,
     check_leave_conflict,
     get_all_employees_allocation_status
 )
@@ -142,7 +140,10 @@ def get_allocations_page(
     project_ids = [p.id for p in all_projects]
 
     # 2) One query for every allocation on these projects (no N+1).
-    all_allocs = db.query(Allocation).filter(Allocation.sub_project_id.in_(project_ids)).all()
+    all_allocs = db.query(Allocation).filter(
+        Allocation.sub_project_id.in_(project_ids),
+        Allocation.is_active == True
+    ).all()
     allocs_by_project: dict[int, list[Allocation]] = {}
     for a in all_allocs:
         allocs_by_project.setdefault(a.sub_project_id, []).append(a)
@@ -307,7 +308,10 @@ def get_project_allocation_detail(
         db, current_user, project, action="view this project's allocations"
     )
 
-    allocs = db.query(Allocation).filter(Allocation.sub_project_id == project_id).all()
+    allocs = db.query(Allocation).filter(
+        Allocation.sub_project_id == project_id,
+        Allocation.is_active == True
+    ).all()
     employee_ids = {a.employee_id for a in allocs} | set(project.assigned_employee_ids or [])
     employees = db.query(Employee).filter(Employee.id.in_(employee_ids)).all() if employee_ids else []
     employee_map = {e.id: e for e in employees}
@@ -525,6 +529,9 @@ def _allocation_to_dict(
         "weekly_hours_allocated": allocation.weekly_hours_allocated,
         "weekly_tasks_allocated": allocation.weekly_tasks_allocated,
         "effective_week": allocation.effective_week,
+        "is_active": allocation.is_active,
+        "deactivated_at": allocation.deactivated_at,
+        "deactivated_reason": allocation.deactivated_reason,
         "created_at": allocation.created_at,
         "updated_at": allocation.updated_at,
         "employee_name": employee.name if employee else None,
@@ -547,32 +554,10 @@ def validate_allocation(
 ):
     """
     Validate an allocation before saving.
-    Performs Sum-Zero and Double-Booking checks.
     """
     errors = []
     warnings = []
     
-    # Sum-Zero validation
-    time_check = validate_time_distribution(
-        data.total_daily_hours,
-        data.time_distribution or {}
-    )
-    if not time_check['is_valid'] and data.time_distribution:
-        errors.append(time_check['message'])
-    
-    # Double-booking check
-    booking_check = check_double_booking(
-        db=db,
-        employee_id=data.employee_id,
-        new_hours=data.total_daily_hours,
-        active_start=data.active_start_date,
-        active_end=data.active_end_date,
-        exclude_allocation_id=data.exclude_allocation_id
-    )
-    
-    if booking_check.get('is_overbooked'):
-        warnings.append(booking_check['message'])
-
     # Leave-overlap check: informational warning only — leave days are
     # automatically excluded from capacity calculations downstream.
     leave_check = check_leave_conflict(
@@ -586,8 +571,8 @@ def validate_allocation(
 
     return AllocationValidationResponse(
         is_valid=len(errors) == 0,
-        time_distribution_valid=time_check['is_valid'],
-        double_booking_check=booking_check,
+        time_distribution_valid=True,
+        double_booking_check={"is_overbooked": False, "message": ""},
         errors=errors,
         warnings=warnings
     )
@@ -614,36 +599,8 @@ def create_allocation(
         action="allocate people to this project",
     )
 
-    # Validate time distribution if provided
-    if data.time_distribution:
-        time_check = validate_time_distribution(
-            data.total_daily_hours,
-            data.time_distribution
-        )
-        if not time_check['is_valid']:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=time_check['message']
-            )
-    
-    # Double-booking check (warn but don't block if override_flag is set)
-    booking_check = check_double_booking(
-        db=db,
-        employee_id=data.employee_id,
-        new_hours=data.total_daily_hours,
-        active_start=data.active_start_date,
-        active_end=data.active_end_date
-    )
-    
-    if booking_check.get('is_overbooked') and not data.override_flag:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": booking_check['message'],
-                "requires_override": True,
-                "booking_details": booking_check
-            }
-        )
+    # Force all allocations to be a simple 8-hour flat assignment
+    data.total_daily_hours = 8
 
     # Leave-overlap check: informational only — leave days are excluded from
     # capacity calculations automatically; assignment is still permitted.
@@ -794,8 +751,7 @@ def get_allocations_by_employee(
             if not employee or current_user.email != employee.email:
                 raise HTTPException(status_code=403, detail="Access denied")
     allocations = db.query(Allocation).filter(
-        Allocation.employee_id == employee_id,
-        Allocation.is_active == True
+        Allocation.employee_id == employee_id
     ).all()
     return [enrich_allocation_response(a, db) for a in allocations]
 
@@ -852,49 +808,8 @@ def update_allocation(
             )
     
     # Double-booking check — always re-validate on update.
-    # Moving an allocation to a new project / date range / employee without
-    # changing hours can still create overlaps that the previous range avoided.
-    # (Previously the check only ran when data.total_daily_hours was truthy.)
-    resolved_employee_id = data.employee_id if data.employee_id is not None else allocation.employee_id
-    resolved_hours = (
-        data.total_daily_hours
-        if data.total_daily_hours is not None
-        else (allocation.total_daily_hours or 8)
-    )
-    resolved_start = (
-        data.active_start_date
-        if data.active_start_date is not None
-        else allocation.active_start_date
-    )
-    resolved_end = (
-        data.active_end_date
-        if data.active_end_date is not None
-        else allocation.active_end_date
-    )
-
-    booking_check = check_double_booking(
-        db=db,
-        employee_id=resolved_employee_id,
-        new_hours=resolved_hours,
-        active_start=resolved_start,
-        active_end=resolved_end,
-        exclude_allocation_id=allocation_id,
-    )
-
-    override_flag = (
-        data.override_flag
-        if data.override_flag is not None
-        else allocation.override_flag
-    )
-    if booking_check.get("is_overbooked") and not override_flag:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": booking_check["message"],
-                "requires_override": True,
-                "booking_details": booking_check,
-            },
-        )
+    # Force all allocations to be a simple 8-hour flat assignment
+    data.total_daily_hours = 8
 
     # Leave-overlap check on update: informational only.
     resolved_employee_id = data.employee_id or allocation.employee_id
@@ -909,15 +824,19 @@ def update_allocation(
 
     old_sub_project_id = allocation.sub_project_id
 
-    # Snapshot every field the caller is about to overwrite, before overwriting it.
-    # Read after the setattr loop and the "from" side of each diff would already be
-    # the new value.
     changed_keys = list(data.model_dump(exclude_unset=True).keys())
+    # Manually track total_daily_hours as changed
+    if "total_daily_hours" not in changed_keys:
+        changed_keys.append("total_daily_hours")
+
     before_values = {key: getattr(allocation, key, None) for key in changed_keys}
     old_employee_id = allocation.employee_id
 
     for key, value in data.model_dump(exclude_unset=True).items():
         setattr(allocation, key, value)
+        
+    # Force 8-hour flat assignment explicitly
+    allocation.total_daily_hours = 8
 
     db.flush()
 

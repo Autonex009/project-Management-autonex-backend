@@ -73,6 +73,8 @@ LATE_WARNING_HOUR = int(os.getenv("LATE_WARNING_HOUR", "10"))
 LATE_WARNING_MINUTE = int(os.getenv("LATE_WARNING_MINUTE", "45"))
 ADMIN_REPORT_HOUR = int(os.getenv("ADMIN_REPORT_HOUR", "11"))
 ADMIN_REPORT_MINUTE = int(os.getenv("ADMIN_REPORT_MINUTE", "10"))
+EVENING_REPORT_HOUR = int(os.getenv("EVENING_REPORT_HOUR", "18"))
+EVENING_REPORT_MINUTE = int(os.getenv("EVENING_REPORT_MINUTE", "30"))
 LATE_CHECKIN_CHANNEL_ID = os.getenv("LATE_CHECKIN_CHANNEL_ID", "C0BV91K4PD5")
 
 # Onboarding checks
@@ -263,6 +265,7 @@ def _scheduled_checkin_reminders() -> None:
         from app.models.leave import Leave
         from app.models.daily_checkin import DailyCheckIn
         from app.services.slack_service import (
+            SlackRateLimitError,
             try_get_or_cache_employee_slack_user_id,
             try_send_checkin_reminder_message,
         )
@@ -302,12 +305,11 @@ def _scheduled_checkin_reminders() -> None:
                 ):
                     sent += 1
                     time.sleep(1.5)  # Base sleep to avoid rate limits
+            except SlackRateLimitError as exc:
+                logger.warning("[scheduler] Rate limit hit sending reminder to %s, sleeping %s seconds...", employee.email, exc.retry_after_seconds)
+                time.sleep(exc.retry_after_seconds)
             except Exception as exc:
-                if "429" in str(exc) or "rate" in str(exc).lower():
-                    logger.warning("[scheduler] Rate limit hit sending reminder to %s, sleeping...", employee.email)
-                    time.sleep(10)
-                else:
-                    logger.error("[scheduler] Failed sending checkin reminder to %s: %s", employee.email, exc)
+                logger.error("[scheduler] Failed sending checkin reminder to %s: %s", employee.email, exc)
 
         logger.info("[scheduler] Check-in reminders sent to %s employee(s)", sent)
     except Exception as exc:
@@ -376,6 +378,7 @@ def _scheduled_pm_confirm_reminders() -> None:
         from app.models.allocation import Allocation
         from app.api.checkins import _get_scoped_project_ids
         from app.services.slack_service import (
+            SlackRateLimitError,
             try_get_or_cache_employee_slack_user_id,
             try_send_pm_confirm_reminder_message,
         )
@@ -451,12 +454,11 @@ def _scheduled_pm_confirm_reminders() -> None:
                 ):
                     sent += 1
                     time.sleep(1.5)  # Avoid Slack API rate limit
+            except SlackRateLimitError as exc:
+                logger.warning("[scheduler] Rate limit hit sending PM reminder, sleeping %s seconds...", exc.retry_after_seconds)
+                time.sleep(exc.retry_after_seconds)
             except Exception as exc:
-                if "429" in str(exc) or "rate" in str(exc).lower():
-                    logger.warning("[scheduler] Rate limit hit sending PM reminder, sleeping...")
-                    time.sleep(10)
-                else:
-                    logger.error("[scheduler] Failed sending PM reminder: %s", exc)
+                logger.error("[scheduler] Failed sending PM reminder: %s", exc)
                     
         logger.info("[scheduler] PM confirm reminders sent to %s manager(s)", sent)
     except Exception as exc:
@@ -533,13 +535,8 @@ def _scheduled_admin_report() -> None:
     try:
         from app.utils.business_time import today_ist
         from app.constants.leave_types import is_fixed_holiday, is_weekend
-        from app.models.employee import Employee
-        from app.models.leave import Leave
-        from app.models.daily_checkin import DailyCheckIn
         from app.services.slack_service import try_send_admin_late_list
-        from sqlalchemy import not_
-        from datetime import datetime, time as dtime, timezone
-        from zoneinfo import ZoneInfo
+        from app.services.stats_engine import _generate_admin_report_payload
 
         today = today_ist()
 
@@ -547,52 +544,50 @@ def _scheduled_admin_report() -> None:
             logger.info("[scheduler] Skipping admin report because today is a weekend or holiday.")
             return
 
-        checked_in_query = db.query(DailyCheckIn.employee_id).filter(
-            DailyCheckIn.checkin_date == today
-        )
-        on_leave_query = db.query(Leave.employee_id).filter(
-            Leave.status == "approved",
-            Leave.start_date <= today,
-            Leave.end_date >= today,
-        )
+        # 1. Generate stats payload via the new Stats Engine
+        stats_payload = _generate_admin_report_payload(db, target_date=today)
 
-        # 1. Pending: Did not check in and not on leave
-        pending_employees = db.query(Employee).filter(
-            Employee.status == "active",
-            not_(Employee.id.in_(checked_in_query)),
-            not_(Employee.id.in_(on_leave_query))
-        ).all()
-        pending_list = [(emp.name, emp.email) for emp in pending_employees]
-
-        # 2. Late Check-in: Checked in today, but after 11:00 AM IST
-        IST = ZoneInfo("Asia/Kolkata")
-        late_threshold_ist = datetime.combine(today, dtime(11, 0), tzinfo=IST)
-        late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
-
-        late_checkins = db.query(Employee, DailyCheckIn.checked_in_at).join(
-            DailyCheckIn, Employee.id == DailyCheckIn.employee_id
-        ).filter(
-            Employee.status == "active",
-            DailyCheckIn.checkin_date == today,
-            DailyCheckIn.checked_in_at > late_threshold_utc
-        ).all()
-        late_checkin_list = [
-            (emp.name, emp.email, checkin_time.astimezone(IST).strftime("%I:%M %p") if checkin_time else "—")
-            for emp, checkin_time in late_checkins
-        ]
-
-        if late_checkin_list or pending_list:
+        if stats_payload["late_list"] or stats_payload["pending_list"]:
             try_send_admin_late_list(
                 channel_id=LATE_CHECKIN_CHANNEL_ID,
-                late_checkins=late_checkin_list,
-                pending_checkins=pending_list
+                stats_payload=stats_payload
             )
-            logger.info("[scheduler] Sent admin report (Late: %s, Pending: %s)", len(late_checkin_list), len(pending_list))
+            logger.info("[scheduler] Sent admin report (Late: %s, Pending: %s)", len(stats_payload["late_list"]), len(stats_payload["pending_list"]))
         else:
             logger.info("[scheduler] No late or pending check-ins today! Admin report skipped.")
 
     except Exception as exc:
         logger.error("[scheduler] Admin report job failed: %s", exc)
+    finally:
+        db.close()
+
+
+def _scheduled_evening_report() -> None:
+    """Compile and send the final end-of-day check-in summary."""
+    db = SessionLocal()
+    try:
+        from app.utils.business_time import today_ist
+        from app.constants.leave_types import is_fixed_holiday, is_weekend
+        from app.services.slack_service import try_send_admin_late_list
+        from app.services.stats_engine import _generate_admin_report_payload
+
+        today = today_ist()
+
+        if is_weekend(today) or is_fixed_holiday(today):
+            logger.info("[scheduler] Skipping evening report because today is a weekend or holiday.")
+            return
+
+        # Use the same Stats Engine
+        stats_payload = _generate_admin_report_payload(db, target_date=today)
+
+        try_send_admin_late_list(
+            channel_id=LATE_CHECKIN_CHANNEL_ID,
+            stats_payload=stats_payload
+        )
+        logger.info("[scheduler] Sent evening check-in summary report.")
+
+    except Exception as exc:
+        logger.error("[scheduler] Evening report job failed: %s", exc)
     finally:
         db.close()
 
@@ -706,6 +701,18 @@ def start_scheduler() -> None:
         hour=ADMIN_REPORT_HOUR,
         minute=ADMIN_REPORT_MINUTE,
         id="late_admin_report",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    _scheduler.add_job(
+        _scheduled_evening_report,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=EVENING_REPORT_HOUR,
+        minute=EVENING_REPORT_MINUTE,
+        id="evening_admin_report",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

@@ -64,6 +64,11 @@ class AllocationResponse(AllocationBase):
     employee_name: Optional[str] = None
     project_name: Optional[str] = None
     
+    # History and Status fields
+    is_active: bool = True
+    deactivated_at: Optional[datetime] = None
+    deactivated_reason: Optional[str] = None
+    
     class Config:
         from_attributes = True
 

@@ -6,7 +6,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,12 @@ def _get_bot_token() -> str | None:
 
 def get_slack_signing_secret() -> str | None:
     return os.getenv("SLACK_SIGNING_SECRET")
+
+
+class SlackRateLimitError(Exception):
+    def __init__(self, retry_after_seconds: int):
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(f"Slack rate limit hit. Retry after {retry_after_seconds} seconds.")
 
 
 def _slack_request(path: str, payload: dict | None = None, method: str = "POST", use_json: bool = True) -> dict:
@@ -54,10 +60,47 @@ def _slack_request(path: str, payload: dict | None = None, method: str = "POST",
         with urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
+        if exc.code == 429:
+            retry_after = int(exc.headers.get("Retry-After", 10))
+            raise SlackRateLimitError(retry_after)
         detail = exc.read().decode("utf-8", errors="ignore") or exc.reason
         raise RuntimeError(f"Slack API request failed: {detail}") from exc
     except URLError as exc:
         raise RuntimeError(f"Slack API request failed: {exc.reason}") from exc
+
+
+async def _async_slack_request(path: str, payload: dict | None = None, method: str = "POST", use_json: bool = True) -> dict:
+    import httpx
+    token = _get_bot_token()
+    if not token:
+        raise RuntimeError("SLACK_BOT_TOKEN is not configured")
+
+    payload = payload or {}
+    request_url = f"{SLACK_API_BASE}{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            if method.upper() == "GET":
+                response = await client.get(request_url, params=payload, headers=headers, timeout=30.0)
+            elif use_json:
+                headers["Content-Type"] = "application/json; charset=utf-8"
+                response = await client.post(request_url, json=payload, headers=headers, timeout=30.0)
+            else:
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+                response = await client.post(request_url, data=payload, headers=headers, timeout=30.0)
+                
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                retry_after = int(exc.response.headers.get("Retry-After", 10))
+                raise SlackRateLimitError(retry_after)
+            raise RuntimeError(f"Slack API request failed: {exc.response.text}") from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Slack API request failed: {str(exc)}") from exc
 
 
 def lookup_user_id_by_email(email: str) -> str | None:
@@ -1279,9 +1322,46 @@ def send_checkin_reminder_message(*, employee_slack_user_id: str, employee_name:
     raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
 
 
+async def send_checkin_reminder_message_async(*, employee_slack_user_id: str, employee_name: str) -> bool:
+    channel_id = open_direct_message_channel(employee_slack_user_id)
+    portal_url = os.getenv("PORTAL_URL", "https://portal.autonexai360.com")
+
+    response = await _async_slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": "Daily Check-in Reminder",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"Hi {employee_name}, please don't forget to <{portal_url}|check in for today>.",
+                    },
+                }
+            ],
+        },
+    )
+    if response.get("ok"):
+        return True
+    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+
+
 def try_send_checkin_reminder_message(**kwargs) -> bool:
     try:
         return send_checkin_reminder_message(**kwargs)
+    except SlackRateLimitError:
+        raise
+    except Exception as exc:
+        logger.warning("Slack check-in reminder skipped for %s: %s", kwargs.get("employee_name"), exc)
+        return False
+
+
+async def try_send_checkin_reminder_message_async(**kwargs) -> bool:
+    try:
+        return await send_checkin_reminder_message_async(**kwargs)
+    except SlackRateLimitError:
+        raise
     except Exception as exc:
         logger.warning("Slack check-in reminder skipped for %s: %s", kwargs.get("employee_name"), exc)
         return False
@@ -1325,34 +1405,97 @@ def send_late_warning_message(*, employee_slack_user_id: str, employee_name: str
 def try_send_late_warning_message(**kwargs) -> bool:
     try:
         return send_late_warning_message(**kwargs)
+    except SlackRateLimitError:
+        raise
     except Exception as exc:
         logger.warning("Slack late check-in warning skipped for %s: %s", kwargs.get("employee_name"), exc)
         return False
 
 
-def send_admin_late_list(*, channel_id: str, late_checkins: list[tuple[str, str, str]], pending_checkins: list[tuple[str, str]]) -> bool:
-    """Send the late check-in report to a specific channel (e.g. admins)."""
-    if not late_checkins and not pending_checkins:
-        return True
-
+def send_admin_late_list(*, channel_id: str, stats_payload: dict) -> bool:
+    """Send the late check-in report to a specific channel (e.g. admins) using the stats engine payload."""
+    overall = stats_payload.get("overall", {})
+    projects = stats_payload.get("projects", [])
+    late_checkins = stats_payload.get("late_list", [])
+    pending_checkins = stats_payload.get("pending_list", [])
+    
+    # 1. Overall Summary Block
     blocks = [
         {
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": f"Daily Late Check-in Report (Late: {len(late_checkins)} | Pending: {len(pending_checkins)})",
+                "text": "📊 Daily Check-in & Summary Report",
                 "emoji": True
             }
-        }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*1. Overall Check-in Summary*\n"
+                        f"• 👥 *Total Active Employees:* {overall.get('total_active', 0)} (excludes employees on leave)\n"
+                        f"• ✅ *Total Checked-in:* {overall.get('total_checked_in', 0)}\n"
+                        f"• ⏳ *Total Pending:* {overall.get('total_pending', 0)}\n"
+                        f"• ⏱️ *Average Check-in Time:* WFO: {overall.get('avg_time_wfo', '—')} | WFH: {overall.get('avg_time_wfh', '—')}\n"
+                        f"• 🥇 *First Check-in:* WFO: {overall.get('first_checkin_wfo', 'None')} | WFH: {overall.get('first_checkin_wfh', 'None')}"
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Check-in Time Distribution:*\n"
+                        f"  ◽ *Before 9:00 AM:* {overall.get('distribution', {}).get('before_9', 0)} employees\n"
+                        f"  ◽ *9:00 AM - 10:00 AM:* {overall.get('distribution', {}).get('9_to_10', 0)} employees\n"
+                        f"  ◽ *10:00 AM - 11:00 AM:* {overall.get('distribution', {}).get('10_to_11', 0)} employees\n"
+                        f"  ◽ *11:00 AM - 12:00 PM:* {overall.get('distribution', {}).get('11_to_12', 0)} employees\n"
+                        f"  🟥 *After 12:00 PM:* {overall.get('distribution', {}).get('after_12', 0)} employees"
+            }
+        },
+        {"type": "divider"}
     ]
 
     def make_cell(text):
         return {"type": "raw_text", "text": str(text)}
 
+    # 2. Project-Wise Summary
+    if projects:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*2. Project-Wise Summary*"
+            }
+        })
+        
+        chunk_size = 50
+        for i in range(0, len(projects), chunk_size):
+            chunk = projects[i:i + chunk_size]
+            rows = [[make_cell("Project Name"), make_cell("Check-ins"), make_cell("Pending"), make_cell("Distribution (<9 | 9-10 | 10-11 | 11-12 | >12)")]]
+            for p in chunk:
+                name_str = p['name'][:30] + "..." if len(p['name']) > 33 else p['name']
+                chk_str = f"{p['checked_in']}/{p['allocated_total']}"
+                pend_str = str(p['pending'])
+                dist_str = f"{p['dist_before_9']} | {p['dist_9_to_10']} | {p['dist_10_to_11']} | {p['dist_11_to_12']} | {p['dist_after_12']}"
+                rows.append([make_cell(name_str), make_cell(chk_str), make_cell(pend_str), make_cell(dist_str)])
+                
+            blocks.append({
+                "type": "table",
+                "rows": rows,
+                "column_settings": [
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "center"},
+                    {"align": "center"},
+                    {"align": "center", "is_wrapped": True}
+                ]
+            })
+            
+        blocks.append({"type": "divider"})
+
     def add_table_section(title, employee_list, is_late_list=False):
         if not employee_list:
             return
-        
         blocks.append({
             "type": "section",
             "text": {
@@ -1360,57 +1503,57 @@ def send_admin_late_list(*, channel_id: str, late_checkins: list[tuple[str, str,
                 "text": f"*{title} ({len(employee_list)})*"
             }
         })
-        
         chunk_size = 50
         for i in range(0, len(employee_list), chunk_size):
             chunk = employee_list[i:i + chunk_size]
-            
             if is_late_list:
                 rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email"), make_cell("Time")]]
                 for idx, record in enumerate(chunk):
                     name, email, time_str = record
                     rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email), make_cell(time_str)])
-                
                 blocks.append({
                     "type": "table",
                     "rows": rows,
-                    "column_settings": [
-                        {"align": "center"},
-                        {"align": "left", "is_wrapped": True},
-                        {"align": "left", "is_wrapped": True},
-                        {"align": "right"}
-                    ]
+                    "column_settings": [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}, {"align": "right"}]
                 })
             else:
                 rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email")]]
                 for idx, record in enumerate(chunk):
                     name, email = record
                     rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email)])
-
                 blocks.append({
                     "type": "table",
                     "rows": rows,
-                    "column_settings": [
-                        {"align": "center"},
-                        {"align": "left", "is_wrapped": True},
-                        {"align": "left", "is_wrapped": True}
-                    ]
+                    "column_settings": [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}]
                 })
 
     add_table_section("Checked In Late (After 11:00 AM)", late_checkins, is_late_list=True)
     add_table_section("Pending (Not Checked In Yet)", pending_checkins, is_late_list=False)
 
-    response = _slack_request(
-        "/chat.postMessage",
-        {
-            "channel": channel_id,
-            "text": f"Daily Late Check-in Report (Late: {len(late_checkins)} | Pending: {len(pending_checkins)})",
-            "blocks": blocks,
-        },
-    )
-    if response.get("ok"):
-        return True
-    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+    max_blocks = 40
+    main_message_ts = None
+    text = f"Daily Late Check-in Report (Late: {len(late_checkins)} | Pending: {len(pending_checkins)})"
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    def send_chunk(payload):
+        resp = _slack_request("/chat.postMessage", payload)
+        if not resp.get("ok"):
+            raise RuntimeError(f"Slack message chunk failed: {resp.get('error') or 'unknown_error'}")
+        return resp
+    
+    for i in range(0, len(blocks), max_blocks):
+        chunk = blocks[i:i + max_blocks]
+        payload = {"channel": channel_id, "text": text if not main_message_ts else "Report Continued...", "blocks": chunk}
+        
+        if main_message_ts:
+            payload["thread_ts"] = main_message_ts
+            
+        response = send_chunk(payload)
+            
+        if not main_message_ts:
+            main_message_ts = response.get("ts")
+            
+    return True
 
 
 def try_send_admin_late_list(**kwargs) -> bool:
@@ -1459,6 +1602,8 @@ def send_pm_confirm_reminder_message(*, pm_slack_user_id: str, pm_name: str, pen
 def try_send_pm_confirm_reminder_message(**kwargs) -> bool:
     try:
         return send_pm_confirm_reminder_message(**kwargs)
+    except SlackRateLimitError:
+        raise
     except Exception as exc:
         logger.warning("Slack PM confirm reminder skipped for %s: %s", kwargs.get("pm_name"), exc)
         return False
