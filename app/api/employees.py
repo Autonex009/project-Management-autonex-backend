@@ -372,6 +372,10 @@ def list_employees_paginated(
     skill: Optional[str] = None,
     designation: Optional[str] = None,
     sort_by: Optional[str] = None,
+    time_filter: Optional[str] = None,
+    time_from: Optional[str] = None,
+    time_to: Optional[str] = None,
+    office_floor: Optional[str] = None,
     team_only: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -475,6 +479,19 @@ def list_employees_paginated(
             skill_conditions.append(cast(Employee.skills, String).ilike(f'%"{s}"%'))
         if skill_conditions:
             query = query.filter(or_(*skill_conditions))
+
+    if time_filter or time_from or time_to or office_floor:
+        from app.api.checkins import _apply_time_filter
+        today = today_ist()
+        checkin_q = db.query(DailyCheckIn.employee_id).filter(DailyCheckIn.checkin_date == today)
+        if office_floor:
+            floors = [f.strip() for f in office_floor.split(",") if f.strip()]
+            if floors:
+                checkin_q = checkin_q.filter(DailyCheckIn.office_floor.in_(floors))
+        if time_filter or time_from or time_to:
+            checkin_q = _apply_time_filter(checkin_q, time_filter, time_from, time_to, today)
+        matching_emp_ids = [r[0] for r in checkin_q.all() if r[0]]
+        query = query.filter(Employee.id.in_(matching_emp_ids if matching_emp_ids else [-1]))
 
     from app.models.leave import Leave
     from app.models.allocation import Allocation

@@ -68,7 +68,7 @@ def get_pm_team_summary(pm_id: int, db: Session = Depends(get_db)):
     }
 
 @router.get("/dashboard-kpis")
-def get_dashboard_kpis(db: Session = Depends(get_db)):
+def get_dashboard_kpis(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     from app.models.employee import Employee
     from app.models.project import DailySheet
     from app.models.leave import Leave
@@ -77,8 +77,21 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
     from datetime import date
     from sqlalchemy import func
 
+    allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
+    
+    pm_emp_ids = None
+    if allowed_ids is not None:
+        allocs = db.query(Allocation.employee_id).filter(
+            Allocation.sub_project_id.in_(allowed_ids),
+            Allocation.is_active == True
+        ).distinct().all()
+        pm_emp_ids = [r[0] for r in allocs if r[0]]
+
     # 1. Employee stats
-    emp_stats = db.query(Employee.status, func.count(Employee.id)).filter(Employee.status != "archived").group_by(Employee.status).all()
+    emp_query = db.query(Employee.status, func.count(Employee.id)).filter(Employee.status != "archived")
+    if pm_emp_ids is not None:
+        emp_query = emp_query.filter(Employee.id.in_(pm_emp_ids))
+    emp_stats = emp_query.group_by(Employee.status).all()
     emp_dict = dict(emp_stats)
 
     allocated_employee_ids = db.query(Allocation.employee_id).filter(Allocation.is_active == True).distinct().all()
@@ -89,35 +102,55 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
         Leave.start_date <= today,
         Leave.end_date >= today,
         Leave.status == "approved"
-    ).all()
-    on_leave_ids = [r[0] for r in on_leave_today_query]
+    )
+    if pm_emp_ids is not None:
+        on_leave_today_query = on_leave_today_query.filter(Leave.employee_id.in_(pm_emp_ids))
+    on_leave_ids = [r[0] for r in on_leave_today_query.all()]
 
-    idle_count = db.query(Employee).filter(
+    idle_query = db.query(Employee).filter(
         Employee.status == "active",
         Employee.id.notin_(allocated_employee_ids),
         Employee.id.notin_(on_leave_ids) if on_leave_ids else True
-    ).count()
+    )
+    if pm_emp_ids is not None:
+        idle_query = idle_query.filter(Employee.id.in_(pm_emp_ids))
+    idle_count = idle_query.count()
 
     # Employee Breakdown by Type & Designation
-    emp_type_stats = db.query(Employee.employee_type, func.count(Employee.id)).filter(Employee.status != "archived").group_by(Employee.employee_type).all()
+    emp_type_query = db.query(Employee.employee_type, func.count(Employee.id)).filter(Employee.status != "archived")
+    if pm_emp_ids is not None:
+        emp_type_query = emp_type_query.filter(Employee.id.in_(pm_emp_ids))
+    emp_type_stats = emp_type_query.group_by(Employee.employee_type).all()
     by_type = {k: v for k, v in emp_type_stats if k}
 
-    emp_desig_stats = db.query(Employee.designation, func.count(Employee.id)).filter(Employee.status != "archived").group_by(Employee.designation).all()
+    emp_desig_query = db.query(Employee.designation, func.count(Employee.id)).filter(Employee.status != "archived")
+    if pm_emp_ids is not None:
+        emp_desig_query = emp_desig_query.filter(Employee.id.in_(pm_emp_ids))
+    emp_desig_stats = emp_desig_query.group_by(Employee.designation).all()
     by_designation = {k: v for k, v in emp_desig_stats if k}
 
     # 2. Leaves
-    leave_stats = db.query(Leave.status, func.count(Leave.id)).group_by(Leave.status).all()
+    leave_query = db.query(Leave.status, func.count(Leave.id))
+    if pm_emp_ids is not None:
+        leave_query = leave_query.filter(Leave.employee_id.in_(pm_emp_ids))
+    leave_stats = leave_query.group_by(Leave.status).all()
     leave_dict = dict(leave_stats)
     
-    on_leave_today_query = db.query(Leave.employee_id, Employee.name).join(Employee, Leave.employee_id == Employee.id).filter(
+    on_leave_today_people_query = db.query(Leave.employee_id, Employee.name).join(Employee, Leave.employee_id == Employee.id).filter(
         Leave.start_date <= today,
         Leave.end_date >= today,
         Leave.status == "approved"
-    ).all()
-    on_leave_today_count = len(on_leave_today_query)
-    on_leave_today_people = [{"id": r[0], "name": r[1]} for r in on_leave_today_query]
+    )
+    if pm_emp_ids is not None:
+        on_leave_today_people_query = on_leave_today_people_query.filter(Leave.employee_id.in_(pm_emp_ids))
+    on_leave_today_result = on_leave_today_people_query.all()
+    on_leave_today_count = len(on_leave_today_result)
+    on_leave_today_people = [{"id": r[0], "name": r[1]} for r in on_leave_today_result]
 
-    pending_leaves = db.query(Leave.id, Leave.employee_id, Employee.name, Leave.start_date, Leave.end_date, Leave.is_emergency).join(Employee, Leave.employee_id == Employee.id).filter(Leave.status == "pending").all()
+    pending_leaves_query = db.query(Leave.id, Leave.employee_id, Employee.name, Leave.start_date, Leave.end_date, Leave.is_emergency).join(Employee, Leave.employee_id == Employee.id).filter(Leave.status == "pending")
+    if pm_emp_ids is not None:
+        pending_leaves_query = pending_leaves_query.filter(Leave.employee_id.in_(pm_emp_ids))
+    pending_leaves = pending_leaves_query.all()
     pending_leaves_list = [{
         "id": l.id,
         "employee_id": l.employee_id,
@@ -128,18 +161,27 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
     } for l in pending_leaves]
 
     # 3. WFH
-    wfh_stats = db.query(WFHRequest.status, func.count(WFHRequest.id)).group_by(WFHRequest.status).all()
+    wfh_query = db.query(WFHRequest.status, func.count(WFHRequest.id))
+    if pm_emp_ids is not None:
+        wfh_query = wfh_query.filter(WFHRequest.employee_id.in_(pm_emp_ids))
+    wfh_stats = wfh_query.group_by(WFHRequest.status).all()
     wfh_dict = dict(wfh_stats)
 
     on_wfh_today_query = db.query(WFHRequest.employee_id, Employee.name).join(Employee, WFHRequest.employee_id == Employee.id).filter(
         WFHRequest.wfh_date <= today,
         func.coalesce(WFHRequest.end_date, WFHRequest.wfh_date) >= today,
         WFHRequest.status == "approved"
-    ).all()
-    on_wfh_today_count = len(on_wfh_today_query)
-    on_wfh_today_people = [{"id": r[0], "name": r[1]} for r in on_wfh_today_query]
+    )
+    if pm_emp_ids is not None:
+        on_wfh_today_query = on_wfh_today_query.filter(WFHRequest.employee_id.in_(pm_emp_ids))
+    on_wfh_today_result = on_wfh_today_query.all()
+    on_wfh_today_count = len(on_wfh_today_result)
+    on_wfh_today_people = [{"id": r[0], "name": r[1]} for r in on_wfh_today_result]
 
-    pending_wfh = db.query(WFHRequest.id, WFHRequest.employee_id, Employee.name, WFHRequest.wfh_date, WFHRequest.end_date).join(Employee, WFHRequest.employee_id == Employee.id).filter(WFHRequest.status == "pending").all()
+    pending_wfh_query = db.query(WFHRequest.id, WFHRequest.employee_id, Employee.name, WFHRequest.wfh_date, WFHRequest.end_date).join(Employee, WFHRequest.employee_id == Employee.id).filter(WFHRequest.status == "pending")
+    if pm_emp_ids is not None:
+        pending_wfh_query = pending_wfh_query.filter(WFHRequest.employee_id.in_(pm_emp_ids))
+    pending_wfh = pending_wfh_query.all()
     pending_wfh_list = [{
         "id": w.id,
         "employee_id": w.employee_id,
@@ -150,15 +192,21 @@ def get_dashboard_kpis(db: Session = Depends(get_db)):
     } for w in pending_wfh]
 
     # 4. Projects
-    project_stats = db.query(DailySheet.project_status, func.count(DailySheet.id)).group_by(DailySheet.project_status).all()
+    project_query = db.query(DailySheet.project_status, func.count(DailySheet.id))
+    if allowed_ids is not None:
+        project_query = project_query.filter(DailySheet.id.in_(allowed_ids))
+    project_stats = project_query.group_by(DailySheet.project_status).all()
     proj_dict = dict(project_stats)
 
     from app.models.parent_project import MainProject
     import json
 
-    active_projects = db.query(DailySheet.project_status, DailySheet.workforce_vendors, DailySheet.client).filter(
+    active_projects_query = db.query(DailySheet.project_status, DailySheet.workforce_vendors, DailySheet.client).filter(
         DailySheet.project_status.notin_(["completed", "on-hold", "cancelled"])
-    ).all()
+    )
+    if allowed_ids is not None:
+        active_projects_query = active_projects_query.filter(DailySheet.id.in_(allowed_ids))
+    active_projects = active_projects_query.all()
 
     by_organisation = {}
     by_vendor = {}
