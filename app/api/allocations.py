@@ -14,6 +14,7 @@ from app.models.sub_project import SubProject as HierarchySubProject
 from datetime import date as date_cls
 from app.models.leave import Leave
 from app.models.wfh import WFHRequest
+from app.api.projects import _get_temp_rosters_for_projects
 from app.schemas.allocation import (
     AllocationCreate, 
     AllocationUpdate, 
@@ -196,7 +197,13 @@ def get_allocations_page(
     def is_wfh_today(emp: Employee) -> bool:
         return emp.id in wfh_today
 
+    
+    # Fetch temp data for all projects
+    from app.api.projects import _get_temp_rosters_for_projects
+    temp_data = _get_temp_rosters_for_projects(db, project_ids, allocs_by_project)
+
     # 5) Build one row per project + a search blob kept OUT of the response.
+
     built: list[tuple[ProjectAllocationRow, str]] = []
     for project in all_projects:
         allocs = allocs_by_project.get(project.id, [])
@@ -232,9 +239,10 @@ def get_allocations_page(
                 stale_count += 1
             else:
                 assigned_ids.add(a.employee_id)
-                if a.employee_id in on_leave_today:
+                loc = temp_data[project.id].get("permanent_locations", {}).get(a.employee_id)
+                if loc == "Leave":
                     on_leave += 1
-                elif is_wfh_today(emp):
+                elif loc and ("WFH" in loc.upper() or "HOME" in loc.upper()):
                     wfh_c += 1
                 else:
                     wfo += 1
@@ -272,6 +280,10 @@ def get_allocations_page(
             on_leave_count=on_leave,
             allocated_preview=preview,
             total_allocated_count=len(allocs),
+            daily_presence_total=temp_data[project.id]["temp_count"],
+            daily_presence_wfo=len([t for t in temp_data[project.id]["temp_roster"] if t["work_location"] == "WFO"]),
+            daily_presence_wfh=len([t for t in temp_data[project.id]["temp_roster"] if t["work_location"] == "WFH"]),
+            temp_roster=temp_data[project.id]["temp_roster"],
         )
         built.append((row, " ".join(name_blob_parts).lower()))
 
@@ -343,12 +355,30 @@ def get_project_allocation_detail(
     ).all() if employee_ids else []
     wfh_ids = {wfh.employee_id for wfh in wfhs}
 
+    from app.models.daily_checkin import DailyCheckIn
+    checkins = db.query(DailyCheckIn).filter(
+        DailyCheckIn.employee_id.in_(employee_ids),
+        DailyCheckIn.checkin_date == today
+    ).order_by(DailyCheckIn.created_at.desc()).all() if employee_ids else []
+    
+    checkin_map = {}
+    for c in checkins:
+        if c.employee_id not in checkin_map:
+            checkin_map[c.employee_id] = c.work_mode
+
     for a in allocs:
         emp = employee_map.get(a.employee_id)
         stale = emp is None or emp.status == "archived"
         
-        is_wfh = emp and emp.id in wfh_ids
-        location = "WFH" if is_wfh else ("WFO" if emp else None)
+        location = None
+        if emp:
+            if emp.id in checkin_map and emp.id not in on_leave_ids:
+                location = checkin_map[emp.id]
+            elif emp.id in wfh_ids:
+                location = "WFH"
+            else:
+                wm = emp.work_model or "WFO"
+                location = "WFH" if "HOME" in wm.upper() or "WFH" in wm.upper() else "WFO"
 
         items.append(ProjectAllocationDetailItem(
             allocation_id=a.id,
