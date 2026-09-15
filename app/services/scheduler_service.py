@@ -95,6 +95,10 @@ LUNCH_REPORT_MINUTE = int(os.getenv("LUNCH_REPORT_MINUTE", "0"))
 LUNCH_REPORT_PRIMARY_EMAIL = os.getenv("LUNCH_REPORT_PRIMARY_EMAIL", "jadhavashish061@gmail.com")
 LUNCH_REPORT_FALLBACK_EMAIL = os.getenv("LUNCH_REPORT_FALLBACK_EMAIL", "kisanjena40@gmail.com")
 
+# Internship lifecycle alert — run once per day (default 9:00 AM IST)
+INTERNSHIP_ALERT_HOUR = int(os.getenv("INTERNSHIP_ALERT_HOUR", "9"))
+INTERNSHIP_ALERT_MINUTE = int(os.getenv("INTERNSHIP_ALERT_MINUTE", "0"))
+
 
 def _scheduled_hiring_sync() -> None:
     db = SessionLocal()
@@ -597,6 +601,113 @@ def _scheduled_admin_report() -> None:
         db.close()
 
 
+def _check_internship_endings() -> None:
+    """Daily job: fire 30d, 7d and 0d alerts for interns whose internship_end_date
+    is approaching or has arrived today.
+
+    For each match:
+      - Creates an in-app Notification for every HR / admin user.
+      - Sends an email alert to the intern themselves.
+    Failures per-employee are logged and swallowed so one bad record never
+    blocks the rest.
+    """
+    from datetime import date
+    from app.models.employee import Employee
+    from app.models.user import User
+    from app.models.notification import Notification
+    from app.constants.leave_types import is_intern_or_contractor
+    from app.services.email_service import try_send_internship_ending_alert
+
+    ALERT_DAYS = [0, 7, 30]
+
+    db = SessionLocal()
+    try:
+        today = date.today()
+
+        # Fetch all HR/admin user IDs for in-app notifications
+        hr_admin_user_ids = [
+            uid
+            for (uid,) in db.query(User.id).filter(
+                User.role.in_(["hr", "admin"]),
+                User.is_active == True,
+            ).all()
+        ]
+
+        total_alerts = 0
+        for days in ALERT_DAYS:
+            from datetime import timedelta
+            target_date = today + timedelta(days=days)
+
+            interns = (
+                db.query(Employee)
+                .filter(
+                    Employee.status == "active",
+                    Employee.internship_end_date == target_date,
+                )
+                .all()
+            )
+
+            for emp in interns:
+                end_str = emp.internship_end_date.strftime("%d %B %Y")
+                try:
+                    # ── In-app notifications for HR/admins ──────────────────
+                    if days == 0:
+                        title = f"{emp.name}'s internship ends today"
+                        msg = (
+                            f"{emp.name} ({emp.designation or 'Intern'})'s internship ends "
+                            f"today ({end_str}). Please take the necessary action."
+                        )
+                        notif_type = "internship_ending_today"
+                    else:
+                        title = f"{emp.name}'s internship ends in {days} day{'s' if days != 1 else ''}"
+                        msg = (
+                            f"{emp.name} ({emp.designation or 'Intern'})'s internship is "
+                            f"ending on {end_str} ({days} day{'s' if days != 1 else ''} away)."
+                        )
+                        notif_type = f"internship_ending_{days}d"
+
+                    for uid in hr_admin_user_ids:
+                        db.add(Notification(
+                            user_id=uid,
+                            title=title,
+                            message=msg,
+                            type=notif_type,
+                        ))
+
+                    # ── Email alert to the intern ───────────────────────────
+                    linked_user = (
+                        db.query(User)
+                        .filter(User.employee_id == emp.id, User.is_active == True)
+                        .first()
+                    )
+                    if linked_user:
+                        try_send_internship_ending_alert(
+                            to_email=emp.email,
+                            to_name=emp.name,
+                            days_remaining=days,
+                            internship_end_date=end_str,
+                        )
+
+                    total_alerts += 1
+                except Exception as exc:
+                    logger.error(
+                        "[scheduler] Internship alert failed for employee %s: %s",
+                        emp.id, exc,
+                    )
+
+        if total_alerts:
+            db.commit()
+        logger.info(
+            "[scheduler] Internship endings check: fired %d alert(s) for dates %s",
+            total_alerts,
+            [str(today + __import__('datetime').timedelta(days=d)) for d in ALERT_DAYS],
+        )
+    except Exception as exc:
+        logger.error("[scheduler] Internship endings check failed: %s", exc)
+    finally:
+        db.close()
+
+
 def start_scheduler() -> None:
     # Encord analytics pull once a day at end of day (ENCORD_SYNC_HOUR:MINUTE).
     # max_instances=1 + coalesce so a slow run never overlaps the next.
@@ -760,6 +871,18 @@ def start_scheduler() -> None:
         hour=LUNCH_REPORT_HOUR,
         minute=LUNCH_REPORT_MINUTE,
         id="daily_lunch_report",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Internship lifecycle alerts — 30d, 7d, and 0d warnings (daily at 9:00 AM IST)
+    _scheduler.add_job(
+        _check_internship_endings,
+        trigger="cron",
+        hour=INTERNSHIP_ALERT_HOUR,
+        minute=INTERNSHIP_ALERT_MINUTE,
+        id="internship_endings_check",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

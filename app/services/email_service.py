@@ -688,3 +688,60 @@ def try_send_lunch_report_email(**kwargs) -> bool:
     except Exception as exc:
         logger.warning("[email] Lunch report email failed: %s", exc)
         return False
+
+# ── Internship Lifecycle Alerts ───────────────────────────────────────────────
+
+def send_internship_ending_alert(
+    *,
+    to_email: str,
+    to_name: str,
+    days_remaining: int,
+    internship_end_date: str,
+) -> None:
+    """Alert an intern (and optionally HR) that their internship is ending soon."""
+    if days_remaining == 0:
+        subject = f"Your Internship Ends Today — {to_name}"
+        headline = "Your internship ends <strong>today</strong>."
+        colour = "#ef4444"
+    elif days_remaining == 7:
+        subject = f"Internship Ending in 7 Days — {to_name}"
+        headline = "Your internship ends in <strong>7 days</strong>."
+        colour = "#f97316"
+    else:
+        subject = f"Internship Ending in {days_remaining} Days — {to_name}"
+        headline = f"Your internship ends in <strong>{days_remaining} days</strong>."
+        colour = "#3b82f6"
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"/></head>
+<body style="font-family:Arial,sans-serif;background:#f9fafb;margin:0;padding:32px;">
+  <table width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:8px;overflow:hidden;margin:0 auto;">
+    <tr><td style="background:{colour};padding:24px 32px;">
+      <h1 style="color:#fff;margin:0;font-size:20px;">Internship Ending Reminder</h1>
+    </td></tr>
+    <tr><td style="padding:32px;">
+      <p style="font-size:16px;color:#111827;">Hi {to_name},</p>
+      <p style="font-size:15px;color:#374151;">{headline}</p>
+      <p style="font-size:15px;color:#374151;">
+        Your internship end date is <strong>{internship_end_date}</strong>.
+        Please reach out to HR if you have any questions about next steps.
+      </p>
+      <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;"/>
+      <p style="font-size:12px;color:#9ca3af;">
+        This is an automated reminder from the Autonex HR system.
+      </p>
+    </td></tr>
+  </table>
+</body>
+</html>"""
+    _send(to_email=to_email, to_name=to_name, subject=subject, html_body=html)
+
+
+def try_send_internship_ending_alert(**kwargs) -> bool:
+    try:
+        send_internship_ending_alert(**kwargs)
+        return True
+    except Exception as exc:
+        logger.warning("[email] Internship ending alert failed: %s", exc)
+        return False

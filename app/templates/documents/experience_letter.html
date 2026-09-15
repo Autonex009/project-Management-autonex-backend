@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="doc-title">Experience Letter</div>
+
+<div class="salutation">To Whomsoever It May Concern,</div>
+
+<p>
+  This is to certify that <span class="highlight">{{ employee_name }}</span> was associated with
+  <span class="highlight">{{ company_name }}</span> as a
+  <span class="highlight">{{ designation }}</span> ({{ employee_type }})
+  from <span class="highlight">{{ start_date }}</span> to <span class="highlight">{{ end_date }}</span>.
+</p>
+
+<table class="info-table">
+  <tr><td class="label">Employee Name</td><td>{{ employee_name }}</td></tr>
+  <tr><td class="label">Designation</td><td>{{ designation }}</td></tr>
+  <tr><td class="label">Employment Type</td><td>{{ employee_type }}</td></tr>
+  <tr><td class="label">Period of Association</td><td>{{ start_date }} — {{ end_date }}</td></tr>
+</table>
+
+<p>
+  During the tenure, {{ employee_name }} consistently demonstrated professionalism, technical
+  competence, and a commitment to quality. We found them to be a reliable and hard-working
+  individual and wish them all the best in their future endeavours.
+</p>
+
+<p>
+  This letter is issued at the request of the employee for whatever purpose it may serve.
+</p>
+
+<div class="signature-block">
+  <div class="sig-col">
+    <div class="sig-line"></div>
+    <div class="sig-name">{{ hr_signatory }}</div>
+    <div class="sig-title">Human Resources</div>
+    <div class="sig-title">{{ company_name }}</div>
+  </div>
+</div>
+{% endblock %}

@@ -1,6 +1,7 @@
 fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
 sqlalchemy>=2.0.0
+jinja2>=3.1.0
 pydantic>=2.0.0
 pydantic[email]
 python-dotenv>=1.0.0
@@ -23,3 +24,6 @@ encord>=0.1.150
 arq>=0.25.0
 redis>=5.0.0
 reportlab>=4.0.0
+docxtpl>=0.20.0   # Word template rendering (.docx → filled .docx)
+xhtml2pdf>=0.2.11  # HTML → PDF fallback (used when LibreOffice is not available)
+num2words==0.5.14

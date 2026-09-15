@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 11pt;
+    color: #1a1a2e;
+    background: #fff;
+    padding: 0;
+  }
+  .page {
+    width: 794px;
+    min-height: 1123px;
+    padding: 72px 72px 80px 72px;
+    position: relative;
+    background: #fff;
+  }
+
+  /* ── Header ── */
+  .letterhead {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    border-bottom: 3px solid #1a1a2e;
+    padding-bottom: 16px;
+    margin-bottom: 28px;
+  }
+  .company-name {
+    font-size: 20pt;
+    font-weight: 900;
+    color: #1a1a2e;
+    letter-spacing: -0.5px;
+  }
+  .company-sub {
+    font-size: 8.5pt;
+    color: #555;
+    margin-top: 2px;
+  }
+  .letterhead-right {
+    text-align: right;
+    font-size: 8.5pt;
+    color: #555;
+    line-height: 1.6;
+  }
+
+  /* ── Doc reference ── */
+  .doc-ref {
+    display: flex;
+    justify-content: space-between;
+    font-size: 8.5pt;
+    color: #888;
+    margin-bottom: 28px;
+  }
+
+  /* ── Title block ── */
+  .doc-title {
+    font-size: 15pt;
+    font-weight: 800;
+    color: #1a1a2e;
+    text-align: center;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 24px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid #e2e8f0;
+  }
+
+  /* ── Body ── */
+  .salutation { margin-bottom: 16px; font-size: 11pt; }
+  p { margin-bottom: 14px; line-height: 1.75; font-size: 11pt; }
+  .highlight { font-weight: 700; }
+
+  /* ── Info table ── */
+  .info-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 18px 0 22px 0;
+    font-size: 10.5pt;
+  }
+  .info-table td {
+    padding: 8px 12px;
+    border: 1px solid #e2e8f0;
+    vertical-align: top;
+  }
+  .info-table tr:nth-child(odd) td { background: #f8fafc; }
+  .info-table .label { font-weight: 700; color: #374151; width: 38%; }
+
+  /* ── Signature ── */
+  .signature-block {
+    margin-top: 48px;
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-end;
+  }
+  .sig-col { font-size: 10pt; }
+  .sig-line {
+    width: 180px;
+    border-top: 1.5px solid #1a1a2e;
+    margin-bottom: 4px;
+    margin-top: 32px;
+  }
+  .sig-name { font-weight: 700; }
+  .sig-title { color: #555; font-size: 9pt; }
+
+  /* ── Footer ── */
+  .footer {
+    position: absolute;
+    bottom: 28px;
+    left: 72px;
+    right: 72px;
+    display: flex;
+    justify-content: space-between;
+    font-size: 8pt;
+    color: #aaa;
+    border-top: 1px solid #e2e8f0;
+    padding-top: 8px;
+  }
+
+  .badge {
+    display: inline-block;
+    background: #1a1a2e;
+    color: #fff;
+    font-size: 8pt;
+    font-weight: 700;
+    padding: 3px 10px;
+    border-radius: 20px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <!-- Letterhead -->
+  <div class="letterhead">
+    <div>
+      <div class="company-name">{{ company_name }}</div>
+      <div class="company-sub">Confidential HR Document</div>
+    </div>
+    <div class="letterhead-right">
+      {{ company_address_line1 }}<br/>
+      {{ company_address_line2 }}<br/>
+      {{ issue_date }}
+    </div>
+  </div>
+
+  <!-- Doc reference -->
+  <div class="doc-ref">
+    <span>Ref: {{ doc_ref }}</span>
+    <span>Date: {{ issue_date }}</span>
+  </div>
+
+  {% block content %}{% endblock %}
+
+  <!-- Footer -->
+  <div class="footer">
+    <span>{{ company_name }} — Confidential</span>
+    <span>Generated on {{ issue_date }}</span>
+  </div>
+</div>
+</body>
+</html>
