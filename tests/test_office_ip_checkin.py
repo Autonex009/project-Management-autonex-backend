@@ -265,7 +265,8 @@ def test_request_slack_oauth_blocks_non_office_ip():
     assert "office Wi-Fi" in exc_info.value.detail
 
 
-def test_request_slack_oauth_success():
+def test_request_slack_oauth_success(monkeypatch):
+    monkeypatch.setenv("SLACK_CLIENT_ID", "mock-slack-client-id-12345")
     from app.api.checkins import request_slack_oauth
     from app.schemas.checkin import CheckInCreate
 
