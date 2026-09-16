@@ -58,7 +58,7 @@ router = APIRouter(prefix="/api/checkins", tags=["checkins"])
 
 IST = ZoneInfo("Asia/Kolkata")
 
-DEFAULT_OFFICE_IPS = "38.20.140.122,103.54.189.22,27.0.150.66"
+DEFAULT_OFFICE_IPS = "38.20.140.122,103.54.189.22,27.0.150.66,103.19.135.178,38.20.140.154"
 
 
 def _get_office_ips(db: Optional[Session] = None) -> set[str]:
@@ -354,15 +354,16 @@ def _normalize_floor(raw: Optional[str]) -> Optional[str]:
     return cleaned
 
 
-def _detect_office_floor(client_ip: str, db: Session) -> Optional[str]:
-    """Find matching floor for the client IP based on configured OfficeIP records."""
+def _detect_office_floors(client_ip: str, db: Session) -> List[str]:
+    """Find all matching distinct floors for the client IP based on configured OfficeIP records."""
     if not client_ip or not db:
-        return None
+        return []
     try:
         ip_obj = ipaddress.ip_address(client_ip)
     except ValueError:
-        return None
+        return []
 
+    matched_floors = set()
     try:
         records = db.query(OfficeIP).all()
         for rec in records:
@@ -380,18 +381,31 @@ def _detect_office_floor(client_ip: str, db: Session) -> Optional[str]:
             except ValueError:
                 continue
             if matched:
-                return _normalize_floor(rec.floor)
+                flr = _normalize_floor(rec.floor)
+                if flr:
+                    matched_floors.add(flr)
     except Exception as e:
-        logger.warning("Error detecting office floor for client IP %s: %s", client_ip, e)
+        logger.warning("Error detecting office floors for client IP %s: %s", client_ip, e)
+
+    if matched_floors:
+        return sorted(list(matched_floors), key=lambda x: int(x) if x.isdigit() else str(x))
 
     # Fallback default IP-to-floor mapping
     if client_ip == "38.20.140.122":
-        return "7"
-    elif client_ip == "103.54.189.22":
-        return "9"
-    elif client_ip == "27.0.150.66":
-        return "17"
+        return ["7", "9", "17"]
+    elif client_ip in ("103.54.189.22", "27.0.150.66"):
+        return ["7"]
+    elif client_ip in ("103.19.135.178", "38.20.140.154"):
+        return ["9"]
 
+    return []
+
+
+def _detect_office_floor(client_ip: str, db: Session) -> Optional[str]:
+    """Find matching floor for the client IP when exactly one floor matches."""
+    floors = _detect_office_floors(client_ip, db)
+    if len(floors) == 1:
+        return floors[0]
     return None
 
 
@@ -458,7 +472,25 @@ def get_today_status(
 
     client_ip = _get_client_ip(http_request)
     is_office = _is_office_ip(client_ip, db=db)
-    detected_floor = _detect_office_floor(client_ip, db) if is_office else None
+    detected_floors = _detect_office_floors(client_ip, db) if is_office else []
+    detected_floor = detected_floors[0] if len(detected_floors) == 1 else None
+
+    # Smart suggested floor:
+    # 1. If single floor detected, use it.
+    # 2. If multiple floors match the IP, check employee's previous check-in.
+    suggested_floor = None
+    if len(detected_floors) == 1:
+        suggested_floor = detected_floors[0]
+    elif len(detected_floors) > 1:
+        last_checkin = (
+            db.query(DailyCheckIn)
+            .filter(DailyCheckIn.employee_id == employee_id, DailyCheckIn.office_floor.isnot(None))
+            .order_by(DailyCheckIn.checkin_date.desc(), DailyCheckIn.id.desc())
+            .first()
+        )
+        if last_checkin and last_checkin.office_floor in detected_floors:
+            suggested_floor = last_checkin.office_floor
+
     available_floors = _get_available_floors(db)
 
     return TodayCheckInStatus(
@@ -469,6 +501,8 @@ def get_today_status(
         is_office_network=is_office,
         has_slack=bool(slack_id),
         detected_floor=detected_floor,
+        detected_floors=detected_floors,
+        suggested_floor=suggested_floor,
         available_floors=available_floors,
     )
 

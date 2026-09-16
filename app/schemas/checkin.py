@@ -104,6 +104,8 @@ class TodayCheckInStatus(BaseModel):
     is_office_network: Optional[bool] = None
     has_slack: bool = False
     detected_floor: Optional[str] = None
+    detected_floors: List[str] = []
+    suggested_floor: Optional[str] = None
     available_floors: List[str] = []
 
     class Config:

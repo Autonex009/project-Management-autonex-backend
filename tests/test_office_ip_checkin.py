@@ -483,7 +483,7 @@ def test_validate_ip_or_cidr():
 
 def test_detect_office_floor_and_available_floors():
     from app.models.office_ip import OfficeIP
-    from app.api.checkins import _detect_office_floor, _get_available_floors
+    from app.api.checkins import _detect_office_floor, _detect_office_floors, _get_available_floors
 
     mock_db = MagicMock()
     ip1 = OfficeIP(id=1, ip_address="38.20.140.122", label="Floor 7 IP", floor="Floor 7")
@@ -492,14 +492,40 @@ def test_detect_office_floor_and_available_floors():
     mock_db.query.return_value.all.return_value = [ip1, ip2, ip3]
 
     assert _detect_office_floor("38.20.140.122", mock_db) == "7"
+    assert _detect_office_floors("38.20.140.122", mock_db) == ["7"]
     assert _detect_office_floor("103.54.189.22", mock_db) == "9"
     assert _detect_office_floor("27.0.150.66", mock_db) == "17"
     assert _detect_office_floor("192.168.1.1", mock_db) is None
+    assert _detect_office_floors("192.168.1.1", mock_db) == []
 
     floors = _get_available_floors(mock_db)
     assert "7" in floors
     assert "9" in floors
     assert "17" in floors
+
+
+def test_shared_multi_floor_ip_detection():
+    from app.models.office_ip import OfficeIP
+    from app.api.checkins import _detect_office_floor, _detect_office_floors
+
+    mock_db = MagicMock()
+    # 38.20.140.122 shared across Floor 7, Floor 9, and Floor 17
+    ip1 = OfficeIP(id=1, ip_address="38.20.140.122", label="Autonex_Annotators703-2", floor="Floor 7")
+    ip2 = OfficeIP(id=2, ip_address="38.20.140.122", label="Autonex-jeebr", floor="Floor 9")
+    ip3 = OfficeIP(id=3, ip_address="38.20.140.122", label="Autonex1710", floor="Floor 17")
+    # 103.19.135.178 only on Floor 9
+    ip4 = OfficeIP(id=4, ip_address="103.19.135.178", label="Autonex-Blazenet", floor="Floor 9")
+    mock_db.query.return_value.all.return_value = [ip1, ip2, ip3, ip4]
+
+    detected = _detect_office_floors("38.20.140.122", mock_db)
+    assert set(detected) == {"7", "9", "17"}
+    # Because multiple floors match, _detect_office_floor returns None so UI does not lock into one floor
+    assert _detect_office_floor("38.20.140.122", mock_db) is None
+
+    # Single-floor IP returns that exact floor
+    assert _detect_office_floor("103.19.135.178", mock_db) == "9"
+    assert _detect_office_floors("103.19.135.178", mock_db) == ["9"]
+
 
 
 

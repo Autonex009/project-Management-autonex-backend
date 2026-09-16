@@ -12,7 +12,7 @@ class OfficeIP(Base):
     __tablename__ = "office_ips"
 
     id = Column(Integer, primary_key=True, index=True)
-    ip_address = Column(Text, nullable=False, unique=True)
+    ip_address = Column(Text, nullable=False, index=True)
     label = Column(Text, nullable=True)
     floor = Column(Text, nullable=True)
     updated_by = Column(Integer, nullable=True)
