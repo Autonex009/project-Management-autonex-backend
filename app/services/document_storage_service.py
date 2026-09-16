@@ -8,6 +8,7 @@ Folder convention: /{employee_id}/{doc_type}/{version}.pdf
 import json
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -120,9 +121,7 @@ def get_signed_url(stored_path: str, expires_in: int = SIGNED_URL_EXPIRY_SECONDS
 
     # TEMPORARY: Local storage fallback
     if not is_supabase_configured():
-        import urllib.parse
         encoded_path = urllib.parse.quote(stored_path)
-        # Note: Assuming backend is running on localhost:8000. For production without Supabase, adjust hostname.
         return f"http://localhost:8000/api/employees/documents/local/{encoded_path}"
 
     url = f"{SUPABASE_URL}/storage/v1/object/sign/{DOCS_BUCKET}/{stored_path}"
