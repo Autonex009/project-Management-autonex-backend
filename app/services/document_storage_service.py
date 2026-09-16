@@ -145,7 +145,8 @@ def get_signed_url(stored_path: str, expires_in: int = SIGNED_URL_EXPIRY_SECONDS
             data = json.loads(resp.read())
             signed = data.get("signedURL") or data.get("signedUrl") or ""
             if signed.startswith("/"):
-                signed = f"{SUPABASE_URL}{signed}"
+                # Supabase returns signedURL as "/object/sign/..." (no /storage/v1 prefix)
+                signed = f"{SUPABASE_URL}/storage/v1{signed}"
             return signed or None
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore")
