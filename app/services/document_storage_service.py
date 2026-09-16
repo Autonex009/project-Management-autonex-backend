@@ -86,17 +86,22 @@ def upload_document(
         return stored_path
 
     url = f"{SUPABASE_URL}/storage/v1/object/{DOCS_BUCKET}/{stored_path}"
-    headers = _auth_headers(content_type)
+    # Use x-upsert so the request works for both new and existing files.
+    headers = {**_auth_headers(content_type), "x-upsert": "true"}
+
+    logger.info("[upload_document] Uploading to: %s", url)
 
     def _put() -> None:
         req = urllib.request.Request(url, data=file_bytes, headers=headers, method="POST")
-        with urllib.request.urlopen(req):
-            pass
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            logger.info("[upload_document] Supabase response %s: %s", resp.status, body)
 
     try:
         _put()
     except urllib.error.HTTPError as err:
         body = err.read().decode("utf-8", errors="ignore")
+        logger.error("[upload_document] Supabase HTTP %s: %s", err.code, body)
         if err.code in (404, 400) or "not found" in body.lower() or "bucket" in body.lower():
             _ensure_private_bucket_exists()
             try:
@@ -110,6 +115,9 @@ def upload_document(
             raise RuntimeError(
                 f"Document upload to '{DOCS_BUCKET}' failed ({err.code}): {body}"
             ) from err
+    except Exception as exc:
+        logger.error("[upload_document] Unexpected error: %s", exc)
+        raise RuntimeError(f"Document upload to '{DOCS_BUCKET}' failed: {exc}") from exc
 
     return stored_path
 
