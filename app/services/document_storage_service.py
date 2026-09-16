@@ -6,11 +6,14 @@ Access is always through time-limited signed URLs — never via public links.
 Folder convention: /{employee_id}/{doc_type}/{version}.pdf
 """
 import json
+import logging
 import os
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
@@ -136,7 +139,12 @@ def get_signed_url(stored_path: str, expires_in: int = SIGNED_URL_EXPIRY_SECONDS
             if signed.startswith("/"):
                 signed = f"{SUPABASE_URL}{signed}"
             return signed or None
-    except Exception:
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        logger.error("[get_signed_url] Supabase HTTP %s for path '%s': %s", e.code, stored_path, body)
+        return None
+    except Exception as e:
+        logger.error("[get_signed_url] Unexpected error for path '%s': %s", stored_path, e)
         return None
 
 
