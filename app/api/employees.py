@@ -45,6 +45,7 @@ from app.services.auth_service import (
 from app.services.email_service import try_send_email_changed_email
 from app.services.identity_validator import check_duplicate_identity
 from app.services import audit_service
+from app.services import document_service as _doc_svc
 
 # Column → display name for audit diffs. Anything unmapped falls back to a humanised
 # column name, so a new field still shows up rather than being silently dropped.
@@ -263,6 +264,22 @@ def create_employee(
     db.commit()
     db.refresh(employee)
 
+    # ── Auto-generate internship offer letter for interns / contractors ─────────
+    if is_intern_or_contractor(employee.employee_type):
+        try:
+            _doc_svc.generate_document(
+                employee_id=employee.id,
+                doc_type="internship_offer_letter",
+                db=db,
+                uploaded_by=current_user.id,
+            )
+        except Exception as _exc:
+            logging.getLogger(__name__).warning(
+                "Auto-generation of internship_offer_letter failed for employee %s: %s",
+                employee.id,
+                _exc,
+            )
+
     # Deliver welcome email with credentials to employee
     portal_url = (
         "https://pmportal.autonexai360.com/login/admin" if user.role in ("admin", "hr")
@@ -372,6 +389,10 @@ def list_employees_paginated(
     skill: Optional[str] = None,
     designation: Optional[str] = None,
     sort_by: Optional[str] = None,
+    time_filter: Optional[str] = None,
+    time_from: Optional[str] = None,
+    time_to: Optional[str] = None,
+    office_floor: Optional[str] = None,
     team_only: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -475,6 +496,19 @@ def list_employees_paginated(
             skill_conditions.append(cast(Employee.skills, String).ilike(f'%"{s}"%'))
         if skill_conditions:
             query = query.filter(or_(*skill_conditions))
+
+    if time_filter or time_from or time_to or office_floor:
+        from app.api.checkins import _apply_time_filter
+        today = today_ist()
+        checkin_q = db.query(DailyCheckIn.employee_id).filter(DailyCheckIn.checkin_date == today)
+        if office_floor:
+            floors = [f.strip() for f in office_floor.split(",") if f.strip()]
+            if floors:
+                checkin_q = checkin_q.filter(DailyCheckIn.office_floor.in_(floors))
+        if time_filter or time_from or time_to:
+            checkin_q = _apply_time_filter(checkin_q, time_filter, time_from, time_to, today)
+        matching_emp_ids = [r[0] for r in checkin_q.all() if r[0]]
+        query = query.filter(Employee.id.in_(matching_emp_ids if matching_emp_ids else [-1]))
 
     from app.models.leave import Leave
     from app.models.allocation import Allocation
@@ -1264,6 +1298,22 @@ def convert_to_fulltime(
 
     db.commit()
     db.refresh(employee)
+
+    # ── Auto-generate full-time offer letter on conversion ──────────────────────
+    try:
+        _doc_svc.generate_document(
+            employee_id=employee.id,
+            doc_type="fulltime_offer_letter",
+            db=db,
+            uploaded_by=current_user.id,
+        )
+    except Exception as _exc:
+        logging.getLogger(__name__).warning(
+            "Auto-generation of fulltime_offer_letter failed for employee %s: %s",
+            employee.id,
+            _exc,
+        )
+
     return employee
 
 

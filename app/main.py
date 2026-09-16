@@ -8,7 +8,7 @@ from arq.connections import RedisSettings
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log, employee_badge, onboarding_pipeline
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log, employee_badge, onboarding_pipeline, employee_document
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -46,6 +46,7 @@ from app.api.badges import router as badges_router
 from app.api.slack import router as slack_router
 from app.api.checkins import router as checkins_router
 from app.api.onboarding_pipeline import router as onboarding_pipeline_router
+from app.api.employee_documents import router as employee_documents_router
 
 Base.metadata.create_all(bind=engine)
 
@@ -155,4 +156,5 @@ app.include_router(badges_router)
 app.include_router(slack_router)
 app.include_router(checkins_router)
 app.include_router(onboarding_pipeline_router)
+app.include_router(employee_documents_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")

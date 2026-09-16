@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Text, TIMESTAMP, JSON, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, Text, TIMESTAMP, JSON, ForeignKey, Date
 from sqlalchemy.sql import func
 
 from app.db.database import Base
@@ -55,6 +55,11 @@ class Employee(Base):
     previous_employee_type = Column(Text, nullable=True)
     converted_to_fulltime_at = Column(TIMESTAMP, nullable=True)
     converted_by = Column(Integer, nullable=True)  # user_id of the admin who promoted
+
+    # ── Internship lifecycle ──────────────────────────────────────────────
+    # Date the internship period is expected to end. Used by the daily worker
+    # job (Phase 3) to fire 30d / 7d / 0d HR alerts.
+    internship_end_date = Column(Date, nullable=True)
 
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(
