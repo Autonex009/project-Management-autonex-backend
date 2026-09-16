@@ -293,16 +293,6 @@ def delete_employee_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Delete from Supabase storage (best-effort — log but don't block if it fails)
-    if doc.file_url:
-        deleted = delete_document(doc.file_url)
-        if not deleted:
-            import logging
-            logging.getLogger(__name__).warning(
-                "[delete_employee_document] Failed to delete '%s' from Supabase storage",
-                doc.file_url,
-            )
-
     doc.is_active = False
     db.commit()
 
