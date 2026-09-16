@@ -2,17 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Pre-accept Microsoft Font EULA so the Docker build doesn't hang
-RUN echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections
-
-# Install system deps, LibreOffice, and Microsoft Core Fonts
+# Install system deps and LibreOffice
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         gcc \
         libpq-dev \
-        libreoffice-core-nogui \
-        libreoffice-writer \
-        ttf-mscorefonts-installer && \
+        libreoffice-writer && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies

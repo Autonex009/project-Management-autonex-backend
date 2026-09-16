@@ -172,7 +172,7 @@ def test_checkin_logs_explicit_device_type(ctx):
         "mood": "okay",
         "device_type": "desktop",
     }
-    resp = client.post("/api/checkins", json=payload)
+    resp = client.post("/api/checkins", json=payload, headers={"x-forwarded-for": "38.20.140.122"})
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["device_type"] == "desktop"
