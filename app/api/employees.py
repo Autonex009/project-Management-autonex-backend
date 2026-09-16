@@ -45,6 +45,7 @@ from app.services.auth_service import (
 from app.services.email_service import try_send_email_changed_email
 from app.services.identity_validator import check_duplicate_identity
 from app.services import audit_service
+from app.services import document_service as _doc_svc
 
 # Column → display name for audit diffs. Anything unmapped falls back to a humanised
 # column name, so a new field still shows up rather than being silently dropped.
@@ -262,6 +263,22 @@ def create_employee(
 
     db.commit()
     db.refresh(employee)
+
+    # ── Auto-generate internship offer letter for interns / contractors ─────────
+    if is_intern_or_contractor(employee.employee_type):
+        try:
+            _doc_svc.generate_document(
+                employee_id=employee.id,
+                doc_type="internship_offer_letter",
+                db=db,
+                uploaded_by=current_user.id,
+            )
+        except Exception as _exc:
+            logging.getLogger(__name__).warning(
+                "Auto-generation of internship_offer_letter failed for employee %s: %s",
+                employee.id,
+                _exc,
+            )
 
     # Deliver welcome email with credentials to employee
     portal_url = (
@@ -1281,6 +1298,22 @@ def convert_to_fulltime(
 
     db.commit()
     db.refresh(employee)
+
+    # ── Auto-generate full-time offer letter on conversion ──────────────────────
+    try:
+        _doc_svc.generate_document(
+            employee_id=employee.id,
+            doc_type="fulltime_offer_letter",
+            db=db,
+            uploaded_by=current_user.id,
+        )
+    except Exception as _exc:
+        logging.getLogger(__name__).warning(
+            "Auto-generation of fulltime_offer_letter failed for employee %s: %s",
+            employee.id,
+            _exc,
+        )
+
     return employee
 
 
