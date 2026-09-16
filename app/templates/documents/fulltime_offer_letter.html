@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="doc-title">Offer Letter — Full-time Employment</div>
+
+<div class="salutation">Dear <span class="highlight">{{ employee_name }}</span>,</div>
+
+<p>
+  On behalf of <span class="highlight">{{ company_name }}</span>, we are pleased to offer you the
+  position of <span class="highlight">{{ designation }}</span>, subject to the terms and conditions
+  set forth in this letter.
+</p>
+
+<table class="info-table">
+  <tr><td class="label">Employee Name</td><td>{{ employee_name }}</td></tr>
+  <tr><td class="label">Designation</td><td>{{ designation }}</td></tr>
+  <tr><td class="label">Date of Joining</td><td>{{ start_date }}</td></tr>
+  <tr><td class="label">Annual CTC</td><td>₹ {{ annual_ctc }}</td></tr>
+  <tr><td class="label">Monthly In-hand</td><td>₹ {{ monthly_inhand }}</td></tr>
+  <tr><td class="label">Work Location</td><td>{{ office_address_line1 }}, {{ office_address_line2 }}</td></tr>
+</table>
+
+<p>
+  Your employment with {{ company_name }} is at-will and subject to the terms of the Employee
+  Handbook, which will be provided to you on your joining date. The details of your complete
+  compensation structure, including all applicable benefits, will be provided in a separate
+  Salary Structure document.
+</p>
+
+<p>
+  Please sign and return a copy of this letter on or before <span class="highlight">{{ start_date }}</span>
+  to confirm your acceptance of this offer. This offer will lapse if not accepted by the
+  aforementioned date.
+</p>
+
+<p>We look forward to having you on the team!</p>
+
+<div class="signature-block">
+  <div class="sig-col">
+    <div class="sig-line"></div>
+    <div class="sig-name">{{ hr_signatory }}</div>
+    <div class="sig-title">Human Resources</div>
+    <div class="sig-title">{{ company_name }}</div>
+  </div>
+  <div class="sig-col" style="text-align:right;">
+    <div class="sig-line" style="margin-left:auto;"></div>
+    <div class="sig-name">{{ employee_name }}</div>
+    <div class="sig-title">Candidate Signature &amp; Date</div>
+  </div>
+</div>
+{% endblock %}
