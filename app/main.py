@@ -8,7 +8,7 @@ from arq.connections import RedisSettings
 from sqlalchemy import inspect, text
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log, employee_badge, onboarding_pipeline, employee_document
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, office_ip, chat, encord_analytics, encord_activity, vendor, audit_log, employee_badge, onboarding_pipeline, employee_document
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -34,6 +34,7 @@ from app.api.perf_evals import router as perf_evals_router
 from app.api.onboarding import router as onboarding_router
 from app.api.company_settings import router as company_settings_router
 from app.api.wifi_networks import router as wifi_networks_router
+from app.api.office_ips import router as office_ips_router
 from app.api.hiring_sync import router as hiring_sync_router
 from app.api.chat import router as chat_router
 from app.api.encord_sync import router as encord_sync_router
@@ -145,6 +146,7 @@ app.include_router(perf_evals_router)
 app.include_router(onboarding_router)
 app.include_router(company_settings_router)
 app.include_router(wifi_networks_router)
+app.include_router(office_ips_router)
 app.include_router(hiring_sync_router)
 app.include_router(chat_router)
 app.include_router(encord_sync_router)
