@@ -520,8 +520,10 @@ def _get_filtered_enriched_projects(
 
     if search:
         query = query.filter(Project.name.ilike(f"%{search}%"))
-    if priority and priority != "all":
-        query = query.filter(Project.priority == priority)
+    if priority and str(priority) != "all":
+        priorities = [p.strip() for p in str(priority).split(",") if p.strip() and p.strip() != "all"]
+        if priorities:
+            query = query.filter(Project.priority.in_(priorities))
     if main_project_id:
         query = query.filter(Project.main_project_id == main_project_id)
 
@@ -532,20 +534,23 @@ def _get_filtered_enriched_projects(
         all_projects = [p for p in all_projects if p.id in allowed_ids]
 
     tl_valid_pids = set()
-    if team_lead_id and team_lead_id != "all":
-        from app.models.allocation import Allocation
-        tl_allocs = db.query(Allocation.sub_project_id, Allocation.role_tags).filter(
-            Allocation.employee_id == team_lead_id,
-            Allocation.is_active == True
-        ).all()
-        tl_valid_pids = {r[0] for r in tl_allocs if r[1] and TEAM_LEAD_ROLE_TAG in r[1]}
+    if team_lead_id and str(team_lead_id) != "all":
+        tl_ids = [int(p.strip()) for p in str(team_lead_id).split(",") if p.strip().isdigit() and p.strip() != "all"]
+        if tl_ids:
+            from app.models.allocation import Allocation
+            tl_allocs = db.query(Allocation.sub_project_id, Allocation.role_tags).filter(
+                Allocation.employee_id.in_(tl_ids),
+                Allocation.is_active == True
+            ).all()
+            tl_valid_pids = {r[0] for r in tl_allocs if r[1] and TEAM_LEAD_ROLE_TAG in r[1]}
 
     filtered = []
 
     for p in all_projects:
         # Client / Organization
-        if organization and organization != "all":
-            if (p.client or "") != organization:
+        if organization and str(organization) != "all":
+            orgs = [o.strip() for o in str(organization).split(",") if o.strip() and o.strip() != "all"]
+            if orgs and (p.client or "") not in orgs:
                 continue
 
         # Autonex only
@@ -573,23 +578,31 @@ def _get_filtered_enriched_projects(
             if is_dev or is_archived:
                 continue
 
-        if status and status != "all":
-            if status == "active":
-                if status_val not in ("active", "in-progress", "in progress"):
-                    continue
-            elif status == "poc":
-                if status_val != "poc":
-                    continue
-            else:
-                if status_val != status.lower():
+        if status and str(status) != "all":
+            statuses = [s.strip().lower() for s in str(status).split(",") if s.strip() and s.strip() != "all"]
+            if statuses:
+                matched = False
+                for st in statuses:
+                    if st == "active" and status_val in ("active", "in-progress", "in progress"):
+                        matched = True
+                        break
+                    elif st == "poc" and status_val == "poc":
+                        matched = True
+                        break
+                    elif status_val == st:
+                        matched = True
+                        break
+                if not matched:
                     continue
 
-        if pm_id and pm_id != "all":
-            assigned = p.assigned_employee_ids or []
-            if str(pm_id) not in [str(x) for x in assigned]:
-                continue
+        if pm_id and str(pm_id) != "all":
+            pm_ids = [str(x.strip()) for x in str(pm_id).split(",") if x.strip() and x.strip() != "all"]
+            if pm_ids:
+                assigned = [str(x) for x in (p.assigned_employee_ids or [])]
+                if not any(pid in assigned for pid in pm_ids):
+                    continue
 
-        if team_lead_id and team_lead_id != "all":
+        if team_lead_id and str(team_lead_id) != "all":
             if p.id not in tl_valid_pids:
                 continue
 
@@ -613,8 +626,8 @@ def list_projects_paginated(
     priority: str | None = None,
     organization: str | None = None,
     autonex_only: bool = False,
-    pm_id: int | None = None,
-    team_lead_id: int | None = None,
+    pm_id: str | None = None,
+    team_lead_id: str | None = None,
     recommendation: str | None = None,
     main_project_id: int | None = None,
     db: Session = Depends(get_db),
