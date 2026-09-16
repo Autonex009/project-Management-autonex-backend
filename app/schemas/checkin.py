@@ -42,8 +42,10 @@ class CheckInCreate(BaseModel):
     @classmethod
     def validate_office_floor(cls, v, info):
         if info.data.get("work_mode") == "WFO":
-            if not v or not str(v).strip():
+            if not v:
                 raise ValueError("Please select your office floor.")
+            if v not in OFFICE_FLOOR_CHOICES:
+                raise ValueError(f"office_floor must be one of: {', '.join(OFFICE_FLOOR_CHOICES)}")
         return v
 
     @field_validator("lunch_preference")
@@ -101,31 +103,9 @@ class TodayCheckInStatus(BaseModel):
     checkin: Optional[CheckInResponse] = None
     project_options: List[dict] = []  # [{project_id, project_name}]
     suggested_work_mode: str = "WFO"  # "WFH" if an approved WFH request covers today
-    is_office_network: Optional[bool] = None
-    has_slack: bool = False
-    detected_floor: Optional[str] = None
-    detected_floors: List[str] = []
-    suggested_floor: Optional[str] = None
-    available_floors: List[str] = []
 
     class Config:
         from_attributes = True
-
-
-class CheckInConfirmationResponse(BaseModel):
-    status: str  # "completed" or "pending_slack"
-    message: str
-    checkin: Optional[CheckInResponse] = None
-    expires_in: Optional[int] = None  # seconds
-
-
-class SlackConfirmRequest(BaseModel):
-    token: str
-
-
-class SlackOAuthRequestResponse(BaseModel):
-    oauth_url: str
-    expires_in: int = 30
 
 
 class TeamCheckInRow(BaseModel):
