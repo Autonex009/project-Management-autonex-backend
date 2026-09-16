@@ -177,6 +177,12 @@ def delete_document(stored_path: str) -> bool:
     req = urllib.request.Request(url, headers=_auth_headers(), method="DELETE")
     try:
         with urllib.request.urlopen(req):
+            logger.info("[delete_document] Deleted '%s' from Supabase", stored_path)
             return True
-    except Exception:
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        logger.error("[delete_document] Supabase HTTP %s for path '%s': %s", e.code, stored_path, body)
+        return False
+    except Exception as e:
+        logger.error("[delete_document] Unexpected error for path '%s': %s", stored_path, e)
         return False
