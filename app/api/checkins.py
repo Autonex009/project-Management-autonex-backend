@@ -19,6 +19,7 @@ from app.models.wfh import WFHRequest
 from app.models.daily_checkin import DailyCheckIn
 from app.models.employee import Employee
 from app.models.user import User
+from app.models.office_ip import OfficeIP
 from app.services.auth_service import (
     get_current_user,
     require_role,
@@ -57,7 +58,14 @@ IST = ZoneInfo("Asia/Kolkata")
 DEFAULT_OFFICE_IPS = "38.20.140.122,103.54.189.22,27.0.150.66"
 
 
-def _get_office_ips() -> set[str]:
+def _get_office_ips(db: Optional[Session] = None) -> set[str]:
+    if db is not None:
+        try:
+            db_ips = {item.ip_address.strip() for item in db.query(OfficeIP).all() if item.ip_address}
+            if db_ips:
+                return db_ips
+        except Exception as e:
+            logger.warning("Error fetching office IPs from database: %s", e)
     raw = os.getenv("OFFICE_IPS", DEFAULT_OFFICE_IPS)
     return {ip.strip() for ip in raw.split(",") if ip.strip()}
 
@@ -78,13 +86,13 @@ def _get_client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
-def _is_office_ip(client_ip: str) -> bool:
+def _is_office_ip(client_ip: str, db: Optional[Session] = None) -> bool:
     """Verify if client IP matches authorized office public IPs or CIDR blocks."""
     if os.getenv("BYPASS_OFFICE_IP_CHECK", "false").lower() in ("true", "1"):
         return True
     if not client_ip:
         return False
-    office_ips = _get_office_ips()
+    office_ips = _get_office_ips(db)
     if client_ip in office_ips:
         return True
     try:
@@ -229,6 +237,75 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
     )
 
 
+def _normalize_floor(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    cleaned = raw.strip()
+    if cleaned.lower().startswith("floor "):
+        return cleaned[6:].strip()
+    return cleaned
+
+
+def _detect_office_floor(client_ip: str, db: Session) -> Optional[str]:
+    """Find matching floor for the client IP based on configured OfficeIP records."""
+    if not client_ip or not db:
+        return None
+    try:
+        ip_obj = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return None
+
+    try:
+        records = db.query(OfficeIP).all()
+        for rec in records:
+            if not rec.ip_address or not rec.floor:
+                continue
+            rec_ip_str = rec.ip_address.strip()
+            matched = False
+            try:
+                if "/" in rec_ip_str:
+                    if ip_obj in ipaddress.ip_network(rec_ip_str, strict=False):
+                        matched = True
+                else:
+                    if ip_obj == ipaddress.ip_address(rec_ip_str):
+                        matched = True
+            except ValueError:
+                continue
+            if matched:
+                return _normalize_floor(rec.floor)
+    except Exception as e:
+        logger.warning("Error detecting office floor for client IP %s: %s", client_ip, e)
+
+    # Fallback default IP-to-floor mapping
+    if client_ip == "38.20.140.122":
+        return "7"
+    elif client_ip == "103.54.189.22":
+        return "9"
+    elif client_ip == "27.0.150.66":
+        return "17"
+
+    return None
+
+
+def _get_available_floors(db: Session) -> List[str]:
+    """Retrieve distinct configured floors from OfficeIP records, always including standard floors 7, 9, 17."""
+    seen = {"7", "9", "17"}
+    distinct_floors = ["7", "9", "17"]
+    if db:
+        try:
+            records = db.query(OfficeIP).all()
+            for rec in records:
+                normalized = _normalize_floor(rec.floor)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    distinct_floors.append(normalized)
+        except Exception as e:
+            logger.warning("Error fetching available floors: %s", e)
+    return sorted(distinct_floors, key=lambda x: int(x) if x.isdigit() else str(x))
+
+
+# ── Today Status ─────────────────────────────────────────────────────────────
+
 @router.get("/today", response_model=TodayCheckInStatus)
 def get_today_status(
     response: Response,
@@ -272,7 +349,9 @@ def get_today_status(
         slack_id = try_get_or_cache_employee_slack_user_id(db, employee)
 
     client_ip = _get_client_ip(http_request)
-    is_office = _is_office_ip(client_ip)
+    is_office = _is_office_ip(client_ip, db=db)
+    detected_floor = _detect_office_floor(client_ip, db) if is_office else None
+    available_floors = _get_available_floors(db)
 
     return TodayCheckInStatus(
         already_checked_in=existing is not None,
@@ -281,6 +360,8 @@ def get_today_status(
         suggested_work_mode="WFH" if approved_wfh_today else "WFO",
         is_office_network=is_office,
         has_slack=bool(slack_id),
+        detected_floor=detected_floor,
+        available_floors=available_floors,
     )
 
 
@@ -304,7 +385,7 @@ def submit_checkin(
 
     if payload.work_mode == "WFO":
         client_ip = _get_client_ip(http_request)
-        if not _is_office_ip(client_ip):
+        if not _is_office_ip(client_ip, db=db):
             logger.warning(
                 "[checkin] Blocked WFO check-in for employee_id=%s from non-office IP '%s'",
                 employee_id,
@@ -354,7 +435,7 @@ def request_checkin_confirmation(
     portal_ip = _get_client_ip(http_request)
 
     if payload.work_mode == "WFO":
-        if not _is_office_ip(portal_ip):
+        if not _is_office_ip(portal_ip, db=db):
             logger.warning(
                 "[checkin] Blocked WFO request-confirmation for employee_id=%s from non-office IP '%s'",
                 employee_id,
@@ -551,7 +632,7 @@ def confirm_slack_checkin(
         )
 
     # For WFO, click_ip must also be an authorized office IP
-    if work_mode == "WFO" and not _is_office_ip(click_ip):
+    if work_mode == "WFO" and not _is_office_ip(click_ip, db=db):
         logger.warning(
             "[checkin/confirm-slack] Blocked WFO confirm for employee_id=%s: click_ip '%s' not in office IPs",
             employee_id,
@@ -606,7 +687,7 @@ def request_slack_oauth(
     portal_ip = _get_client_ip(http_request)
 
     if payload.work_mode == "WFO":
-        if not _is_office_ip(portal_ip):
+        if not _is_office_ip(portal_ip, db=db):
             logger.warning(
                 "[checkin] Blocked WFO request-slack-oauth for employee_id=%s from non-office IP '%s'",
                 employee_id,
@@ -694,7 +775,7 @@ def slack_oauth_callback(
         )
         return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=ip_mismatch&portal_ip={portal_ip}&client_ip={client_ip}&oauth_popup=1")
 
-    if work_mode == "WFO" and not _is_office_ip(client_ip):
+    if work_mode == "WFO" and not _is_office_ip(client_ip, db=db):
         logger.warning("[slack-oauth-callback] Blocked WFO checkin from non-office IP '%s' for employee_id=%s", client_ip, employee_id)
         return RedirectResponse(f"{frontend_url}/dashboard?checkin_error=office_ip_required&ip={client_ip}&oauth_popup=1")
 

@@ -451,4 +451,56 @@ def test_slack_oauth_callback_detects_ip_mismatch():
     assert "checkin_error=ip_mismatch" in resp.headers["location"]
 
 
+def test_office_ip_db_query():
+    from app.models.office_ip import OfficeIP
+    from app.api.checkins import _is_office_ip, _get_office_ips
+
+    mock_db = MagicMock()
+    ip1 = OfficeIP(id=1, ip_address="203.0.113.50", label="Custom DB Office IP")
+    ip2 = OfficeIP(id=2, ip_address="198.51.100.0/24", label="Custom CIDR Subnet")
+    mock_db.query.return_value.all.return_value = [ip1, ip2]
+
+    ips = _get_office_ips(db=mock_db)
+    assert "203.0.113.50" in ips
+    assert "198.51.100.0/24" in ips
+
+    assert _is_office_ip("203.0.113.50", db=mock_db) is True
+    assert _is_office_ip("198.51.100.42", db=mock_db) is True  # Inside CIDR
+    assert _is_office_ip("198.51.101.1", db=mock_db) is False  # Outside CIDR
+
+
+def test_validate_ip_or_cidr():
+    from app.api.office_ips import validate_ip_or_cidr
+    assert validate_ip_or_cidr("1.2.3.4") == "1.2.3.4"
+    assert validate_ip_or_cidr(" 10.0.0.0/16 ") == "10.0.0.0/16"
+    assert validate_ip_or_cidr("2001:db8::1") == "2001:db8::1"
+    with pytest.raises(ValueError):
+        validate_ip_or_cidr("invalid-ip")
+    with pytest.raises(ValueError):
+        validate_ip_or_cidr("")
+
+
+def test_detect_office_floor_and_available_floors():
+    from app.models.office_ip import OfficeIP
+    from app.api.checkins import _detect_office_floor, _get_available_floors
+
+    mock_db = MagicMock()
+    ip1 = OfficeIP(id=1, ip_address="38.20.140.122", label="Floor 7 IP", floor="Floor 7")
+    ip2 = OfficeIP(id=2, ip_address="103.54.189.22", label="Floor 9 IP", floor="9")
+    ip3 = OfficeIP(id=3, ip_address="27.0.150.66", label="Floor 17 IP", floor="Floor 17")
+    mock_db.query.return_value.all.return_value = [ip1, ip2, ip3]
+
+    assert _detect_office_floor("38.20.140.122", mock_db) == "7"
+    assert _detect_office_floor("103.54.189.22", mock_db) == "9"
+    assert _detect_office_floor("27.0.150.66", mock_db) == "17"
+    assert _detect_office_floor("192.168.1.1", mock_db) is None
+
+    floors = _get_available_floors(mock_db)
+    assert "7" in floors
+    assert "9" in floors
+    assert "17" in floors
+
+
+
+
 
