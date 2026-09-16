@@ -16,7 +16,6 @@ class CheckInCreate(BaseModel):
     office_floor: Optional[str] = None  # Required if work_mode is "WFO"
     lunch_preference: Optional[str] = None  # Required if work_mode is "WFO"
     tiffin_type: Optional[str] = None  # Required if lunch_preference is "order_tiffin"
-    device_type: Optional[str] = None
 
     @field_validator("work_mode")
     @classmethod
@@ -89,7 +88,6 @@ class CheckInResponse(BaseModel):
     office_floor: Optional[str] = None
     lunch_preference: Optional[str] = None
     tiffin_type: Optional[str] = None
-    device_type: Optional[str] = None
     checked_in_at: Optional[datetime] = None
     checked_out_at: Optional[datetime] = None
 
@@ -143,7 +141,6 @@ class TeamCheckInRow(BaseModel):
     office_floor: Optional[str] = None
     lunch_preference: Optional[str] = None
     tiffin_type: Optional[str] = None
-    device_type: Optional[str] = None
     checked_in_at: Optional[datetime] = None
     checked_out_at: Optional[datetime] = None
     pm_confirmed_at: Optional[datetime] = None

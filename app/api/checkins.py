@@ -127,30 +127,6 @@ def _require_employee(current_user: User) -> int:
     return current_user.employee_id
 
 
-def detect_device_type(user_agent: Optional[str]) -> str:
-    """Classify client device type from User-Agent string. Returns: 'mobile', 'tablet', or 'desktop'."""
-    if not user_agent:
-        return "desktop"
-    ua = user_agent.lower()
-    if "ipad" in ua or "tablet" in ua or ("android" in ua and "mobile" not in ua):
-        return "tablet"
-    if any(m in ua for m in ["mobile", "iphone", "ipod", "android", "blackberry", "iemobile", "opera mini", "silk/"]):
-        return "mobile"
-    return "desktop"
-
-
-def normalize_device_type(device_type: Optional[str], user_agent: Optional[str] = None) -> str:
-    if device_type:
-        dt = device_type.strip().lower()
-        if dt in ["phone", "mobile"]:
-            return "mobile"
-        if dt in ["tablet", "tab"]:
-            return "tablet"
-        if dt in ["desktop", "laptop", "pc"]:
-            return "desktop"
-    return detect_device_type(user_agent)
-
-
 def _get_scoped_project_ids(db: Session, user: User) -> set[int]:
     import time
     t0 = time.time()
@@ -335,7 +311,6 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
             office_floor=chk.office_floor if chk else None,
             lunch_preference=chk.lunch_preference if chk else None,
             tiffin_type=chk.tiffin_type if chk else None,
-            device_type=getattr(chk, "device_type", None) if chk else None,
             checked_in_at=chk.checked_in_at if chk else None,
             checked_out_at=chk.checked_out_at if chk else None,
             pm_confirmed_at=chk.pm_confirmed_at if chk else None,
@@ -563,8 +538,6 @@ def submit_checkin(
                 detail="Please connect to the office Wi-Fi or disconnect VPN service.",
             )
 
-    device_type = normalize_device_type(payload.device_type, http_request.headers.get("user-agent"))
-
     checkin = DailyCheckIn(
         employee_id=employee_id,
         checkin_date=today,
@@ -574,7 +547,6 @@ def submit_checkin(
         office_floor=payload.office_floor,
         lunch_preference=payload.lunch_preference,
         tiffin_type=payload.tiffin_type,
-        device_type=device_type,
         checked_in_at=_get_ist_now(),
     )
     db.add(checkin)
