@@ -16,6 +16,7 @@ class CheckInCreate(BaseModel):
     office_floor: Optional[str] = None  # Required if work_mode is "WFO"
     lunch_preference: Optional[str] = None  # Required if work_mode is "WFO"
     tiffin_type: Optional[str] = None  # Required if lunch_preference is "order_tiffin"
+    device_type: Optional[str] = None
 
     @field_validator("work_mode")
     @classmethod
@@ -42,10 +43,8 @@ class CheckInCreate(BaseModel):
     @classmethod
     def validate_office_floor(cls, v, info):
         if info.data.get("work_mode") == "WFO":
-            if not v:
+            if not v or not str(v).strip():
                 raise ValueError("Please select your office floor.")
-            if v not in OFFICE_FLOOR_CHOICES:
-                raise ValueError(f"office_floor must be one of: {', '.join(OFFICE_FLOOR_CHOICES)}")
         return v
 
     @field_validator("lunch_preference")
@@ -90,6 +89,7 @@ class CheckInResponse(BaseModel):
     office_floor: Optional[str] = None
     lunch_preference: Optional[str] = None
     tiffin_type: Optional[str] = None
+    device_type: Optional[str] = None
     checked_in_at: Optional[datetime] = None
     checked_out_at: Optional[datetime] = None
 
@@ -103,9 +103,31 @@ class TodayCheckInStatus(BaseModel):
     checkin: Optional[CheckInResponse] = None
     project_options: List[dict] = []  # [{project_id, project_name}]
     suggested_work_mode: str = "WFO"  # "WFH" if an approved WFH request covers today
+    is_office_network: Optional[bool] = None
+    has_slack: bool = False
+    detected_floor: Optional[str] = None
+    detected_floors: List[str] = []
+    suggested_floor: Optional[str] = None
+    available_floors: List[str] = []
 
     class Config:
         from_attributes = True
+
+
+class CheckInConfirmationResponse(BaseModel):
+    status: str  # "completed" or "pending_slack"
+    message: str
+    checkin: Optional[CheckInResponse] = None
+    expires_in: Optional[int] = None  # seconds
+
+
+class SlackConfirmRequest(BaseModel):
+    token: str
+
+
+class SlackOAuthRequestResponse(BaseModel):
+    oauth_url: str
+    expires_in: int = 30
 
 
 class TeamCheckInRow(BaseModel):
@@ -121,6 +143,7 @@ class TeamCheckInRow(BaseModel):
     office_floor: Optional[str] = None
     lunch_preference: Optional[str] = None
     tiffin_type: Optional[str] = None
+    device_type: Optional[str] = None
     checked_in_at: Optional[datetime] = None
     checked_out_at: Optional[datetime] = None
     pm_confirmed_at: Optional[datetime] = None
