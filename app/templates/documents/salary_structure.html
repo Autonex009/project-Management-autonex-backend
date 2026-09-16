@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="doc-title">Salary Structure</div>
+
+<div class="salutation">Dear <span class="highlight">{{ employee_name }}</span>,</div>
+
+<p>
+  This document outlines your compensation structure at
+  <span class="highlight">{{ company_name }}</span>, effective from
+  <span class="highlight">{{ effective_date }}</span>.
+</p>
+
+<table class="info-table">
+  <tr><td class="label">Employee Name</td><td>{{ employee_name }}</td></tr>
+  <tr><td class="label">Designation</td><td>{{ designation }}</td></tr>
+  <tr><td class="label">Employment Type</td><td>{{ employee_type }}</td></tr>
+  <tr><td class="label">Effective Date</td><td>{{ effective_date }}</td></tr>
+</table>
+
+<table class="info-table" style="margin-top:18px;">
+  <tr>
+    <td class="label" style="background:#1a1a2e;color:#fff;font-weight:700;">Component</td>
+    <td style="background:#1a1a2e;color:#fff;font-weight:700;">Monthly (₹)</td>
+    <td style="background:#1a1a2e;color:#fff;font-weight:700;">Annual (₹)</td>
+  </tr>
+  <tr><td class="label">Gross / CTC</td><td>{{ monthly_gross }}</td><td>{{ annual_ctc }}</td></tr>
+  <tr><td class="label">In-hand (Estimated)</td><td>{{ monthly_inhand }}</td><td>{{ annual_inhand }}</td></tr>
+</table>
+
+<p style="font-size:9pt; color:#888; margin-top:10px;">
+  * In-hand amounts are indicative and may vary based on applicable statutory deductions (TDS, PF, etc.).
+  This document is confidential and intended solely for the employee named above.
+</p>
+
+<div class="signature-block">
+  <div class="sig-col">
+    <div class="sig-line"></div>
+    <div class="sig-name">{{ hr_signatory }}</div>
+    <div class="sig-title">Human Resources</div>
+    <div class="sig-title">{{ company_name }}</div>
+  </div>
+</div>
+{% endblock %}

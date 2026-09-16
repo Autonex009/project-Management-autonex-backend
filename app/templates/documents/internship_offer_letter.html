@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="doc-title">Internship Offer Letter</div>
+
+<div class="salutation">Dear <span class="highlight">{{ employee_name }}</span>,</div>
+
+<p>
+  We are delighted to extend this offer of an internship at
+  <span class="highlight">{{ company_name }}</span>. After a thorough evaluation of your profile,
+  we are pleased to confirm your selection for the position detailed below.
+</p>
+
+<table class="info-table">
+  <tr><td class="label">Candidate Name</td><td>{{ employee_name }}</td></tr>
+  <tr><td class="label">Designation</td><td>{{ designation }}</td></tr>
+  <tr><td class="label">Internship Start Date</td><td>{{ start_date }}</td></tr>
+  <tr><td class="label">Internship End Date</td><td>{{ end_date }}</td></tr>
+  <tr><td class="label">Stipend</td><td>₹ {{ stipend }} per month</td></tr>
+  <tr><td class="label">Work Location</td><td>{{ office_address_line1 }}, {{ office_address_line2 }}</td></tr>
+</table>
+
+<p>
+  During the internship period, you will work under the guidance of your assigned mentor and
+  contribute to live projects. Your performance will be evaluated at regular intervals, and
+  exceptional performers may be considered for a full-time role at the conclusion of the internship.
+</p>
+
+<p>
+  This offer is contingent upon the successful verification of your educational qualifications
+  and any other documents requested. Please report to our office on your joining date with
+  the necessary documents.
+</p>
+
+<p>
+  We look forward to welcoming you to the <span class="highlight">{{ company_name }}</span> family.
+  Kindly acknowledge acceptance of this offer by signing a copy of this letter.
+</p>
+
+<p>Warm regards,</p>
+
+<div class="signature-block">
+  <div class="sig-col">
+    <div class="sig-line"></div>
+    <div class="sig-name">{{ hr_signatory }}</div>
+    <div class="sig-title">Human Resources</div>
+    <div class="sig-title">{{ company_name }}</div>
+  </div>
+  <div class="sig-col" style="text-align:right;">
+    <div class="sig-line" style="margin-left:auto;"></div>
+    <div class="sig-name">{{ employee_name }}</div>
+    <div class="sig-title">Candidate Signature &amp; Date</div>
+  </div>
+</div>
+{% endblock %}

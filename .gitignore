@@ -80,3 +80,4 @@ autonex.db.bak
 *.pdf
 generate_audit_doc.py
 .agents/
+graphify-out/

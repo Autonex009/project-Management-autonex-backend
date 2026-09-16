@@ -2,9 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system deps for psycopg2-binary and general build tools
+# Pre-accept Microsoft Font EULA so the Docker build doesn't hang
+RUN echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections
+
+# Install system deps, LibreOffice, and Microsoft Core Fonts
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc libpq-dev && \
+    apt-get install -y --no-install-recommends \
+        gcc \
+        libpq-dev \
+        libreoffice-core-nogui \
+        libreoffice-writer \
+        ttf-mscorefonts-installer && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
