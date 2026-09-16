@@ -35,6 +35,7 @@ class DailyCheckIn(Base):
     office_floor = Column(Text, nullable=True)  # "7", "9", "17"
     lunch_preference = Column(Text, nullable=True)  # "order_tiffin", "canteen", "none"
     tiffin_type = Column(Text, nullable=True)  # "full_meal", "no_rice", "dal_and_rice" (only if lunch_preference is "order_tiffin")
+    device_type = Column(Text, nullable=True)  # "desktop", "mobile", "tablet"
     
     checked_in_at = Column(UTCDateTime, nullable=True)
     checked_out_at = Column(UTCDateTime, nullable=True)
