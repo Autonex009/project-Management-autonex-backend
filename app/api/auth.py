@@ -120,6 +120,8 @@ def get_user_designation(user: User, db: Session) -> Optional[str]:
 
 
 def get_access_role(designation: Optional[str], fallback_role: str) -> str:
+    if fallback_role in ("admin", "hr"):
+        return fallback_role
     return DESIGNATION_ACCESS.get(designation, fallback_role)
 
 

@@ -74,14 +74,39 @@ async def slack_interactions(request: Request, db: Session = Depends(get_db)):
     req_type = action_value.get("type")
     req_id = action_value.get("id")
 
-    if not action_type or not req_type or not req_id:
-        return {"status": "ignored"}
-
-    response_url = data.get("response_url")
-
-    # Look up user
     slack_user_id = data.get("user", {}).get("id")
     employee = db.query(Employee).filter(Employee.slack_user_id == slack_user_id).first()
+
+    # Check if this interaction is a checkin reminder action
+    if action_type == "checkin_reminder" or action.get("action_id") == "checkin_now":
+        if employee:
+            from app.models.daily_checkin import DailyCheckIn
+            from datetime import date
+            today = date.today()
+            existing_checkin = (
+                db.query(DailyCheckIn)
+                .filter(DailyCheckIn.employee_id == employee.id, DailyCheckIn.checkin_date == today)
+                .first()
+            )
+            if existing_checkin and existing_checkin.checked_in_at is not None:
+                blocked_blocks = [
+                    b for b in data.get("message", {}).get("blocks", [])
+                    if b.get("type") != "actions"
+                ]
+                blocked_blocks.append({
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "✅ *You have already checked in for today.*"
+                    }
+                })
+                _respond_to_slack(
+                    response_url,
+                    "You have already checked in for today.",
+                    replace_original=True,
+                    blocks=blocked_blocks
+                )
+                return {"status": "ok"}
     
     user = db.query(User).filter(User.employee_id == employee.id).first() if employee else None
     if not user:

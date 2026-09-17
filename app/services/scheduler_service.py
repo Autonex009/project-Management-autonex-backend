@@ -265,6 +265,7 @@ def _scheduled_checkin_reminders() -> None:
         from app.services.slack_service import (
             try_get_or_cache_employee_slack_user_id,
             try_send_checkin_reminder_message,
+            record_today_slack_reminder,
         )
         from sqlalchemy import not_
         import time
@@ -297,10 +298,12 @@ def _scheduled_checkin_reminders() -> None:
                 continue
             
             try:
-                if try_send_checkin_reminder_message(
+                ts, channel_id = try_send_checkin_reminder_message(
                     employee_slack_user_id=slack_id, employee_name=employee.name
-                ):
+                )
+                if ts and channel_id:
                     sent += 1
+                    record_today_slack_reminder(employee.id, channel_id, ts)
                     time.sleep(1.5)  # Base sleep to avoid rate limits
             except Exception as exc:
                 if "429" in str(exc) or "rate" in str(exc).lower():
@@ -509,10 +512,12 @@ def _scheduled_late_warning() -> None:
                 continue
             
             try:
-                if try_send_late_warning_message(
+                ts, channel_id = try_send_late_warning_message(
                     employee_slack_user_id=slack_id, employee_name=employee.name
-                ):
+                )
+                if ts and channel_id:
                     sent += 1
+                    record_today_slack_reminder(employee.id, channel_id, ts)
                     time.sleep(1.5)
             except Exception as exc:
                 if "429" in str(exc) or "rate" in str(exc).lower():
@@ -577,7 +582,17 @@ def _scheduled_admin_report() -> None:
             DailyCheckIn.checked_in_at > late_threshold_utc
         ).all()
         late_checkin_list = [
-            (emp.name, emp.email, checkin_time.astimezone(IST).strftime("%I:%M %p") if checkin_time else "—")
+            (
+                emp.name,
+                emp.email,
+                (
+                    (checkin_time if checkin_time.tzinfo else checkin_time.replace(tzinfo=timezone.utc))
+                    .astimezone(IST)
+                    .strftime("%I:%M %p")
+                    if checkin_time
+                    else "—"
+                ),
+            )
             for emp, checkin_time in late_checkins
         ]
 

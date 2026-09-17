@@ -254,8 +254,39 @@ def enrich_projects_bulk(db: Session, projects: list[Project]) -> list[dict]:
                 pm_count += 1
                 pm_ids.append(alloc.employee_id)
 
-        capacity = {"status": "unknown", "recommendation": None}
-        if project.end_date:
+        leave_emp_ids = {
+            l.employee_id
+            for l in all_leaves
+            if l.employee_id in allocated_employee_ids
+            and l.start_date <= today <= l.end_date
+        }
+        active_allocated_count = len(
+            set([e for e in allocated_employee_ids if e not in leave_emp_ids])
+        )
+        req_manpower = (project.required_manpower if (project.required_manpower and project.required_manpower > 0) else _autonex_headcount(project)) or 0
+        working_days = get_working_days(today, project.end_date) if project.end_date else 0
+
+        if project.end_date and working_days <= 0:
+            capacity = {
+                "status": "overdue",
+                "recommendation": {"message": "Past deadline"},
+            }
+        elif req_manpower > 0 and active_allocated_count < req_manpower:
+            extra = req_manpower - active_allocated_count
+            capacity = {
+                "status": "overburden",
+                "recommendation": {
+                    "message": f"+{extra} staff needed"
+                },
+            }
+        elif active_allocated_count == 0:
+            capacity = {
+                "status": "no_staff",
+                "recommendation": {"message": "Needs staffing"},
+            }
+        elif req_manpower > 0 and active_allocated_count >= req_manpower:
+            capacity = {"status": "balanced", "recommendation": None}
+        else:
             task_count = (
                 project.remaining_tasks
                 if project.remaining_tasks is not None
@@ -264,68 +295,29 @@ def enrich_projects_bulk(db: Session, projects: list[Project]) -> list[dict]:
             required_hours = float(task_count or 0) * float(
                 project.estimated_time_per_task or 0
             )
-            working_days = get_working_days(today, project.end_date)
-
-            if working_days <= 0:
-                capacity = {
-                    "status": "overdue",
-                    "recommendation": {"message": "Past deadline"},
-                }
-            else:
-                leave_emp_ids = {
-                    l.employee_id
-                    for l in all_leaves
-                    if l.employee_id in allocated_employee_ids
-                    and l.start_date <= project.end_date
-                    and l.end_date >= project.start_date
-                }
-                active_allocated_count = len(
-                    [e for e in allocated_employee_ids if e not in leave_emp_ids]
+            if required_hours > 0 and project.end_date and working_days > 0:
+                standard_day_hours = 8
+                total_cap = (
+                    active_allocated_count * standard_day_hours * working_days
                 )
-
-                if (
-                    project.required_manpower
-                    and active_allocated_count >= project.required_manpower
-                ):
-                    capacity = {"status": "balanced", "recommendation": None}
-                elif active_allocated_count == 0:
+                load_ratio = (
+                    required_hours / total_cap if total_cap > 0 else float("inf")
+                )
+                if load_ratio > 1.1:
+                    deficit = required_hours - total_cap
+                    extra = math.ceil(
+                        deficit / (working_days * standard_day_hours)
+                    )
                     capacity = {
-                        "status": "no_staff",
-                        "recommendation": {"message": "Needs staffing"},
+                        "status": "overburden",
+                        "recommendation": {
+                            "message": f"+{extra} staff needed"
+                        },
                     }
                 else:
-                    standard_day_hours = 8
-                    total_cap = (
-                        active_allocated_count * standard_day_hours * working_days
-                    )
-                    load_ratio = (
-                        required_hours / total_cap if total_cap > 0 else float("inf")
-                    )
-                    if load_ratio > 1.1:
-                        if (
-                            project.required_manpower
-                            and active_allocated_count < project.required_manpower
-                        ):
-                            extra = project.required_manpower - active_allocated_count
-                            capacity = {
-                                "status": "overburden",
-                                "recommendation": {
-                                    "message": f"+{extra} staff needed"
-                                },
-                            }
-                        else:
-                            deficit = required_hours - total_cap
-                            extra = math.ceil(
-                                deficit / (working_days * standard_day_hours)
-                            )
-                            capacity = {
-                                "status": "overburden",
-                                "recommendation": {
-                                    "message": f"+{extra} staff needed"
-                                },
-                            }
-                    else:
-                        capacity = {"status": "balanced", "recommendation": None}
+                    capacity = {"status": "balanced", "recommendation": None}
+            else:
+                capacity = {"status": "balanced", "recommendation": None}
 
         resp = ProjectResponse.model_validate(project).model_dump()
         resp["allocated_pm_count"] = pm_count
@@ -468,36 +460,39 @@ def bulk_compute_capacity(db: Session, projects: list[Project]) -> dict[int, str
 
     res = {}
     for p in projects:
-        cap = "unknown"
+        p_allocs = [a for a in allocs if a.sub_project_id == p.id]
+        p_emp_ids = [a.employee_id for a in p_allocs if a.employee_id and not (a.active_end_date and a.active_end_date < today) and not (a.active_start_date and a.active_start_date > today)]
+
+        p_leaves = [l for l in all_leaves if l.employee_id in p_emp_ids and l.start_date <= today <= l.end_date]
+        leave_eids = {l.employee_id for l in p_leaves}
+        active_count = len(set([e for e in p_emp_ids if e not in leave_eids]))
+        req_manpower = (p.required_manpower if (p.required_manpower and p.required_manpower > 0) else _autonex_headcount(p)) or 0
+
+        days = 0
         if p.end_date:
-            p_allocs = [a for a in allocs if a.sub_project_id == p.id]
-            p_emp_ids = [a.employee_id for a in p_allocs if not (a.active_end_date and a.active_end_date < today)]
-
-            tc = p.remaining_tasks if p.remaining_tasks is not None else p.total_tasks
-            req_hrs = float(tc or 0) * float(p.estimated_time_per_task or 0)
-
-            days = 0
             curr = today
             while curr <= p.end_date:
                 if curr.weekday() < 5:
                     days += 1
                 curr += timedelta(days=1)
 
-            if days <= 0:
-                cap = "overdue"
+        if p.end_date and days <= 0:
+            cap = "overdue"
+        elif req_manpower > 0 and active_count < req_manpower:
+            cap = "overburden"
+        elif active_count == 0:
+            cap = "no_staff"
+        elif req_manpower > 0 and active_count >= req_manpower:
+            cap = "balanced"
+        else:
+            tc = p.remaining_tasks if p.remaining_tasks is not None else p.total_tasks
+            req_hrs = float(tc or 0) * float(p.estimated_time_per_task or 0)
+            if req_hrs > 0 and p.end_date and days > 0:
+                total_cap = active_count * 8 * days
+                lr = req_hrs / total_cap if total_cap > 0 else float('inf')
+                cap = "overburden" if lr > 1.1 else "balanced"
             else:
-                p_leaves = [l for l in all_leaves if l.employee_id in p_emp_ids and l.start_date <= p.end_date and l.end_date >= p.start_date]
-                leave_eids = {l.employee_id for l in p_leaves}
-                active_count = len([e for e in p_emp_ids if e not in leave_eids])
-
-                if p.required_manpower and active_count >= p.required_manpower:
-                    cap = "balanced"
-                elif active_count == 0:
-                    cap = "no_staff"
-                else:
-                    total_cap = active_count * 8 * days
-                    lr = req_hrs / total_cap if total_cap > 0 else float('inf')
-                    cap = "overburden" if lr > 1.1 else "balanced"
+                cap = "balanced"
         res[p.id] = cap
     return res
 
@@ -725,9 +720,9 @@ def get_projects_kpi(
     caps = bulk_compute_capacity(db, active_for_cap)
     for p in active_for_cap:
         cap = caps.get(p.id, "")
-        if cap == "overburden":
+        if cap in ("overburden", "no_staff", "overdue"):
             metrics["overburdenedProjects"] += 1
-        elif cap == "balanced":
+        else:
             metrics["balancedProjects"] += 1
 
     return {

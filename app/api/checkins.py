@@ -139,12 +139,29 @@ def _apply_time_filter(query, time_filter: str, time_from: str = None, time_to: 
     return query
 
 
-def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kpis: dict, scoped_project_ids=None):
+def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kpis: dict, scoped_project_ids=None, sort_pending_priority: bool = False):
     import time
     t0 = time.time()
     total = base_query.count()
     t1 = time.time()
-    results = base_query.order_by(Employee.name).offset((page - 1) * limit).limit(limit).all()
+
+    if sort_pending_priority:
+        from sqlalchemy import case
+        from app.models.leave import Leave
+        today = _get_ist_today()
+        on_leave_subq = db.query(Leave.employee_id).filter(
+            Leave.start_date <= today,
+            Leave.end_date >= today,
+            Leave.status != "rejected"
+        )
+        is_on_leave_expr = case(
+            (Employee.id.in_(on_leave_subq), 1),
+            else_=0
+        )
+        results = base_query.order_by(is_on_leave_expr.asc(), Employee.name.asc()).offset((page - 1) * limit).limit(limit).all()
+    else:
+        results = base_query.order_by(Employee.name.asc()).offset((page - 1) * limit).limit(limit).all()
+
     t2 = time.time()
     
     if not results:
@@ -324,23 +341,77 @@ def submit_checkin(
         .filter(DailyCheckIn.employee_id == employee_id, DailyCheckIn.checkin_date == today)
         .first()
     )
-    if existing:
+    if existing and existing.checked_in_at is not None:
         raise HTTPException(status_code=400, detail="You've already checked in today.")
 
-    checkin = DailyCheckIn(
-        employee_id=employee_id,
-        checkin_date=today,
-        work_mode=payload.work_mode,
-        project_ids=payload.project_ids,
-        mood=payload.mood,
-        office_floor=payload.office_floor,
-        lunch_preference=payload.lunch_preference,
-        tiffin_type=payload.tiffin_type,
-        checked_in_at=_get_ist_now(),
-    )
-    db.add(checkin)
+    if existing:
+        existing.work_mode = payload.work_mode
+        existing.project_ids = payload.project_ids
+        existing.mood = payload.mood
+        existing.office_floor = payload.office_floor
+        existing.lunch_preference = payload.lunch_preference
+        existing.tiffin_type = payload.tiffin_type
+        existing.checked_in_at = _get_ist_now()
+        checkin = existing
+    else:
+        checkin = DailyCheckIn(
+            employee_id=employee_id,
+            checkin_date=today,
+            work_mode=payload.work_mode,
+            project_ids=payload.project_ids,
+            mood=payload.mood,
+            office_floor=payload.office_floor,
+            lunch_preference=payload.lunch_preference,
+            tiffin_type=payload.tiffin_type,
+            checked_in_at=_get_ist_now(),
+        )
+        db.add(checkin)
+
     db.commit()
     db.refresh(checkin)
+
+    # --- Send Slack confirmation DM & update reminder message button ---
+    try:
+        from app.models.employee import Employee
+        from app.services.slack_service import (
+            try_get_or_cache_employee_slack_user_id,
+            try_send_checkin_success_message,
+            update_checkin_reminder_to_completed,
+            pop_today_slack_reminder,
+            find_today_slack_reminder,
+        )
+
+        employee = db.query(Employee).filter(Employee.id == employee_id).first()
+        if employee:
+            slack_id = try_get_or_cache_employee_slack_user_id(db, employee)
+            if slack_id:
+                if checkin.checked_in_at:
+                    chk_at = checkin.checked_in_at
+                    if chk_at.tzinfo is None:
+                        chk_at = chk_at.replace(tzinfo=timezone.utc)
+                    now_str = chk_at.astimezone(IST).strftime("%I:%M %p")
+                else:
+                    now_str = "N/A"
+                try_send_checkin_success_message(
+                    employee_slack_user_id=slack_id,
+                    employee_name=employee.name,
+                    work_mode=checkin.work_mode,
+                    checked_in_at_str=now_str,
+                )
+
+                rem_channel_id, rem_ts = pop_today_slack_reminder(employee_id)
+                if not (rem_channel_id and rem_ts):
+                    rem_channel_id, rem_ts = find_today_slack_reminder(slack_id)
+
+                if rem_channel_id and rem_ts:
+                    update_checkin_reminder_to_completed(
+                        channel_id=rem_channel_id,
+                        ts=rem_ts,
+                        employee_name=employee.name,
+                    )
+    except Exception as exc:
+        logger.warning(f"Error triggering Slack check-in notifications: {exc}")
+
     return checkin
 
 
@@ -383,6 +454,7 @@ def get_team_today(
     time_from: str = None,          
     time_to: str = None,           
     sentiment: str = "",
+    pm_confirmation: str = "",
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("pm", "team_lead")),
 ):
@@ -426,7 +498,7 @@ def get_team_today(
 
     from datetime import time as dtime
     from datetime import timezone
-    late_threshold_ist = datetime.combine(today, dtime(10, 0), tzinfo=IST)
+    late_threshold_ist = datetime.combine(today, dtime(11, 0), tzinfo=IST)
     late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
     
     from app.models.leave import Leave
@@ -470,6 +542,7 @@ def get_team_today(
     
     if search:
         query = query.filter(Employee.name.ilike(f"%{search}%"))
+    sort_pending_priority = False
     if status:
         statuses = [s.strip() for s in status.split(",")]
         conds = []
@@ -477,9 +550,20 @@ def get_team_today(
             conds.append(DailyCheckIn.id.isnot(None))
         if "pending" in statuses:
             conds.append(DailyCheckIn.id.is_(None))
+            sort_pending_priority = True
         if conds:
             from sqlalchemy import or_
             query = query.filter(or_(*conds))
+    if pm_confirmation:
+        confirmations = [c.strip() for c in pm_confirmation.split(",") if c.strip()]
+        pm_conds = []
+        if "confirmed" in confirmations:
+            pm_conds.append(DailyCheckIn.pm_confirmed_at.isnot(None))
+        if "pending" in confirmations:
+            pm_conds.append((DailyCheckIn.id.isnot(None)) & (DailyCheckIn.pm_confirmed_at.is_(None)))
+        if pm_conds:
+            from sqlalchemy import or_
+            query = query.filter(or_(*pm_conds))
     if work_mode:
         modes = [m.strip() for m in work_mode.split(",")]
         query = query.filter(DailyCheckIn.work_mode.in_(modes))
@@ -510,16 +594,9 @@ def get_team_today(
             proj_emp_ids.update({c.employee_id for c in chk_proj})
             query = query.filter(Employee.id.in_(list(proj_emp_ids) if proj_emp_ids else [-1]))
         
-    # if time_filter == "late":
-    #     from datetime import time as dtime
-    #     from datetime import timezone
-    #     late_threshold_ist = datetime.combine(today, dtime(10, 0), tzinfo=IST)
-    #     late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
-    #     query = query.filter(DailyCheckIn.checked_in_at > late_threshold_utc)
-
     query = _apply_time_filter(query, time_filter, time_from, time_to, today)
         
-    res = _build_paginated_checkins(db, query, page, limit, kpis, scoped_project_ids)
+    res = _build_paginated_checkins(db, query, page, limit, kpis, scoped_project_ids, sort_pending_priority=sort_pending_priority)
     t4 = time.time()
     
     print(f"PROFILE team_today: scope={t1-t0:.3f}s setup={t2-t1:.3f}s kpis={t3-t2:.3f}s build={t4-t3:.3f}s TOTAL={t4-t0:.3f}s")
@@ -583,6 +660,7 @@ def get_admin_checkins_paginated(
     time_from: str = None,          
     time_to: str = None,            
     sentiment: str = "",
+    pm_confirmation: str = "",
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "hr")),
 ):
@@ -607,7 +685,7 @@ def get_admin_checkins_paginated(
     
     from datetime import time as dtime
     from datetime import timezone
-    late_threshold_ist = datetime.combine(today, dtime(10, 0), tzinfo=IST)
+    late_threshold_ist = datetime.combine(today, dtime(11, 0), tzinfo=IST)
     late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
 
     from app.models.leave import Leave
@@ -650,6 +728,7 @@ def get_admin_checkins_paginated(
     
     if search:
         query = query.filter(Employee.name.ilike(f"%{search}%"))
+    sort_pending_priority = False
     if status:
         statuses = [s.strip() for s in status.split(",")]
         conds = []
@@ -657,9 +736,20 @@ def get_admin_checkins_paginated(
             conds.append(DailyCheckIn.id.isnot(None))
         if "pending" in statuses:
             conds.append(DailyCheckIn.id.is_(None))
+            sort_pending_priority = True
         if conds:
             from sqlalchemy import or_
             query = query.filter(or_(*conds))
+    if pm_confirmation:
+        confirmations = [c.strip() for c in pm_confirmation.split(",") if c.strip()]
+        pm_conds = []
+        if "confirmed" in confirmations:
+            pm_conds.append(DailyCheckIn.pm_confirmed_at.isnot(None))
+        if "pending" in confirmations:
+            pm_conds.append((DailyCheckIn.id.isnot(None)) & (DailyCheckIn.pm_confirmed_at.is_(None)))
+        if pm_conds:
+            from sqlalchemy import or_
+            query = query.filter(or_(*pm_conds))
     if work_mode:
         modes = [m.strip() for m in work_mode.split(",")]
         query = query.filter(DailyCheckIn.work_mode.in_(modes))
@@ -711,7 +801,7 @@ def get_admin_checkins_paginated(
 
     query = _apply_time_filter(query, time_filter, time_from, time_to, today)
         
-    return _build_paginated_checkins(db, query, page, limit, kpis, scoped_project_ids=None)
+    return _build_paginated_checkins(db, query, page, limit, kpis, scoped_project_ids=None, sort_pending_priority=sort_pending_priority)
 
 from app.schemas.checkin import MatrixResponse, MatrixRow
 import calendar

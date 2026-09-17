@@ -38,6 +38,7 @@ from app.services.slack_service import (
     notify_employee_allocation_removed,
     notify_employee_sub_project_updated,
     try_get_or_cache_employee_slack_user_id,
+    queue_pm_allocation_batch,
 )
 
 TEAM_LEAD_TAG = "Team Lead"  # matches TEAM_LEAD_ROLE_TAG in sub_projects.py / TEAM_LEAD_TAG in frontend
@@ -503,6 +504,81 @@ def _send_employee_allocation_removed_notification(db: Session, allocation: Allo
     )
 
 
+def _get_project_pm_employees(db: Session, project: Project) -> list[Employee]:
+    pm_ids = set()
+
+    if getattr(project, "assigned_employee_ids", None):
+        for pm_id in project.assigned_employee_ids:
+            try:
+                pm_ids.add(int(pm_id))
+            except (ValueError, TypeError):
+                continue
+
+    if not pm_ids and getattr(project, "main_project_id", None):
+        main_project = db.query(MainProject).filter(MainProject.id == project.main_project_id).first()
+        if main_project:
+            if getattr(main_project, "program_manager_ids", None):
+                for pm_id in main_project.program_manager_ids:
+                    try:
+                        pm_ids.add(int(pm_id))
+                    except (ValueError, TypeError):
+                        continue
+            if not pm_ids and getattr(main_project, "program_manager_id", None):
+                pm_ids.add(main_project.program_manager_id)
+
+    if not pm_ids and getattr(project, "sub_project_id", None):
+        hierarchy_sub_project = db.query(HierarchySubProject).filter(HierarchySubProject.id == project.sub_project_id).first()
+        if hierarchy_sub_project and hierarchy_sub_project.pm_id:
+            pm_ids.add(hierarchy_sub_project.pm_id)
+
+    if not pm_ids:
+        return []
+
+    return db.query(Employee).filter(Employee.id.in_(list(pm_ids))).all()
+
+
+def _queue_pm_allocation_notification(
+    db: Session,
+    project: Project | None,
+    actor: User,
+    change_type: str,
+    allocation: Allocation,
+) -> None:
+    if not project or not actor:
+        return
+
+    actor_role = (getattr(actor, "role", None) or "").lower().strip()
+    if actor_role != "admin":
+        return
+
+    pm_employees = _get_project_pm_employees(db, project)
+    if not pm_employees:
+        return
+
+    allocated_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
+    if not allocated_employee:
+        return
+
+    actor_name = getattr(actor, "full_name", None) or getattr(actor, "name", None) or actor.email or "Admin"
+
+    for pm_emp in pm_employees:
+        if pm_emp.email and actor.email and pm_emp.email.lower().strip() == actor.email.lower().strip():
+            continue
+
+        pm_slack_user_id = try_get_or_cache_employee_slack_user_id(db, pm_emp)
+        if pm_slack_user_id:
+            queue_pm_allocation_batch(
+                pm_slack_user_id=pm_slack_user_id,
+                pm_name=pm_emp.name,
+                actor_name=actor_name,
+                sub_project_name=project.name,
+                change_type=change_type,
+                employee_name=allocated_employee.name,
+                allocated_hours_per_day=f"{allocation.total_daily_hours or 8}h/day",
+                role_tags=allocation.role_tags or [],
+            )
+
+
 def _allocation_to_dict(
     allocation: Allocation,
     employee: Optional[Employee] = None,
@@ -704,11 +780,13 @@ def create_allocation(
     db.commit()
     db.refresh(allocation)
 
-    # Notify only the newly allocated employee. The whole-team
-    # "target changed" broadcast was intentionally removed so that adding a
-    # member doesn't spam everyone already on the project.
     try:
         _send_employee_allocation_notification(db, allocation, project, actual_count)
+    except Exception:
+        pass
+
+    try:
+        _queue_pm_allocation_notification(db, project, current_user, "added", allocation)
     except Exception:
         pass
 
@@ -1052,11 +1130,13 @@ def delete_allocation(
 
     db.commit()
 
-    # Notify only the removed employee. The whole-team "target changed"
-    # broadcast was intentionally removed so removing a member doesn't spam
-    # everyone still on the project.
     try:
         _send_employee_allocation_removed_notification(db, allocation, project)
+    except Exception:
+        pass
+
+    try:
+        _queue_pm_allocation_notification(db, project, current_user, "removed", allocation)
     except Exception:
         pass
 
