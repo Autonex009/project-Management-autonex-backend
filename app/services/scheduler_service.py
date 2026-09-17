@@ -278,6 +278,7 @@ def _scheduled_checkin_reminders() -> None:
             SlackRateLimitError,
             try_get_or_cache_employee_slack_user_id,
             try_send_checkin_reminder_message,
+            record_today_slack_reminder,
         )
         from sqlalchemy import not_
         import time
@@ -310,10 +311,12 @@ def _scheduled_checkin_reminders() -> None:
                 continue
             
             try:
-                if try_send_checkin_reminder_message(
+                ts, channel_id = try_send_checkin_reminder_message(
                     employee_slack_user_id=slack_id, employee_name=employee.name
-                ):
+                )
+                if ts and channel_id:
                     sent += 1
+                    record_today_slack_reminder(employee.id, channel_id, ts)
                     time.sleep(1.5)  # Base sleep to avoid rate limits
             except SlackRateLimitError as exc:
                 logger.warning("[scheduler] Rate limit hit sending reminder to %s, sleeping %s seconds...", employee.email, exc.retry_after_seconds)
@@ -489,6 +492,7 @@ def _scheduled_late_warning() -> None:
         from app.services.slack_service import (
             try_get_or_cache_employee_slack_user_id,
             try_send_late_warning_message,
+            record_today_slack_reminder,
         )
         from sqlalchemy import not_
         import time
@@ -521,10 +525,12 @@ def _scheduled_late_warning() -> None:
                 continue
             
             try:
-                if try_send_late_warning_message(
+                ts, channel_id = try_send_late_warning_message(
                     employee_slack_user_id=slack_id, employee_name=employee.name
-                ):
+                )
+                if ts and channel_id:
                     sent += 1
+                    record_today_slack_reminder(employee.id, channel_id, ts)
                     time.sleep(1.5)
             except Exception as exc:
                 if "429" in str(exc) or "rate" in str(exc).lower():

@@ -120,6 +120,8 @@ def get_user_designation(user: User, db: Session) -> Optional[str]:
 
 
 def get_access_role(designation: Optional[str], fallback_role: str) -> str:
+    if fallback_role in ("admin", "hr"):
+        return fallback_role
     return DESIGNATION_ACCESS.get(designation, fallback_role)
 
 
@@ -251,13 +253,14 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     # Auto-link PM/employee users to an Employee record if not yet linked
     if user.employee_id is None:
         employee = db.query(Employee).filter(Employee.email == user.email).first()
-        if employee is None and user.role in ("pm", "team_lead", "employee"):
+        if employee is None and user.role in ("admin", "pm", "team_lead", "employee"):
             # Create a fresh Employee record for this user. The designation has to
             # match the role we already trust, or the next employee update would read
             # the designation back and silently rewrite the role (see
             # api/employees.py — a team lead defaulted to "Program Manager" here would
             # be promoted to a real PM by an unrelated profile edit).
             _designation_for_role = {
+                "admin": "Admin",
                 "pm": "Program Manager",
                 "team_lead": "Team Lead",
             }
