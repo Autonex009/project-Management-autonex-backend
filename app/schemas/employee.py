@@ -58,6 +58,7 @@ class EmployeeBase(BaseModel):
     
     # Designation for role-based filtering
     designation: Optional[str] = "Annotator"
+    work_model: Optional[str] = "WFO"
     
     working_hours_per_day: float = Field(8.0, gt=0, le=24)
     weekly_availability: float = Field(40.0, gt=0, le=168)
@@ -94,6 +95,7 @@ class EmployeeUpdate(BaseModel):
     avatar_url: Optional[str] = None
     employee_type: Optional[str] = None
     designation: Optional[str] = None
+    work_model: Optional[str] = None
     
     working_hours_per_day: Optional[float] = None
     weekly_availability: Optional[float] = None

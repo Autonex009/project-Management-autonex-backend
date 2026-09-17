@@ -56,6 +56,7 @@ EMPLOYEE_FIELD_LABELS = {
     "phone": "Phone",
     "designation": "Designation",
     "employee_type": "Employee type",
+    "work_model": "Work model",
     "status": "Status",
     "working_hours_per_day": "Working hours/day",
     "weekly_availability": "Weekly availability",
@@ -762,11 +763,18 @@ def employee_stats(db: Session = Depends(get_db)):
         "archived": archived_count
     }
 
+    by_work_model_raw = db.query(
+        func.coalesce(Employee.work_model, "WFO"),
+        func.count(Employee.id)
+    ).filter(Employee.status != "archived").group_by(func.coalesce(Employee.work_model, "WFO")).all()
+    by_work_model = {str(row[0]).upper(): row[1] for row in by_work_model_raw}
+
     return {
         "by_designation": dict(by_designation),
         "by_status": by_status_dict,
         "by_type": dict(by_type),
         "by_type_active": dict(by_type_active),
+        "by_work_model": by_work_model,
         "total": total_roster
     }
 
@@ -1344,9 +1352,13 @@ def delete_employee(
         # Clear allocations for this employee — counted before the delete so the entry
         # can say how many project assignments this silently removed.
         removed_allocations = db.query(Allocation).filter(
-            Allocation.employee_id == employee.id
+            Allocation.employee_id == employee.id,
+            Allocation.is_active == True
         ).count()
-        db.query(Allocation).filter(Allocation.employee_id == employee.id).delete(synchronize_session=False)
+        db.query(Allocation).filter(Allocation.employee_id == employee.id).update(
+            {"is_active": False, "deactivated_reason": "Employee archived"},
+            synchronize_session=False
+        )
         db.flush()
 
         audit_service.record(

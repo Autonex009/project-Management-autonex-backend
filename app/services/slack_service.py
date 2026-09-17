@@ -6,7 +6,7 @@ from datetime import datetime
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
-
+from tenacity import retry, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +19,12 @@ def _get_bot_token() -> str | None:
 
 def get_slack_signing_secret() -> str | None:
     return os.getenv("SLACK_SIGNING_SECRET")
+
+
+class SlackRateLimitError(Exception):
+    def __init__(self, retry_after_seconds: int):
+        self.retry_after_seconds = retry_after_seconds
+        super().__init__(f"Slack rate limit hit. Retry after {retry_after_seconds} seconds.")
 
 
 def _slack_request(path: str, payload: dict | None = None, method: str = "POST", use_json: bool = True) -> dict:
@@ -54,10 +60,47 @@ def _slack_request(path: str, payload: dict | None = None, method: str = "POST",
         with urlopen(request, timeout=30) as response:
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
+        if exc.code == 429:
+            retry_after = int(exc.headers.get("Retry-After", 10))
+            raise SlackRateLimitError(retry_after)
         detail = exc.read().decode("utf-8", errors="ignore") or exc.reason
         raise RuntimeError(f"Slack API request failed: {detail}") from exc
     except URLError as exc:
         raise RuntimeError(f"Slack API request failed: {exc.reason}") from exc
+
+
+async def _async_slack_request(path: str, payload: dict | None = None, method: str = "POST", use_json: bool = True) -> dict:
+    import httpx
+    token = _get_bot_token()
+    if not token:
+        raise RuntimeError("SLACK_BOT_TOKEN is not configured")
+
+    payload = payload or {}
+    request_url = f"{SLACK_API_BASE}{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            if method.upper() == "GET":
+                response = await client.get(request_url, params=payload, headers=headers, timeout=30.0)
+            elif use_json:
+                headers["Content-Type"] = "application/json; charset=utf-8"
+                response = await client.post(request_url, json=payload, headers=headers, timeout=30.0)
+            else:
+                headers["Content-Type"] = "application/x-www-form-urlencoded"
+                response = await client.post(request_url, data=payload, headers=headers, timeout=30.0)
+                
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 429:
+                retry_after = int(exc.response.headers.get("Retry-After", 10))
+                raise SlackRateLimitError(retry_after)
+            raise RuntimeError(f"Slack API request failed: {exc.response.text}") from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Slack API request failed: {str(exc)}") from exc
 
 
 def lookup_user_id_by_email(email: str) -> str | None:
@@ -1121,6 +1164,397 @@ def notify_employee_allocation_removed(
     raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
 
 
+def notify_project_leader_allocation_created(
+    *,
+    leader_slack_user_id: str,
+    leader_name: str,
+    employee_name: str,
+    employee_designation: str | None = None,
+    sub_project_name: str,
+    allocated_hours_per_day: str = "8h/day",
+    allocation_source: str = "Auto-allocation (7-day continuous check-in streak)",
+    start_date: str | None = None,
+    role_tags: list[str] | None = None,
+) -> bool:
+    channel_id = open_direct_message_channel(leader_slack_user_id)
+    roles_text = ", ".join(role_tags or []) or "Standard Member"
+
+    response = _slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": f"New team member {employee_name} allocated to {sub_project_name}.",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*New Team Member Allocated*\nHello {leader_name}, *{employee_name}* has been allocated to your project *{sub_project_name}*.",
+                    },
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Sub-Project*\n{sub_project_name}"},
+                        {"type": "mrkdwn", "text": f"*Allocated Member*\n{employee_name}"},
+                        {"type": "mrkdwn", "text": f"*Designation*\n{employee_designation or 'N/A'}"},
+                        {"type": "mrkdwn", "text": f"*Allocated Hours/Day*\n{allocated_hours_per_day}"},
+                        {"type": "mrkdwn", "text": f"*Effective Date*\n{start_date or 'Immediate'}"},
+                        {"type": "mrkdwn", "text": f"*Allocation Mode*\n{allocation_source}"},
+                    ],
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Role Tags*\n{roles_text}",
+                    },
+                },
+            ],
+        },
+    )
+
+    if response.get("ok"):
+        return True
+
+    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+
+
+def notify_employee_auto_allocated(
+    *,
+    employee_slack_user_id: str,
+    employee_name: str,
+    sub_project_name: str,
+    allocated_hours_per_day: str = "8h/day",
+) -> bool:
+    channel_id = open_direct_message_channel(employee_slack_user_id)
+    response = _slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": f"You have been permanently allocated to {sub_project_name} after a 7-day continuous check-in streak.",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Permanent Allocation Assigned*\nHello {employee_name}, congratulations! You have been permanently allocated to *{sub_project_name}* following a 7-day continuous check-in streak.",
+                    },
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Sub-Project*\n{sub_project_name}"},
+                        {"type": "mrkdwn", "text": f"*Allocated Hours/Day*\n{allocated_hours_per_day}"},
+                        {"type": "mrkdwn", "text": f"*Status*\nPermanent Team Member"},
+                        {"type": "mrkdwn", "text": f"*Trigger*\n7-Day Continuous Check-in Streak"},
+                    ],
+                },
+            ],
+        },
+    )
+    if response.get("ok"):
+        return True
+    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+
+
+def send_allocation_notifications_to_leaders(
+    db,
+    allocation,
+    project,
+    source: str = "Manual Allocation",
+    actor_employee_id: int | None = None,
+) -> None:
+    """
+    Finds all PMs and Team Leads for a project and sends each of them a Slack DM
+    notifying them of the new allocation on their project.
+    Optimized: Resolves all employees in a single bulk database query.
+    """
+    if not project or not allocation:
+        return
+
+    try:
+        from app.models.employee import Employee
+        from app.models.sub_project import SubProject as HierarchySubProject
+        from app.services.project_scope import project_pm_ids, project_lead_ids
+
+        # 1. Collect all project manager and team lead employee IDs
+        leader_ids = project_pm_ids(db, project) | project_lead_ids(db, project)
+
+        if getattr(project, "sub_project_id", None):
+            hsp = db.query(HierarchySubProject).filter(HierarchySubProject.id == project.sub_project_id).first()
+            if hsp and getattr(hsp, "pm_id", None):
+                leader_ids.add(hsp.pm_id)
+
+        # Do not notify the allocated employee themselves if they happen to be in leader_ids
+        leader_ids.discard(allocation.employee_id)
+
+        # If an actor_employee_id performed this action, do not send a redundant self-notification
+        if actor_employee_id:
+            leader_ids.discard(actor_employee_id)
+
+        if not leader_ids:
+            logger.info("No PMs or Leads found to notify for project %s (ID %s)", project.name, project.id)
+            return
+
+        # 2. Bulk fetch all leaders AND allocated employee in ONE query!
+        all_emp_ids = leader_ids | {allocation.employee_id}
+        employees = db.query(Employee).filter(Employee.id.in_(all_emp_ids)).all()
+        emp_map = {e.id: e for e in employees}
+
+        allocated_emp = emp_map.get(allocation.employee_id)
+        if not allocated_emp:
+            return
+
+        emp_name = allocated_emp.name
+        emp_desig = allocated_emp.designation
+        hours_str = f"{allocation.total_daily_hours or 8}h/day"
+        start_date_str = str(allocation.active_start_date) if getattr(allocation, "active_start_date", None) else "Immediate"
+        role_tags = getattr(allocation, "role_tags", None) or []
+
+        # 3. Notify each leader via Slack
+        for leader_id in leader_ids:
+            try:
+                leader = emp_map.get(leader_id)
+                if not leader:
+                    continue
+
+                leader_slack_id = try_get_or_cache_employee_slack_user_id(db, leader)
+                if not leader_slack_id:
+                    logger.debug("Leader %s (ID %s) has no Slack user ID; notification skipped", leader.name, leader_id)
+                    continue
+
+                notify_project_leader_allocation_created(
+                    leader_slack_user_id=leader_slack_id,
+                    leader_name=leader.name,
+                    employee_name=emp_name,
+                    employee_designation=emp_desig,
+                    sub_project_name=project.name,
+                    allocated_hours_per_day=hours_str,
+                    allocation_source=source,
+                    start_date=start_date_str,
+                    role_tags=role_tags,
+                )
+                logger.info("Successfully sent Slack allocation notification to leader %s for project %s", leader.name, project.name)
+            except Exception as e:
+                logger.warning("Failed to send Slack allocation notification to leader %s: %s", leader_id, e)
+
+    except Exception as exc:
+        logger.warning("Error in send_allocation_notifications_to_leaders for project %s: %s", getattr(project, "id", "unknown"), exc)
+
+
+def notify_project_leader_allocation_removed(
+    *,
+    leader_slack_user_id: str,
+    leader_name: str,
+    employee_name: str,
+    employee_designation: str | None = None,
+    sub_project_name: str,
+    remover_name: str,
+    remover_role: str,
+    allocated_hours_per_day: str = "8h/day",
+    role_tags: list[str] | None = None,
+) -> bool:
+    channel_id = open_direct_message_channel(leader_slack_user_id)
+    roles_text = ", ".join(role_tags or []) or "Standard Member"
+
+    response = _slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": f"Team member {employee_name} has been unallocated from {sub_project_name}.",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Team Member Allocation Removed*\nHello {leader_name}, *{employee_name}* has been unallocated from your project *{sub_project_name}*.",
+                    },
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": f"*Sub-Project*\n{sub_project_name}"},
+                        {"type": "mrkdwn", "text": f"*Removed Member*\n{employee_name}"},
+                        {"type": "mrkdwn", "text": f"*Designation*\n{employee_designation or 'N/A'}"},
+                        {"type": "mrkdwn", "text": f"*Unallocated By*\n{remover_name} ({remover_role})"},
+                        {"type": "mrkdwn", "text": f"*Previous Daily Hours*\n{allocated_hours_per_day}"},
+                        {"type": "mrkdwn", "text": f"*Role Tags*\n{roles_text}"},
+                    ],
+                },
+            ],
+        },
+    )
+
+    if response.get("ok"):
+        return True
+
+    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+
+
+def send_unallocation_notifications(
+    db,
+    alloc_info: dict,
+    project_id: int,
+    actor_user_role: str | None = None,
+    actor_employee_id: int | None = None,
+    actor_name: str | None = None,
+) -> None:
+    """
+    Sends Slack notifications when an allocation is removed / unallocated, following the rules:
+    - If Admin did it: Notify PM(s), Lead(s), and Employee.
+    - If PM did it: Notify Lead(s) and Employee (not the PM).
+    - If Lead did it: Notify PM(s) and Employee (not the Lead).
+    
+    Optimized: Resolves PMs, Leads, and employees using a single batch query.
+    """
+    try:
+        from datetime import date as date_cls
+        from app.models.project import DailySheet as Project
+        from app.models.parent_project import MainProject
+        from app.models.sub_project import SubProject as HierarchySubProject
+        from app.models.allocation import Allocation
+        from app.models.employee import Employee
+        from app.services.slack_service import (
+            notify_employee_allocation_removed,
+            notify_project_leader_allocation_removed,
+            try_get_or_cache_employee_slack_user_id,
+        )
+
+        project = db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+
+        # 1. Fast resolve PM candidate IDs from project and parent
+        pm_candidate_ids: set[int] = set()
+        for v in (project.assigned_employee_ids or []):
+            try:
+                pm_candidate_ids.add(int(v))
+            except (ValueError, TypeError):
+                continue
+
+        if not pm_candidate_ids and getattr(project, "main_project_id", None):
+            mp = db.query(MainProject).filter(MainProject.id == project.main_project_id).first()
+            if mp:
+                for v in (getattr(mp, "program_manager_ids", None) or ([mp.program_manager_id] if getattr(mp, "program_manager_id", None) else [])):
+                    try:
+                        pm_candidate_ids.add(int(v))
+                    except (ValueError, TypeError):
+                        continue
+
+        if getattr(project, "sub_project_id", None):
+            hsp = db.query(HierarchySubProject).filter(HierarchySubProject.id == project.sub_project_id).first()
+            if hsp and getattr(hsp, "pm_id", None):
+                pm_candidate_ids.add(int(hsp.pm_id))
+
+        # 2. Fast query active project allocations to identify Leads
+        lead_candidate_ids: set[int] = set()
+        alloc_rows = db.query(Allocation.employee_id, Allocation.role_tags).filter(
+            Allocation.sub_project_id == project.id,
+            Allocation.is_active == True,
+        ).all()
+        for eid, role_tags in alloc_rows:
+            if eid and any("lead" in str(tag).lower() for tag in (role_tags or [])):
+                lead_candidate_ids.add(int(eid))
+
+        # 3. Single bulk query to load all candidate employees in ONE database roundtrip!
+        all_candidate_ids = pm_candidate_ids | lead_candidate_ids | {alloc_info["employee_id"]}
+        if actor_employee_id:
+            all_candidate_ids.add(actor_employee_id)
+
+        employees = db.query(Employee).filter(Employee.id.in_(all_candidate_ids)).all()
+        emp_map = {e.id: e for e in employees}
+
+        # Check designations to finalize PMs and Leads
+        pm_ids: set[int] = set()
+        lead_ids: set[int] = set(lead_candidate_ids)
+        for pid in pm_candidate_ids:
+            emp = emp_map.get(pid)
+            if not emp:
+                continue
+            desig = (emp.designation or "").strip().lower()
+            if "team lead" in desig:
+                lead_ids.add(pid)
+            else:
+                pm_ids.add(pid)
+
+        # 4. Determine Actor Type and Role Label
+        role_lower = (actor_user_role or "").strip().lower()
+        if role_lower in ("admin", "hr"):
+            actor_type = "admin"
+            actor_role_label = "Admin"
+        elif (actor_employee_id and actor_employee_id in lead_ids and actor_employee_id not in pm_ids) or role_lower == "team_lead":
+            actor_type = "lead"
+            actor_role_label = "Team Lead"
+        else:
+            actor_type = "pm"
+            actor_role_label = "Project Manager"
+
+        # 5. Apply User Target Rules
+        # - If admin: pm/lead and employee
+        # - If pm: only to lead and employee
+        # - If lead: only to pm and employee
+        target_leader_ids: set[int] = set()
+        if actor_type == "admin":
+            target_leader_ids = pm_ids | lead_ids
+        elif actor_type == "pm":
+            target_leader_ids = lead_ids
+        elif actor_type == "lead":
+            target_leader_ids = pm_ids
+
+        # Never notify the actor themselves or the removed employee as a leader
+        if actor_employee_id:
+            target_leader_ids.discard(actor_employee_id)
+        target_leader_ids.discard(alloc_info["employee_id"])
+
+        # 6. Notify Removed Employee
+        removed_emp = emp_map.get(alloc_info["employee_id"])
+        if removed_emp:
+            emp_slack_id = try_get_or_cache_employee_slack_user_id(db, removed_emp)
+            if emp_slack_id:
+                try:
+                    notify_employee_allocation_removed(
+                        employee_slack_user_id=emp_slack_id,
+                        employee_name=removed_emp.name,
+                        sub_project_name=project.name,
+                        project_manager_name=actor_name or "Manager",
+                        timeline=f"Until {date_cls.today().isoformat()}",
+                        allocated_hours_per_day=f"{alloc_info.get('total_daily_hours', 8)}h/day",
+                        role_tags=alloc_info.get("role_tags", []),
+                    )
+                    logger.info("Sent Slack removal notification to employee %s for project %s", removed_emp.name, project.name)
+                except Exception as e:
+                    logger.warning("Failed to notify removed employee %s: %s", removed_emp.id, e)
+
+        # 7. Notify Target Leaders (PMs and/or Leads based on actor)
+        remover_display = actor_name or actor_role_label
+        for leader_id in target_leader_ids:
+            leader = emp_map.get(leader_id)
+            if not leader:
+                continue
+            leader_slack_id = try_get_or_cache_employee_slack_user_id(db, leader)
+            if not leader_slack_id:
+                continue
+            try:
+                notify_project_leader_allocation_removed(
+                    leader_slack_user_id=leader_slack_id,
+                    leader_name=leader.name,
+                    employee_name=removed_emp.name if removed_emp else "Employee",
+                    employee_designation=removed_emp.designation if removed_emp else None,
+                    sub_project_name=project.name,
+                    remover_name=remover_display,
+                    remover_role=actor_role_label,
+                    allocated_hours_per_day=f"{alloc_info.get('total_daily_hours', 8)}h/day",
+                    role_tags=alloc_info.get("role_tags", []),
+                )
+                logger.info("Sent Slack removal notification to leader %s for project %s (Actor: %s)", leader.name, project.name, actor_type)
+            except Exception as e:
+                logger.warning("Failed to notify leader %s of removal: %s", leader_id, e)
+
+    except Exception as exc:
+        logger.warning("Error in send_unallocation_notifications: %s", exc)
+
+
 def notify_employee_sub_project_updated(
     *,
     employee_slack_user_id: str,
@@ -1279,9 +1713,46 @@ def send_checkin_reminder_message(*, employee_slack_user_id: str, employee_name:
     raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
 
 
+async def send_checkin_reminder_message_async(*, employee_slack_user_id: str, employee_name: str) -> bool:
+    channel_id = open_direct_message_channel(employee_slack_user_id)
+    portal_url = os.getenv("PORTAL_URL", "https://portal.autonexai360.com")
+
+    response = await _async_slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": "Daily Check-in Reminder",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"Hi {employee_name}, please don't forget to <{portal_url}|check in for today>.",
+                    },
+                }
+            ],
+        },
+    )
+    if response.get("ok"):
+        return True
+    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+
+
 def try_send_checkin_reminder_message(**kwargs) -> bool:
     try:
         return send_checkin_reminder_message(**kwargs)
+    except SlackRateLimitError:
+        raise
+    except Exception as exc:
+        logger.warning("Slack check-in reminder skipped for %s: %s", kwargs.get("employee_name"), exc)
+        return False
+
+
+async def try_send_checkin_reminder_message_async(**kwargs) -> bool:
+    try:
+        return await send_checkin_reminder_message_async(**kwargs)
+    except SlackRateLimitError:
+        raise
     except Exception as exc:
         logger.warning("Slack check-in reminder skipped for %s: %s", kwargs.get("employee_name"), exc)
         return False
@@ -1325,34 +1796,97 @@ def send_late_warning_message(*, employee_slack_user_id: str, employee_name: str
 def try_send_late_warning_message(**kwargs) -> bool:
     try:
         return send_late_warning_message(**kwargs)
+    except SlackRateLimitError:
+        raise
     except Exception as exc:
         logger.warning("Slack late check-in warning skipped for %s: %s", kwargs.get("employee_name"), exc)
         return False
 
 
-def send_admin_late_list(*, channel_id: str, late_checkins: list[tuple[str, str, str]], pending_checkins: list[tuple[str, str]]) -> bool:
-    """Send the late check-in report to a specific channel (e.g. admins)."""
-    if not late_checkins and not pending_checkins:
-        return True
-
+def send_admin_late_list(*, channel_id: str, stats_payload: dict) -> bool:
+    """Send the late check-in report to a specific channel (e.g. admins) using the stats engine payload."""
+    overall = stats_payload.get("overall", {})
+    projects = stats_payload.get("projects", [])
+    late_checkins = stats_payload.get("late_list", [])
+    pending_checkins = stats_payload.get("pending_list", [])
+    
+    # 1. Overall Summary Block
     blocks = [
         {
             "type": "header",
             "text": {
                 "type": "plain_text",
-                "text": f"Daily Late Check-in Report (Late: {len(late_checkins)} | Pending: {len(pending_checkins)})",
+                "text": "📊 Daily Check-in & Summary Report",
                 "emoji": True
             }
-        }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*1. Overall Check-in Summary*\n"
+                        f"• 👥 *Total Active Employees:* {overall.get('total_active', 0)} (excludes employees on leave)\n"
+                        f"• ✅ *Total Checked-in:* {overall.get('total_checked_in', 0)}\n"
+                        f"• ⏳ *Total Pending:* {overall.get('total_pending', 0)}\n"
+                        f"• ⏱️ *Average Check-in Time:* WFO: {overall.get('avg_time_wfo', '—')} | WFH: {overall.get('avg_time_wfh', '—')}\n"
+                        f"• 🥇 *First Check-in:* WFO: {overall.get('first_checkin_wfo', 'None')} | WFH: {overall.get('first_checkin_wfh', 'None')}"
+            }
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Check-in Time Distribution:*\n"
+                        f"  ◽ *Before 9:00 AM:* {overall.get('distribution', {}).get('before_9', 0)} employees\n"
+                        f"  ◽ *9:00 AM - 10:00 AM:* {overall.get('distribution', {}).get('9_to_10', 0)} employees\n"
+                        f"  ◽ *10:00 AM - 11:00 AM:* {overall.get('distribution', {}).get('10_to_11', 0)} employees\n"
+                        f"  ◽ *11:00 AM - 12:00 PM:* {overall.get('distribution', {}).get('11_to_12', 0)} employees\n"
+                        f"  🟥 *After 12:00 PM:* {overall.get('distribution', {}).get('after_12', 0)} employees"
+            }
+        },
+        {"type": "divider"}
     ]
 
     def make_cell(text):
         return {"type": "raw_text", "text": str(text)}
 
-    def add_table_section(title, employee_list, is_late_list=False):
+    # 2. Project-Wise Summary
+    if projects:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": "*2. Project-Wise Summary*"
+            }
+        })
+        
+        chunk_size = 50
+        for i in range(0, len(projects), chunk_size):
+            chunk = projects[i:i + chunk_size]
+            rows = [[make_cell("Project Name"), make_cell("Check-ins"), make_cell("Pending"), make_cell("Distribution (<9 | 9-10 | 10-11 | 11-12 | >12)")]]
+            for p in chunk:
+                name_str = p['name'][:30] + "..." if len(p['name']) > 33 else p['name']
+                chk_str = f"{p['checked_in']}/{p['allocated_total']}"
+                pend_str = str(p['pending'])
+                dist_str = f"{p['dist_before_9']} | {p['dist_9_to_10']} | {p['dist_10_to_11']} | {p['dist_11_to_12']} | {p['dist_after_12']}"
+                rows.append([make_cell(name_str), make_cell(chk_str), make_cell(pend_str), make_cell(dist_str)])
+                
+            blocks.append({
+                "type": "table",
+                "rows": rows,
+                "column_settings": [
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "center"},
+                    {"align": "center"},
+                    {"align": "center", "is_wrapped": True}
+                ]
+            })
+            
+        blocks.append({"type": "divider"})
+
+    def add_table_section(title, employee_list, list_type="pending"):
         if not employee_list:
             return
-        
         blocks.append({
             "type": "section",
             "text": {
@@ -1360,57 +1894,62 @@ def send_admin_late_list(*, channel_id: str, late_checkins: list[tuple[str, str,
                 "text": f"*{title} ({len(employee_list)})*"
             }
         })
-        
         chunk_size = 50
         for i in range(0, len(employee_list), chunk_size):
             chunk = employee_list[i:i + chunk_size]
-            
-            if is_late_list:
+            if list_type == "late":
                 rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email"), make_cell("Time")]]
                 for idx, record in enumerate(chunk):
                     name, email, time_str = record
                     rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email), make_cell(time_str)])
-                
-                blocks.append({
-                    "type": "table",
-                    "rows": rows,
-                    "column_settings": [
-                        {"align": "center"},
-                        {"align": "left", "is_wrapped": True},
-                        {"align": "left", "is_wrapped": True},
-                        {"align": "right"}
-                    ]
-                })
+                col_settings = [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}, {"align": "right"}]
+            elif list_type == "sentiment":
+                rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email"), make_cell("Sentiment")]]
+                for idx, record in enumerate(chunk):
+                    name, email, mood_str = record
+                    rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email), make_cell(mood_str)])
+                col_settings = [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}, {"align": "left"}]
             else:
                 rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email")]]
                 for idx, record in enumerate(chunk):
                     name, email = record
                     rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email)])
+                col_settings = [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}]
+                
+            blocks.append({
+                "type": "table",
+                "rows": rows,
+                "column_settings": col_settings
+            })
 
-                blocks.append({
-                    "type": "table",
-                    "rows": rows,
-                    "column_settings": [
-                        {"align": "center"},
-                        {"align": "left", "is_wrapped": True},
-                        {"align": "left", "is_wrapped": True}
-                    ]
-                })
+    add_table_section("Checked In Late (After 11:00 AM)", late_checkins, list_type="late")
+    add_table_section("Pending (Not Checked In Yet)", pending_checkins, list_type="pending")
+    add_table_section("⚠️ Low Sentiment Check-ins", stats_payload.get("low_sentiment_list", []), list_type="sentiment")
 
-    add_table_section("Checked In Late (After 11:00 AM)", late_checkins, is_late_list=True)
-    add_table_section("Pending (Not Checked In Yet)", pending_checkins, is_late_list=False)
-
-    response = _slack_request(
-        "/chat.postMessage",
-        {
-            "channel": channel_id,
-            "text": f"Daily Late Check-in Report (Late: {len(late_checkins)} | Pending: {len(pending_checkins)})",
-            "blocks": blocks,
-        },
-    )
-    if response.get("ok"):
-        return True
-    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+    max_blocks = 40
+    main_message_ts = None
+    text = f"Daily Late Check-in Report (Late: {len(late_checkins)} | Pending: {len(pending_checkins)})"
+    
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    def send_chunk(payload):
+        resp = _slack_request("/chat.postMessage", payload)
+        if not resp.get("ok"):
+            raise RuntimeError(f"Slack message chunk failed: {resp.get('error') or 'unknown_error'}")
+        return resp
+    
+    for i in range(0, len(blocks), max_blocks):
+        chunk = blocks[i:i + max_blocks]
+        payload = {"channel": channel_id, "text": text if not main_message_ts else "Report Continued...", "blocks": chunk}
+        
+        if main_message_ts:
+            payload["thread_ts"] = main_message_ts
+            
+        response = send_chunk(payload)
+            
+        if not main_message_ts:
+            main_message_ts = response.get("ts")
+            
+    return True
 
 
 def try_send_admin_late_list(**kwargs) -> bool:
@@ -1459,6 +1998,8 @@ def send_pm_confirm_reminder_message(*, pm_slack_user_id: str, pm_name: str, pen
 def try_send_pm_confirm_reminder_message(**kwargs) -> bool:
     try:
         return send_pm_confirm_reminder_message(**kwargs)
+    except SlackRateLimitError:
+        raise
     except Exception as exc:
         logger.warning("Slack PM confirm reminder skipped for %s: %s", kwargs.get("pm_name"), exc)
         return False

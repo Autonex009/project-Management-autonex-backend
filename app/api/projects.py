@@ -135,6 +135,175 @@ def _allocate_project_leaders(db: Session, project: Project, current_user: User)
     )
 
 
+
+def _get_temp_rosters_for_projects(db: Session, pids: list[int], permanent_allocs_by_project: dict[int, list]) -> dict[int, dict]:
+    """
+    Returns dict mapping project_id -> {
+      "temp_count": int,
+      "temp_roster": [
+         {
+           "name": str,
+           "work_location": str,
+           "checked_out_at": str | None,
+           "is_stale": bool,
+           "stale_date": str | None
+         }
+      ]
+    }
+    """
+    from datetime import date
+    from sqlalchemy import desc
+    from app.models.daily_checkin import DailyCheckIn
+    from app.models.leave import Leave
+    from app.models.wfh import WFHRequest
+    from app.models.employee import Employee
+
+    today = date.today()
+    
+    # 1. Get latest checkins for all employees
+    latest_checkins = db.query(DailyCheckIn).distinct(DailyCheckIn.employee_id).order_by(DailyCheckIn.employee_id, desc(DailyCheckIn.checkin_date)).all()
+    
+    # Filter to only checkins that contain any of our pids
+    pid_strs = {str(p) for p in pids}
+    pid_ints = {p for p in pids}
+    
+    relevant_checkins = []
+    for c in latest_checkins:
+        if not c.project_ids:
+            continue
+        c_pids = {str(x) for x in c.project_ids}
+        if c_pids.intersection(pid_strs):
+            relevant_checkins.append(c)
+            
+    if not relevant_checkins:
+        return {pid: {"temp_count": 0, "temp_roster": []} for pid in pids}
+        
+    emp_ids = [c.employee_id for c in relevant_checkins]
+    
+    # 2. Fetch employee baseline models and names
+    emps = db.query(Employee.id, Employee.name, Employee.work_model, Employee.avatar_url, Employee.designation, Employee.status).filter(Employee.id.in_(emp_ids)).all()
+    emp_map = {e.id: e for e in emps if e.status != "archived"}
+
+
+    
+    # 3. Fetch leaves for today for these employees
+    leaves = db.query(Leave.employee_id).filter(
+        Leave.employee_id.in_(emp_ids),
+        Leave.start_date <= today,
+        Leave.end_date >= today,
+        Leave.status == "approved"
+    ).all()
+    leave_emp_ids = {l.employee_id for l in leaves}
+    
+    # 4. Fetch WFH requests for today for these employees
+    from sqlalchemy import func
+    wfhs = db.query(WFHRequest.employee_id).filter(
+        WFHRequest.employee_id.in_(emp_ids),
+        WFHRequest.wfh_date <= today,
+        func.coalesce(WFHRequest.end_date, WFHRequest.wfh_date) >= today,
+        WFHRequest.status == "approved"
+    ).all()
+    wfh_emp_ids = {w.employee_id for w in wfhs}
+    
+    results = {pid: {"temp_count": 0, "temp_roster": [], "permanent_locations": {}} for pid in pids}
+    
+    # Also fetch permanent locations for all involved employees
+    all_perm_emp_ids = set()
+    for allocs in permanent_allocs_by_project.values():
+        for a in allocs:
+            all_perm_emp_ids.add(a.employee_id)
+            
+    # Include their leaves/wfhs
+    from sqlalchemy import func
+    perm_leaves = db.query(Leave.employee_id).filter(
+        Leave.employee_id.in_(all_perm_emp_ids),
+        Leave.start_date <= today,
+        Leave.end_date >= today,
+        Leave.status == "approved"
+    ).all() if all_perm_emp_ids else []
+    perm_leave_emp_ids = {l.employee_id for l in perm_leaves}
+    
+    perm_wfhs = db.query(WFHRequest.employee_id).filter(
+        WFHRequest.employee_id.in_(all_perm_emp_ids),
+        WFHRequest.wfh_date <= today,
+        func.coalesce(WFHRequest.end_date, WFHRequest.wfh_date) >= today,
+        WFHRequest.status == "approved"
+    ).all() if all_perm_emp_ids else []
+    perm_wfh_emp_ids = {w.employee_id for w in perm_wfhs}
+    
+    perm_emps = db.query(Employee.id, Employee.work_model).filter(Employee.id.in_(all_perm_emp_ids)).all() if all_perm_emp_ids else []
+    perm_emp_map = {e.id: e.work_model for e in perm_emps}
+    
+    # Pre-calculate permanent locations (fallback)
+    perm_locations = {}
+    for eid in all_perm_emp_ids:
+        if eid in perm_leave_emp_ids:
+            perm_locations[eid] = "Leave"
+        elif eid in perm_wfh_emp_ids:
+            perm_locations[eid] = "WFH"
+        else:
+            perm_locations[eid] = perm_emp_map.get(eid) or "WFO"
+
+    # Now integrate checkins
+    checkin_locations = {}
+    for c in latest_checkins:
+        if c.checkin_date == today:
+            checkin_locations[c.employee_id] = c.work_mode or "WFO"
+
+    for eid in all_perm_emp_ids:
+        if eid in checkin_locations and perm_locations.get(eid) != "Leave":
+            perm_locations[eid] = checkin_locations[eid]
+
+    for pid, allocs in permanent_allocs_by_project.items():
+        for a in allocs:
+            if a.employee_id in perm_locations:
+                results[pid]["permanent_locations"][a.employee_id] = perm_locations[a.employee_id]
+
+    for c in relevant_checkins:
+        if c.employee_id not in emp_map:
+            continue
+        if c.employee_id in leave_emp_ids:
+            continue # Employee is on leave today, does not appear in temp roster
+            
+        is_stale = c.checkin_date != today
+        
+        # Determine work location
+        if not is_stale:
+            # Actual check-in today
+            work_location = c.work_mode or "WFO"
+        elif c.employee_id in wfh_emp_ids:
+            # No check-in today, but approved WFH
+            work_location = "WFH"
+        else:
+            # Baseline fallback
+            emp_model = emp_map.get(c.employee_id)
+            work_location = emp_model.work_model if emp_model and emp_model.work_model else "WFO"
+            
+        c_pids = {int(x) for x in c.project_ids if str(x).isdigit()}
+        
+        emp = emp_map.get(c.employee_id)
+        emp_name = emp.name if emp else "Unknown"
+        
+        for pid in pids:
+            if pid in c_pids:
+                # Check if they are permanently allocated
+                permanent_emp_ids = [a.employee_id for a in permanent_allocs_by_project.get(pid, [])]
+                if c.employee_id not in permanent_emp_ids:
+                    # They are a temp worker
+                    results[pid]["temp_count"] += 1
+                    results[pid]["temp_roster"].append({
+                        "name": emp_name,
+                        "designation": emp_map[c.employee_id].designation if c.employee_id in emp_map else None,
+                        "avatar_url": emp_map[c.employee_id].avatar_url if c.employee_id in emp_map else None,
+                        "work_location": work_location,
+                        "checked_out_at": c.checked_out_at.isoformat() if (not is_stale and c.checked_out_at) else None,
+                        "is_stale": is_stale,
+                        "stale_date": c.checkin_date.isoformat() if is_stale else None
+                    })
+                    
+    return results
+
+
 def enrich_project_response(db: Session, project: Project) -> dict:
     from datetime import date
     today = date.today()
@@ -158,6 +327,13 @@ def enrich_project_response(db: Session, project: Project) -> dict:
     resp = ProjectResponse.model_validate(project).model_dump()
     resp["allocated_pm_count"] = pm_count
     resp["allocated_lead_count"] = lead_count
+    
+    # Add temp count logic
+    temp_data = _get_temp_rosters_for_projects(db, [project.id], {project.id: allocs})
+    resp["temp_count"] = temp_data[project.id]["temp_count"]
+    resp["temp_roster"] = temp_data[project.id]["temp_roster"]
+    resp["permanent_locations"] = temp_data[project.id].get("permanent_locations", {})
+    
     return resp
 
 
@@ -228,6 +404,8 @@ def enrich_projects_bulk(db: Session, projects: list[Project]) -> list[dict]:
             curr += timedelta(days=1)
         return days
 
+    temp_data = _get_temp_rosters_for_projects(db, pids, allocs_by_project)
+    
     results = []
     for project in projects:
         allocs = allocs_by_project.get(project.id, [])
@@ -337,6 +515,12 @@ def enrich_projects_bulk(db: Session, projects: list[Project]) -> list[dict]:
         ]
         resp["pm_ids"] = pm_ids
         resp["team_lead_ids"] = team_lead_ids
+        
+        # Add temp count logic
+        resp["temp_count"] = temp_data[project.id]["temp_count"]
+        resp["temp_roster"] = temp_data[project.id]["temp_roster"]
+        resp["permanent_locations"] = temp_data[project.id].get("permanent_locations", {})
+        
         results.append(resp)
 
     return results

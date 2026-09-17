@@ -1,0 +1,39 @@
+{
+  "employee_id": 422,
+  "work_model": "WFO",
+  "checkins": [
+    {
+      "id": 2555,
+      "checkin_date": "2026-09-15",
+      "work_mode": "WFO",
+      "project_ids": [
+        "other"
+      ]
+    },
+    {
+      "id": 1730,
+      "checkin_date": "2026-09-09",
+      "work_mode": "WFO",
+      "project_ids": [
+        207
+      ]
+    },
+    {
+      "id": 2002,
+      "checkin_date": "2026-09-10",
+      "work_mode": "WFO",
+      "project_ids": [
+        207
+      ]
+    },
+    {
+      "id": 2830,
+      "checkin_date": "2026-09-16",
+      "work_mode": "WFH",
+      "project_ids": [
+        "other"
+      ]
+    }
+  ],
+  "allocations": []
+}
