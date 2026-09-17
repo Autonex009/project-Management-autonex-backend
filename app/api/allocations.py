@@ -82,25 +82,47 @@ def sync_project_allocations(db, project_id: int):
 
 router = APIRouter(prefix="/api/allocations", tags=["Allocations"], dependencies=[Depends(get_current_user)])
 
+def _is_team_lead(emp: Employee) -> bool:
+    if not emp or not emp.designation: return False
+    val = emp.designation.strip().lower().replace(" ", "_").replace("-", "_")
+    return val in {"team_lead", "teamlead", "tl"}
+
 def _resolve_pm_ids(project: Project, main_project_map: dict, employee_map: dict) -> list[int]:
     """A project's own PMs, falling back to its parent's program managers.
     Archived employees never count as a filled PM slot.
+    Team Leads incorrectly placed in the manager slot are excluded here (they are leads).
     """
     def is_stale(eid: int) -> bool:
         emp = employee_map.get(eid)
         return emp is None or emp.status == "archived"
 
     ids = [i for i in (project.assigned_employee_ids or []) if not is_stale(i)]
-    if ids:
-        return ids
+    if not ids:
+        mp = main_project_map.get(getattr(project, "main_project_id", None))
+        if mp:
+            fallback = getattr(mp, "program_manager_ids", None) or (
+                [mp.program_manager_id] if getattr(mp, "program_manager_id", None) else []
+            )
+            ids = [i for i in fallback if not is_stale(i)]
+            
+    return [i for i in ids if not _is_team_lead(employee_map.get(i))]
 
-    mp = main_project_map.get(getattr(project, "main_project_id", None))
-    if mp:
-        fallback = getattr(mp, "program_manager_ids", None) or (
-            [mp.program_manager_id] if getattr(mp, "program_manager_id", None) else []
-        )
-        return [i for i in fallback if not is_stale(i)]
-    return []
+def _resolve_demoted_lead_ids(project: Project, main_project_map: dict, employee_map: dict) -> list[int]:
+    """Finds users sitting in the manager slot who are actually Team Leads by designation."""
+    def is_stale(eid: int) -> bool:
+        emp = employee_map.get(eid)
+        return emp is None or emp.status == "archived"
+
+    ids = [i for i in (project.assigned_employee_ids or []) if not is_stale(i)]
+    if not ids:
+        mp = main_project_map.get(getattr(project, "main_project_id", None))
+        if mp:
+            fallback = getattr(mp, "program_manager_ids", None) or (
+                [mp.program_manager_id] if getattr(mp, "program_manager_id", None) else []
+            )
+            ids = [i for i in fallback if not is_stale(i)]
+            
+    return [i for i in ids if _is_team_lead(employee_map.get(i))]
 
 
 @router.get("/page", response_model=AllocationsPageResponse)
@@ -216,10 +238,23 @@ def get_allocations_page(
             continue  # mirrors the old client filter: only "active" rows
 
         pm_ids = _resolve_pm_ids(project, main_project_map, employee_map)
-        lead_ids = list({
-            a.employee_id for a in allocs
-            if a.role_tags and TEAM_LEAD_TAG in a.role_tags and not is_stale(a.employee_id)
-        })
+        demoted_ids = _resolve_demoted_lead_ids(project, main_project_map, employee_map)
+        lead_ids_set = set(demoted_ids)
+        
+        for a in allocs:
+            if is_stale(a.employee_id):
+                continue
+            tagged = False
+            for tag in (a.role_tags or []):
+                val = tag.strip().lower().replace(" ", "_").replace("-", "_")
+                if val in {"team_lead", "teamlead", "tl"}:
+                    tagged = True
+                    break
+            
+            if tagged or _is_team_lead(employee_map.get(a.employee_id)):
+                lead_ids_set.add(a.employee_id)
+                
+        lead_ids = list(lead_ids_set)
         assigned_ids = set(pm_ids) | set(lead_ids)
 
         def sort_key(a: Allocation):
@@ -333,13 +368,10 @@ def get_project_allocation_detail(
     employees = db.query(Employee).filter(Employee.id.in_(employee_ids)).all() if employee_ids else []
     employee_map = {e.id: e for e in employees}
 
-    pm_ids = set(project.assigned_employee_ids or [])
-    if not pm_ids and getattr(project, "main_project_id", None):
-        mp = db.query(MainProject).filter(MainProject.id == project.main_project_id).first()
-        if mp:
-            pm_ids = set(getattr(mp, "program_manager_ids", None) or (
-                [mp.program_manager_id] if getattr(mp, "program_manager_id", None) else []
-            ))
+    mp = db.query(MainProject).filter(MainProject.id == project.main_project_id).first() if getattr(project, "main_project_id", None) else None
+    main_project_map = {mp.id: mp} if mp else {}
+    pm_ids = set(_resolve_pm_ids(project, main_project_map, employee_map))
+    demoted_ids = set(_resolve_demoted_lead_ids(project, main_project_map, employee_map))
 
     items = []
 
@@ -385,6 +417,15 @@ def get_project_allocation_detail(
                 wm = emp.work_model or "WFO"
                 location = "WFH" if "HOME" in wm.upper() or "WFH" in wm.upper() else "WFO"
 
+        tagged = False
+        for tag in (a.role_tags or []):
+            val = tag.strip().lower().replace(" ", "_").replace("-", "_")
+            if val in {"team_lead", "teamlead", "tl"}:
+                tagged = True
+                break
+                
+        is_lead_flag = tagged or _is_team_lead(emp) or (a.employee_id in demoted_ids)
+
         items.append(ProjectAllocationDetailItem(
             allocation_id=a.id,
             employee_id=a.employee_id,
@@ -397,7 +438,7 @@ def get_project_allocation_detail(
             total_daily_hours=a.total_daily_hours,
             role_tags=a.role_tags or [],
             is_pm=a.employee_id in pm_ids,
-            is_lead=bool(a.role_tags and TEAM_LEAD_TAG in a.role_tags),
+            is_lead=is_lead_flag,
             stale=stale,
         ))
 
