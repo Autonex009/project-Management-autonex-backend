@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import asyncio
+import threading
 from datetime import datetime
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
@@ -1164,6 +1165,128 @@ def notify_employee_allocation_removed(
     raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
 
 
+_allocation_pm_batches = {}
+_allocation_pm_batches_lock = threading.Lock()
+
+
+def queue_pm_allocation_batch(
+    *,
+    pm_slack_user_id: str,
+    pm_name: str,
+    actor_name: str,
+    sub_project_name: str,
+    change_type: str,  # "added" | "removed"
+    employee_name: str,
+    allocated_hours_per_day: str,
+    role_tags: list[str] | None = None,
+) -> None:
+    """
+    Queue allocation/deallocation notification for a PM and debounce by 2.5s
+    so multiple rapid changes (e.g. bulk allocation modal actions) are sent
+    in a single consolidated Slack DM.
+    """
+    batch_key = (pm_slack_user_id, sub_project_name)
+
+    with _allocation_pm_batches_lock:
+        if batch_key not in _allocation_pm_batches:
+            _allocation_pm_batches[batch_key] = {
+                "pm_slack_user_id": pm_slack_user_id,
+                "pm_name": pm_name,
+                "actor_name": actor_name,
+                "sub_project_name": sub_project_name,
+                "added": [],
+                "removed": [],
+                "timer": None,
+            }
+
+        entry = _allocation_pm_batches[batch_key]
+        if entry["timer"]:
+            entry["timer"].cancel()
+
+        item = {
+            "employee_name": employee_name,
+            "hours": allocated_hours_per_day,
+            "roles": ", ".join(role_tags or []) if role_tags else None,
+        }
+
+        if change_type == "added":
+            if not any(x["employee_name"] == employee_name for x in entry["added"]):
+                entry["added"].append(item)
+        elif change_type == "removed":
+            if not any(x["employee_name"] == employee_name for x in entry["removed"]):
+                entry["removed"].append(item)
+
+        timer = threading.Timer(2.5, _flush_pm_allocation_batch, args=[batch_key])
+        entry["timer"] = timer
+        timer.start()
+
+
+def _flush_pm_allocation_batch(batch_key: tuple[str, str]) -> None:
+    with _allocation_pm_batches_lock:
+        entry = _allocation_pm_batches.pop(batch_key, None)
+
+    if not entry:
+        return
+
+    pm_slack_user_id = entry["pm_slack_user_id"]
+    actor_name = entry["actor_name"]
+    sub_project_name = entry["sub_project_name"]
+    added_list = entry["added"]
+    removed_list = entry["removed"]
+
+    if not added_list and not removed_list:
+        return
+
+    try:
+        channel_id = open_direct_message_channel(pm_slack_user_id)
+
+        blocks = [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"📢 *Project Allocation Update by Admin {actor_name}*\nSub-project: *{sub_project_name}*",
+                },
+            }
+        ]
+
+        if added_list:
+            items_str = "\n".join(
+                f"• *{x['employee_name']}* ({x['hours']}" + (f", Roles: {x['roles']}" if x['roles'] else "") + ")"
+                for x in added_list
+            )
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"✅ *Newly Allocated ({len(added_list)}):*\n{items_str}",
+                }
+            })
+
+        if removed_list:
+            items_str = "\n".join(
+                f"• *{x['employee_name']}*" for x in removed_list
+            )
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"❌ *Deallocated ({len(removed_list)}):*\n{items_str}",
+                }
+            })
+
+        _slack_request(
+            "/chat.postMessage",
+            {
+                "channel": channel_id,
+                "text": f"Allocation update for {sub_project_name} by Admin {actor_name}",
+                "blocks": blocks,
+            },
+        )
+    except Exception as exc:
+        logger.error("Failed to send batched PM allocation notification to %s: %s", pm_slack_user_id, exc)
+
+
 def notify_project_leader_allocation_created(
     *,
     leader_slack_user_id: str,
@@ -1677,7 +1800,41 @@ def _checkin_frontend_url() -> str:
     return f"{base}/employee/dashboard"
 
 
-def send_checkin_reminder_message(*, employee_slack_user_id: str, employee_name: str) -> bool:
+_today_slack_reminders = {}
+
+
+def record_today_slack_reminder(employee_id: int, channel_id: str, ts: str):
+    if employee_id and channel_id and ts:
+        _today_slack_reminders[employee_id] = (channel_id, ts)
+
+
+def pop_today_slack_reminder(employee_id: int) -> tuple[str | None, str | None]:
+    return _today_slack_reminders.pop(employee_id, (None, None))
+
+
+def find_today_slack_reminder(user_id: str) -> tuple[str | None, str | None]:
+    """Find the most recent check-in reminder/warning DM message sent to this user today from DM history."""
+    try:
+        channel_id = open_direct_message_channel(user_id)
+        response = _slack_request("/conversations.history", {"channel": channel_id, "limit": 10}, method="GET")
+        if response.get("ok"):
+            messages = response.get("messages", [])
+            for msg in messages:
+                blocks = msg.get("blocks", [])
+                has_checkin_action = any(
+                    elem.get("action_id") == "checkin_now"
+                    for b in blocks if b.get("type") == "actions"
+                    for elem in b.get("elements", [])
+                )
+                text = msg.get("text", "")
+                if has_checkin_action or "don't forget to check in" in text.lower() or "haven't checked in yet" in text.lower():
+                    return (channel_id, msg.get("ts"))
+    except Exception as exc:
+        logger.warning("Could not find Slack reminder in history for user %s: %s", user_id, exc)
+    return (None, None)
+
+
+def send_checkin_reminder_message(*, employee_slack_user_id: str, employee_name: str) -> tuple[str | None, str | None]:
     """DM an employee who hasn't checked in yet, with a link back to the dashboard
     (the check-in modal shows itself there — see DailyCheckInModal)."""
     channel_id = open_direct_message_channel(employee_slack_user_id)
@@ -1702,6 +1859,8 @@ def send_checkin_reminder_message(*, employee_slack_user_id: str, employee_name:
                             "text": {"type": "plain_text", "text": "Check In Now"},
                             "style": "primary",
                             "url": _checkin_frontend_url(),
+                            "action_id": "checkin_now",
+                            "value": json.dumps({"action": "checkin_reminder"}),
                         }
                     ],
                 },
@@ -1709,7 +1868,7 @@ def send_checkin_reminder_message(*, employee_slack_user_id: str, employee_name:
         },
     )
     if response.get("ok"):
-        return True
+        return (response.get("ts"), channel_id)
     raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
 
 
@@ -1738,7 +1897,7 @@ async def send_checkin_reminder_message_async(*, employee_slack_user_id: str, em
     raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
 
 
-def try_send_checkin_reminder_message(**kwargs) -> bool:
+def try_send_checkin_reminder_message(**kwargs) -> tuple[str | None, str | None]:
     try:
         return send_checkin_reminder_message(**kwargs)
     except SlackRateLimitError:
@@ -1755,10 +1914,10 @@ async def try_send_checkin_reminder_message_async(**kwargs) -> bool:
         raise
     except Exception as exc:
         logger.warning("Slack check-in reminder skipped for %s: %s", kwargs.get("employee_name"), exc)
-        return False
+        return (None, None)
 
 
-def send_late_warning_message(*, employee_slack_user_id: str, employee_name: str) -> bool:
+def send_late_warning_message(*, employee_slack_user_id: str, employee_name: str) -> tuple[str | None, str | None]:
     """DM an employee who hasn't checked in yet, warning them of escalation."""
     channel_id = open_direct_message_channel(employee_slack_user_id)
     response = _slack_request(
@@ -1782,6 +1941,8 @@ def send_late_warning_message(*, employee_slack_user_id: str, employee_name: str
                             "text": {"type": "plain_text", "text": "Check In Now"},
                             "style": "danger",
                             "url": _checkin_frontend_url(),
+                            "action_id": "checkin_now",
+                            "value": json.dumps({"action": "checkin_reminder"}),
                         }
                     ],
                 },
@@ -1789,17 +1950,100 @@ def send_late_warning_message(*, employee_slack_user_id: str, employee_name: str
         },
     )
     if response.get("ok"):
-        return True
+        return (response.get("ts"), channel_id)
     raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
 
 
-def try_send_late_warning_message(**kwargs) -> bool:
+def try_send_late_warning_message(**kwargs) -> tuple[str | None, str | None]:
     try:
         return send_late_warning_message(**kwargs)
     except SlackRateLimitError:
         raise
     except Exception as exc:
         logger.warning("Slack late check-in warning skipped for %s: %s", kwargs.get("employee_name"), exc)
+        return (None, None)
+
+
+def send_checkin_success_message(*, employee_slack_user_id: str, employee_name: str, work_mode: str, checked_in_at_str: str) -> bool:
+    """Send Slack DM via PM Bot confirming successful check-in for today."""
+    channel_id = open_direct_message_channel(employee_slack_user_id)
+    response = _slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": f"You have successfully checked in for today.",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f":white_check_mark: *Check-in Successful!*\nHi {employee_name}, you have successfully checked in for today.",
+                    },
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Work Mode*\n{work_mode.upper() if work_mode else 'N/A'}",
+                        },
+                        {
+                            "type": "mrkdwn",
+                            "text": f"*Check-in Time*\n{checked_in_at_str}",
+                        },
+                    ],
+                },
+            ],
+        },
+    )
+    if response.get("ok"):
+        return True
+    logger.error(f"Failed to send Slack check-in success message: {response.get('error')}")
+    return False
+
+
+def try_send_checkin_success_message(**kwargs) -> bool:
+    try:
+        return send_checkin_success_message(**kwargs)
+    except Exception as exc:
+        logger.warning("Slack check-in success notification skipped: %s", exc)
+        return False
+
+
+def update_checkin_reminder_to_completed(*, channel_id: str, ts: str, employee_name: str | None = None) -> bool:
+    """Update check-in reminder message in Slack, removing the action button and replacing it with 'You have already checked in for today'."""
+    try:
+        name_text = f", {employee_name}" if employee_name else ""
+        response = _slack_request(
+            "/chat.update",
+            {
+                "channel": channel_id,
+                "ts": ts,
+                "text": "You have already checked in for today.",
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": f"*Good morning{name_text}!*",
+                        },
+                    },
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": "✅ *You have already checked in for today.*",
+                        },
+                    },
+                ],
+            },
+        )
+        if response.get("ok"):
+            return True
+        logger.error(f"Failed to update Slack check-in reminder message: {response.get('error')}")
+        return False
+    except Exception as exc:
+        logger.warning("Slack update check-in reminder skipped: %s", exc)
         return False
 
 

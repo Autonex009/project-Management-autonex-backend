@@ -1034,7 +1034,8 @@ def update_employee(
     if linked_user:
         linked_user.email = employee.email
         linked_user.name = employee.name
-        linked_user.role = get_user_role_from_designation(employee.designation)
+        if linked_user.role not in ("admin", "hr"):
+            linked_user.role = get_user_role_from_designation(employee.designation)
         linked_user.skills = employee.skills or []
 
     details = audit_service.diff_all(before, employee, EMPLOYEE_FIELD_LABELS)
@@ -1260,7 +1261,8 @@ def convert_to_fulltime(
     linked_user = db.query(User).filter(User.employee_id == employee.id).first()
     old_login_role = linked_user.role if linked_user else None
     if linked_user:
-        linked_user.role = get_user_role_from_designation(employee.designation)
+        if linked_user.role not in ("admin", "hr"):
+            linked_user.role = get_user_role_from_designation(employee.designation)
         linked_user.employment_type = "Full-time"
         # In-app audit/notification for the employee.
         db.add(Notification(
