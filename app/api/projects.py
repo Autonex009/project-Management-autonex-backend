@@ -181,8 +181,8 @@ def _get_temp_rosters_for_projects(db: Session, pids: list[int], permanent_alloc
     emp_ids = [c.employee_id for c in relevant_checkins]
     
     # 2. Fetch employee baseline models and names
-    emps = db.query(Employee.id, Employee.name, Employee.work_model, Employee.avatar_url, Employee.designation).filter(Employee.id.in_(emp_ids)).all()
-    emp_map = {e.id: e for e in emps}
+    emps = db.query(Employee.id, Employee.name, Employee.work_model, Employee.avatar_url, Employee.designation, Employee.status).filter(Employee.id.in_(emp_ids)).all()
+    emp_map = {e.id: e for e in emps if e.status != "archived"}
 
 
     

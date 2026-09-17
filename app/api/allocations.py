@@ -1,11 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, status
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, status, BackgroundTasks
 from app.services.auth_service import get_current_user, has_team_read, require_role
 from app.services import audit_service, project_scope
 from app.models.user import User
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
-from app.db.database import get_db
+from app.db.database import get_db, SessionLocal
 from app.models.allocation import Allocation
 from app.models.project import SubProject, Project  # SubProject with Project alias
 from app.models.employee import Employee
@@ -36,8 +37,12 @@ from app.services.slack_service import (
     notify_employee_allocation_created,
     notify_employee_allocation_removed,
     notify_employee_sub_project_updated,
+    send_allocation_notifications_to_leaders,
+    send_unallocation_notifications,
     try_get_or_cache_employee_slack_user_id,
 )
+
+logger = logging.getLogger(__name__)
 
 TEAM_LEAD_TAG = "Team Lead"  # matches TEAM_LEAD_ROLE_TAG in sub_projects.py / TEAM_LEAD_TAG in frontend
 
@@ -699,6 +704,19 @@ def create_allocation(
     except Exception:
         pass
 
+    # Notify PM(s) and Lead(s) of the project on Slack
+    try:
+        actor_emp_id = current_user.employee_id if current_user else None
+        send_allocation_notifications_to_leaders(
+            db,
+            allocation,
+            project,
+            source="Manual Allocation",
+            actor_employee_id=actor_emp_id,
+        )
+    except Exception as exc:
+        logger.warning("Failed to send PM/Lead allocation notification: %s", exc)
+
     response = enrich_allocation_response(allocation, db)
     if leave_check["has_conflict"]:
         response["leave_warning"] = {
@@ -791,6 +809,7 @@ def update_allocation(
     allocation_id: int,
     data: AllocationUpdate,
     http_request: Request,
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm")),
 ):
@@ -938,6 +957,84 @@ def update_allocation(
     db.commit()
     db.refresh(allocation)
 
+    # If allocation was moved to a new project:
+    # 1. Unallocation notification for old project
+    # 2. Allocation notification for new project
+    actor_emp_id = current_user.employee_id if current_user else None
+    actor_role = current_user.role if current_user else "admin"
+    actor_name = current_user.name if current_user else "Manager"
+
+    if allocation.sub_project_id != old_sub_project_id:
+        try:
+            alloc_info_old = {
+                "id": allocation.id,
+                "employee_id": allocation.employee_id,
+                "sub_project_id": old_sub_project_id,
+                "total_daily_hours": before_values.get("total_daily_hours") or allocation.total_daily_hours or 8,
+                "role_tags": before_values.get("role_tags") or allocation.role_tags or [],
+            }
+            if background_tasks is not None:
+                background_tasks.add_task(
+                    _background_send_unallocation_notifications,
+                    alloc_info_old,
+                    old_sub_project_id,
+                    actor_emp_id,
+                    actor_role,
+                    actor_name,
+                )
+            else:
+                _background_send_unallocation_notifications(
+                    alloc_info_old,
+                    old_sub_project_id,
+                    actor_emp_id,
+                    actor_role,
+                    actor_name,
+                )
+        except Exception as exc:
+            logger.warning("Failed to send old project unallocation notification: %s", exc)
+
+        try:
+            new_proj = db.query(Project).filter(Project.id == allocation.sub_project_id).first()
+            if new_proj:
+                send_allocation_notifications_to_leaders(
+                    db,
+                    allocation,
+                    new_proj,
+                    source="Reallocation (Project Transfer)",
+                    actor_employee_id=actor_emp_id,
+                )
+        except Exception as exc:
+            logger.warning("Failed to send PM/Lead reallocation notification: %s", exc)
+
+    elif before_values.get("is_active") is True and allocation.is_active is False:
+        try:
+            alloc_info_deactivated = {
+                "id": allocation.id,
+                "employee_id": allocation.employee_id,
+                "sub_project_id": allocation.sub_project_id,
+                "total_daily_hours": allocation.total_daily_hours or 8,
+                "role_tags": allocation.role_tags or [],
+            }
+            if background_tasks is not None:
+                background_tasks.add_task(
+                    _background_send_unallocation_notifications,
+                    alloc_info_deactivated,
+                    allocation.sub_project_id,
+                    actor_emp_id,
+                    actor_role,
+                    actor_name,
+                )
+            else:
+                _background_send_unallocation_notifications(
+                    alloc_info_deactivated,
+                    allocation.sub_project_id,
+                    actor_emp_id,
+                    actor_role,
+                    actor_name,
+                )
+        except Exception as exc:
+            logger.warning("Failed to send deactivation unallocation notification: %s", exc)
+
     response = enrich_allocation_response(allocation, db)
     if leave_check["has_conflict"]:
         response["leave_warning"] = {
@@ -947,10 +1044,33 @@ def update_allocation(
     return response
 
 
+def _background_send_unallocation_notifications(
+    alloc_info: dict,
+    project_id: int,
+    actor_employee_id: int | None,
+    actor_user_role: str | None,
+    actor_name: str | None,
+):
+    """Safely runs in background with its own DB session to send Slack removal notifications."""
+    with SessionLocal() as bg_db:
+        try:
+            send_unallocation_notifications(
+                db=bg_db,
+                alloc_info=alloc_info,
+                project_id=project_id,
+                actor_user_role=actor_user_role,
+                actor_employee_id=actor_employee_id,
+                actor_name=actor_name,
+            )
+        except Exception as e:
+            logger.warning("Error in background unallocation notifications: %s", e)
+
+
 @router.delete("/{allocation_id}")
 def delete_allocation(
     allocation_id: int,
     http_request: Request,
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm")),
 ):
@@ -966,6 +1086,16 @@ def delete_allocation(
     project_scope.require_project_scope(
         db, current_user, project, action="remove allocations from this project"
     )
+
+    alloc_info = {
+        "id": allocation.id,
+        "employee_id": allocation.employee_id,
+        "sub_project_id": allocation.sub_project_id,
+        "total_daily_hours": allocation.total_daily_hours or 8,
+        "role_tags": allocation.role_tags or [],
+        "active_start_date": allocation.active_start_date,
+        "active_end_date": allocation.active_end_date,
+    }
 
     # Captured before the delete — afterwards there is no row left to describe.
     removed_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
@@ -1001,13 +1131,31 @@ def delete_allocation(
 
     db.commit()
 
-    # Notify only the removed employee. The whole-team "target changed"
-    # broadcast was intentionally removed so removing a member doesn't spam
-    # everyone still on the project.
-    try:
-        _send_employee_allocation_removed_notification(db, allocation, project)
-    except Exception:
-        pass
+    # Enqueue Slack notifications in background task:
+    # 1. Admin removed -> PM, Lead, Employee
+    # 2. PM removed -> Lead, Employee
+    # 3. Lead removed -> PM, Employee
+    actor_emp_id = current_user.employee_id if current_user else None
+    actor_role = current_user.role if current_user else "admin"
+    actor_name = current_user.name if current_user else "Manager"
+
+    if background_tasks is not None:
+        background_tasks.add_task(
+            _background_send_unallocation_notifications,
+            alloc_info,
+            sub_project_id,
+            actor_emp_id,
+            actor_role,
+            actor_name,
+        )
+    else:
+        _background_send_unallocation_notifications(
+            alloc_info,
+            sub_project_id,
+            actor_emp_id,
+            actor_role,
+            actor_name,
+        )
 
     return {"message": "Allocation removed"}
 

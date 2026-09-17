@@ -62,9 +62,11 @@ ENCORD_SYNC_HOUR = int(os.getenv("ENCORD_SYNC_HOUR", "23"))
 ENCORD_SYNC_MINUTE = int(os.getenv("ENCORD_SYNC_MINUTE", "30"))
 
 
-# Daily check-in reminders — mid-morning nudge to whoever hasn't checked in yet,
+# Daily check-in reminders — early morning & mid-morning nudge to whoever hasn't checked in yet,
 # then a later nudge to PMs/leads who still have unconfirmed check-ins. Weekdays
 # only. Hours are 24h local time.
+EARLY_CHECKIN_REMINDER_HOUR = int(os.getenv("EARLY_CHECKIN_REMINDER_HOUR", "8"))
+EARLY_CHECKIN_REMINDER_MINUTE = int(os.getenv("EARLY_CHECKIN_REMINDER_MINUTE", "45"))
 CHECKIN_REMINDER_HOUR = int(os.getenv("CHECKIN_REMINDER_HOUR", "10"))
 CHECKIN_REMINDER_MINUTE = int(os.getenv("CHECKIN_REMINDER_MINUTE", "0"))
 PM_CONFIRM_REMINDER_HOUR = int(os.getenv("PM_CONFIRM_REMINDER_HOUR", "12"))
@@ -100,6 +102,10 @@ LUNCH_REPORT_FALLBACK_EMAIL = os.getenv("LUNCH_REPORT_FALLBACK_EMAIL", "kisanjen
 # Internship lifecycle alert — run once per day (default 9:00 AM IST)
 INTERNSHIP_ALERT_HOUR = int(os.getenv("INTERNSHIP_ALERT_HOUR", "9"))
 INTERNSHIP_ALERT_MINUTE = int(os.getenv("INTERNSHIP_ALERT_MINUTE", "0"))
+
+# Monthly work model auto-sync — 1st of every month (default 00:15 AM IST)
+MONTHLY_WORK_MODEL_HOUR = int(os.getenv("MONTHLY_WORK_MODEL_HOUR", "0"))
+MONTHLY_WORK_MODEL_MINUTE = int(os.getenv("MONTHLY_WORK_MODEL_MINUTE", "15"))
 
 
 def _scheduled_hiring_sync() -> None:
@@ -766,7 +772,20 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
-    # Employee check-in reminder – weekdays at CHECKIN_REMINDER_HOUR:MINUTE.
+    # Early morning employee check-in reminder – weekdays at EARLY_CHECKIN_REMINDER_HOUR:MINUTE (default 8:45 AM).
+    _scheduler.add_job(
+        _scheduled_checkin_reminders,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=EARLY_CHECKIN_REMINDER_HOUR,
+        minute=EARLY_CHECKIN_REMINDER_MINUTE,
+        id="early_checkin_reminder",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Employee check-in reminder – weekdays at CHECKIN_REMINDER_HOUR:MINUTE (default 10:00 AM).
     _scheduler.add_job(
         _scheduled_checkin_reminders,
         trigger="cron",
@@ -895,6 +914,19 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
+    # Monthly work model auto-adjustment — 1st of every month at 00:15 AM IST
+    _scheduler.add_job(
+        _scheduled_monthly_work_model_sync,
+        trigger="cron",
+        day=1,
+        hour=MONTHLY_WORK_MODEL_HOUR,
+        minute=MONTHLY_WORK_MODEL_MINUTE,
+        id="monthly_work_model_sync",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     logger.info(
         "[scheduler] Started — Encord sync every %s min; hiring sync %s",
         ENCORD_SYNC_MINUTE,
@@ -928,6 +960,16 @@ def _scheduled_lunch_report() -> None:
             logger.error("[scheduler] Lunch report email failed for one or more recipients")
     except Exception as exc:
         logger.exception("[scheduler] Lunch report job crashed: %s", exc)
+
+def _scheduled_monthly_work_model_sync() -> None:
+    """Evaluate previous month's check-in records and auto-adjust work models (WFO <-> WFH)."""
+    db = SessionLocal()
+    try:
+        from app.services.work_model_service import sync_monthly_work_models
+        res = sync_monthly_work_models(db)
+        logger.info("[scheduler] Monthly work model sync complete: %s", res)
+    except Exception as exc:
+        logger.exception("[scheduler] Monthly work model sync failed: %s", exc)
     finally:
         db.close()
 
