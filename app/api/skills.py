@@ -16,8 +16,6 @@ router = APIRouter(prefix="/api/skills", tags=["skills"], dependencies=[Depends(
 @router.get("", response_model=List[Skill])
 def get_skills(db: Session = Depends(get_db)):
     """Get all skills"""
-    # Self-heal and prune the catalog to the approved dropdown values.
-    seed_skills()
     skills = skill_crud.get_all_skills(db)
     return [skill for skill in skills if skill.name in ALLOWED_SKILLS]
 
