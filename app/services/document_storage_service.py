@@ -182,10 +182,5 @@ def delete_document(stored_path: str) -> bool:
             body = resp.read().decode("utf-8", errors="ignore")
             logger.info("[delete_document] Supabase response %s: %s", resp.status, body)
             return True
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="ignore")
-        logger.error("[delete_document] Supabase HTTP %s for path '%s': %s", e.code, stored_path, body)
-        return False
-    except Exception as e:
-        logger.error("[delete_document] Unexpected error for path '%s': %s", stored_path, e)
+    except Exception:
         return False
