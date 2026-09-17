@@ -173,10 +173,11 @@ def delete_document(stored_path: str) -> bool:
                 return False
         return True
 
-    # Append stored_path to URL. quote() is optional for Supabase but safe.
-    url = f"{SUPABASE_URL}/storage/v1/object/{DOCS_BUCKET}/{urllib.parse.quote(stored_path)}"
-    logger.warning("[delete_document] Sending DELETE to: %s", url)
-    req = urllib.request.Request(url, headers=_auth_headers("application/json"), method="DELETE")
+    # Use POST to the remove endpoint (matches JS SDK implementation)
+    url = f"{SUPABASE_URL}/storage/v1/object/remove/{DOCS_BUCKET}"
+    payload = json.dumps({"prefixes": [stored_path]}).encode("utf-8")
+    logger.warning("[delete_document] Sending POST to: %s with prefixes: ['%s']", url, stored_path)
+    req = urllib.request.Request(url, data=payload, headers=_auth_headers("application/json"), method="POST")
     try:
         with urllib.request.urlopen(req) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
