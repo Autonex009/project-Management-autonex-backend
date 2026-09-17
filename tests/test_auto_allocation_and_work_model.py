@@ -4,7 +4,7 @@
 """
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 
 import pytest
 from fastapi import BackgroundTasks
@@ -222,6 +222,8 @@ def test_monthly_work_model_switches_to_wfh(db):
     emp = Employee(name="Remote Worker", email="remote@example.com", employee_type="Full-time", designation="Developer", status="active", work_model="WFO")
     db.add(emp)
     db.commit()
+    emp.created_at = datetime(2026, 8, 1)
+    db.commit()
 
     # Target date: Oct 1, 2026 -> evaluates September 2026
     # Create 20 working day check-ins in September 2026 with work_mode="WFH"
@@ -254,6 +256,8 @@ def test_monthly_work_model_mixed_mode_no_switch(db):
     """An employee who worked both WFO and WFH should NOT have their work_model changed."""
     emp = Employee(name="Hybrid Worker", email="hybrid@example.com", employee_type="Full-time", designation="Developer", status="active", work_model="WFO")
     db.add(emp)
+    db.commit()
+    emp.created_at = datetime(2026, 8, 1)
     db.commit()
 
     # September 2026: 10 WFH days and 10 WFO days
