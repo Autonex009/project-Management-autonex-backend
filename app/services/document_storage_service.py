@@ -174,6 +174,7 @@ def delete_document(stored_path: str) -> bool:
         return True
 
     url = f"{SUPABASE_URL}/storage/v1/object/{DOCS_BUCKET}/{stored_path}"
+    logger.info("[delete_document] Sending DELETE to: %s", url)
     req = urllib.request.Request(url, headers=_auth_headers(), method="DELETE")
     try:
         with urllib.request.urlopen(req):
