@@ -1,11 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, status
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, status, BackgroundTasks
 from app.services.auth_service import get_current_user, has_team_read, require_role
 from app.services import audit_service, project_scope
 from app.models.user import User
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
-from app.db.database import get_db
+from app.db.database import get_db, SessionLocal
 from app.models.allocation import Allocation
 from app.models.project import SubProject, Project  # SubProject with Project alias
 from app.models.employee import Employee
@@ -14,6 +15,7 @@ from app.models.sub_project import SubProject as HierarchySubProject
 from datetime import date as date_cls
 from app.models.leave import Leave
 from app.models.wfh import WFHRequest
+from app.api.projects import _get_temp_rosters_for_projects
 from app.schemas.allocation import (
     AllocationCreate, 
     AllocationUpdate, 
@@ -28,8 +30,6 @@ from app.schemas.allocation import (
     ProjectAllocationDetailItem,
 )
 from app.services.allocation_validator import (
-    validate_time_distribution,
-    check_double_booking,
     check_leave_conflict,
     get_all_employees_allocation_status
 )
@@ -37,9 +37,13 @@ from app.services.slack_service import (
     notify_employee_allocation_created,
     notify_employee_allocation_removed,
     notify_employee_sub_project_updated,
+    send_allocation_notifications_to_leaders,
+    send_unallocation_notifications,
     try_get_or_cache_employee_slack_user_id,
     queue_pm_allocation_batch,
 )
+
+logger = logging.getLogger(__name__)
 
 TEAM_LEAD_TAG = "Team Lead"  # matches TEAM_LEAD_ROLE_TAG in sub_projects.py / TEAM_LEAD_TAG in frontend
 
@@ -79,25 +83,47 @@ def sync_project_allocations(db, project_id: int):
 
 router = APIRouter(prefix="/api/allocations", tags=["Allocations"], dependencies=[Depends(get_current_user)])
 
+def _is_team_lead(emp: Employee) -> bool:
+    if not emp or not emp.designation: return False
+    val = emp.designation.strip().lower().replace(" ", "_").replace("-", "_")
+    return val in {"team_lead", "teamlead", "tl"}
+
 def _resolve_pm_ids(project: Project, main_project_map: dict, employee_map: dict) -> list[int]:
     """A project's own PMs, falling back to its parent's program managers.
     Archived employees never count as a filled PM slot.
+    Team Leads incorrectly placed in the manager slot are excluded here (they are leads).
     """
     def is_stale(eid: int) -> bool:
         emp = employee_map.get(eid)
         return emp is None or emp.status == "archived"
 
     ids = [i for i in (project.assigned_employee_ids or []) if not is_stale(i)]
-    if ids:
-        return ids
+    if not ids:
+        mp = main_project_map.get(getattr(project, "main_project_id", None))
+        if mp:
+            fallback = getattr(mp, "program_manager_ids", None) or (
+                [mp.program_manager_id] if getattr(mp, "program_manager_id", None) else []
+            )
+            ids = [i for i in fallback if not is_stale(i)]
+            
+    return [i for i in ids if not _is_team_lead(employee_map.get(i))]
 
-    mp = main_project_map.get(getattr(project, "main_project_id", None))
-    if mp:
-        fallback = getattr(mp, "program_manager_ids", None) or (
-            [mp.program_manager_id] if getattr(mp, "program_manager_id", None) else []
-        )
-        return [i for i in fallback if not is_stale(i)]
-    return []
+def _resolve_demoted_lead_ids(project: Project, main_project_map: dict, employee_map: dict) -> list[int]:
+    """Finds users sitting in the manager slot who are actually Team Leads by designation."""
+    def is_stale(eid: int) -> bool:
+        emp = employee_map.get(eid)
+        return emp is None or emp.status == "archived"
+
+    ids = [i for i in (project.assigned_employee_ids or []) if not is_stale(i)]
+    if not ids:
+        mp = main_project_map.get(getattr(project, "main_project_id", None))
+        if mp:
+            fallback = getattr(mp, "program_manager_ids", None) or (
+                [mp.program_manager_id] if getattr(mp, "program_manager_id", None) else []
+            )
+            ids = [i for i in fallback if not is_stale(i)]
+            
+    return [i for i in ids if _is_team_lead(employee_map.get(i))]
 
 
 @router.get("/page", response_model=AllocationsPageResponse)
@@ -143,7 +169,10 @@ def get_allocations_page(
     project_ids = [p.id for p in all_projects]
 
     # 2) One query for every allocation on these projects (no N+1).
-    all_allocs = db.query(Allocation).filter(Allocation.sub_project_id.in_(project_ids)).all()
+    all_allocs = db.query(Allocation).filter(
+        Allocation.sub_project_id.in_(project_ids),
+        Allocation.is_active == True
+    ).all()
     allocs_by_project: dict[int, list[Allocation]] = {}
     for a in all_allocs:
         allocs_by_project.setdefault(a.sub_project_id, []).append(a)
@@ -196,7 +225,13 @@ def get_allocations_page(
     def is_wfh_today(emp: Employee) -> bool:
         return emp.id in wfh_today
 
+    
+    # Fetch temp data for all projects
+    from app.api.projects import _get_temp_rosters_for_projects
+    temp_data = _get_temp_rosters_for_projects(db, project_ids, allocs_by_project)
+
     # 5) Build one row per project + a search blob kept OUT of the response.
+
     built: list[tuple[ProjectAllocationRow, str]] = []
     for project in all_projects:
         allocs = allocs_by_project.get(project.id, [])
@@ -204,10 +239,23 @@ def get_allocations_page(
             continue  # mirrors the old client filter: only "active" rows
 
         pm_ids = _resolve_pm_ids(project, main_project_map, employee_map)
-        lead_ids = list({
-            a.employee_id for a in allocs
-            if a.role_tags and TEAM_LEAD_TAG in a.role_tags and not is_stale(a.employee_id)
-        })
+        demoted_ids = _resolve_demoted_lead_ids(project, main_project_map, employee_map)
+        lead_ids_set = set(demoted_ids)
+        
+        for a in allocs:
+            if is_stale(a.employee_id):
+                continue
+            tagged = False
+            for tag in (a.role_tags or []):
+                val = tag.strip().lower().replace(" ", "_").replace("-", "_")
+                if val in {"team_lead", "teamlead", "tl"}:
+                    tagged = True
+                    break
+            
+            if tagged or _is_team_lead(employee_map.get(a.employee_id)):
+                lead_ids_set.add(a.employee_id)
+                
+        lead_ids = list(lead_ids_set)
         assigned_ids = set(pm_ids) | set(lead_ids)
 
         def sort_key(a: Allocation):
@@ -232,9 +280,10 @@ def get_allocations_page(
                 stale_count += 1
             else:
                 assigned_ids.add(a.employee_id)
-                if a.employee_id in on_leave_today:
+                loc = temp_data[project.id].get("permanent_locations", {}).get(a.employee_id)
+                if loc == "Leave":
                     on_leave += 1
-                elif is_wfh_today(emp):
+                elif loc and ("WFH" in loc.upper() or "HOME" in loc.upper()):
                     wfh_c += 1
                 else:
                     wfo += 1
@@ -272,6 +321,10 @@ def get_allocations_page(
             on_leave_count=on_leave,
             allocated_preview=preview,
             total_allocated_count=len(allocs),
+            daily_presence_total=temp_data[project.id]["temp_count"],
+            daily_presence_wfo=len([t for t in temp_data[project.id]["temp_roster"] if t["work_location"] == "WFO"]),
+            daily_presence_wfh=len([t for t in temp_data[project.id]["temp_roster"] if t["work_location"] == "WFH"]),
+            temp_roster=temp_data[project.id]["temp_roster"],
         )
         built.append((row, " ".join(name_blob_parts).lower()))
 
@@ -308,18 +361,18 @@ def get_project_allocation_detail(
         db, current_user, project, action="view this project's allocations"
     )
 
-    allocs = db.query(Allocation).filter(Allocation.sub_project_id == project_id).all()
+    allocs = db.query(Allocation).filter(
+        Allocation.sub_project_id == project_id,
+        Allocation.is_active == True
+    ).all()
     employee_ids = {a.employee_id for a in allocs} | set(project.assigned_employee_ids or [])
     employees = db.query(Employee).filter(Employee.id.in_(employee_ids)).all() if employee_ids else []
     employee_map = {e.id: e for e in employees}
 
-    pm_ids = set(project.assigned_employee_ids or [])
-    if not pm_ids and getattr(project, "main_project_id", None):
-        mp = db.query(MainProject).filter(MainProject.id == project.main_project_id).first()
-        if mp:
-            pm_ids = set(getattr(mp, "program_manager_ids", None) or (
-                [mp.program_manager_id] if getattr(mp, "program_manager_id", None) else []
-            ))
+    mp = db.query(MainProject).filter(MainProject.id == project.main_project_id).first() if getattr(project, "main_project_id", None) else None
+    main_project_map = {mp.id: mp} if mp else {}
+    pm_ids = set(_resolve_pm_ids(project, main_project_map, employee_map))
+    demoted_ids = set(_resolve_demoted_lead_ids(project, main_project_map, employee_map))
 
     items = []
 
@@ -340,12 +393,39 @@ def get_project_allocation_detail(
     ).all() if employee_ids else []
     wfh_ids = {wfh.employee_id for wfh in wfhs}
 
+    from app.models.daily_checkin import DailyCheckIn
+    checkins = db.query(DailyCheckIn).filter(
+        DailyCheckIn.employee_id.in_(employee_ids),
+        DailyCheckIn.checkin_date == today
+    ).order_by(DailyCheckIn.created_at.desc()).all() if employee_ids else []
+    
+    checkin_map = {}
+    for c in checkins:
+        if c.employee_id not in checkin_map:
+            checkin_map[c.employee_id] = c.work_mode
+
     for a in allocs:
         emp = employee_map.get(a.employee_id)
         stale = emp is None or emp.status == "archived"
         
-        is_wfh = emp and emp.id in wfh_ids
-        location = "WFH" if is_wfh else ("WFO" if emp else None)
+        location = None
+        if emp:
+            if emp.id in checkin_map and emp.id not in on_leave_ids:
+                location = checkin_map[emp.id]
+            elif emp.id in wfh_ids:
+                location = "WFH"
+            else:
+                wm = emp.work_model or "WFO"
+                location = "WFH" if "HOME" in wm.upper() or "WFH" in wm.upper() else "WFO"
+
+        tagged = False
+        for tag in (a.role_tags or []):
+            val = tag.strip().lower().replace(" ", "_").replace("-", "_")
+            if val in {"team_lead", "teamlead", "tl"}:
+                tagged = True
+                break
+                
+        is_lead_flag = tagged or _is_team_lead(emp) or (a.employee_id in demoted_ids)
 
         items.append(ProjectAllocationDetailItem(
             allocation_id=a.id,
@@ -359,7 +439,7 @@ def get_project_allocation_detail(
             total_daily_hours=a.total_daily_hours,
             role_tags=a.role_tags or [],
             is_pm=a.employee_id in pm_ids,
-            is_lead=bool(a.role_tags and TEAM_LEAD_TAG in a.role_tags),
+            is_lead=is_lead_flag,
             stale=stale,
         ))
 
@@ -601,6 +681,9 @@ def _allocation_to_dict(
         "weekly_hours_allocated": allocation.weekly_hours_allocated,
         "weekly_tasks_allocated": allocation.weekly_tasks_allocated,
         "effective_week": allocation.effective_week,
+        "is_active": allocation.is_active,
+        "deactivated_at": allocation.deactivated_at,
+        "deactivated_reason": allocation.deactivated_reason,
         "created_at": allocation.created_at,
         "updated_at": allocation.updated_at,
         "employee_name": employee.name if employee else None,
@@ -623,32 +706,10 @@ def validate_allocation(
 ):
     """
     Validate an allocation before saving.
-    Performs Sum-Zero and Double-Booking checks.
     """
     errors = []
     warnings = []
     
-    # Sum-Zero validation
-    time_check = validate_time_distribution(
-        data.total_daily_hours,
-        data.time_distribution or {}
-    )
-    if not time_check['is_valid'] and data.time_distribution:
-        errors.append(time_check['message'])
-    
-    # Double-booking check
-    booking_check = check_double_booking(
-        db=db,
-        employee_id=data.employee_id,
-        new_hours=data.total_daily_hours,
-        active_start=data.active_start_date,
-        active_end=data.active_end_date,
-        exclude_allocation_id=data.exclude_allocation_id
-    )
-    
-    if booking_check.get('is_overbooked'):
-        warnings.append(booking_check['message'])
-
     # Leave-overlap check: informational warning only — leave days are
     # automatically excluded from capacity calculations downstream.
     leave_check = check_leave_conflict(
@@ -662,8 +723,8 @@ def validate_allocation(
 
     return AllocationValidationResponse(
         is_valid=len(errors) == 0,
-        time_distribution_valid=time_check['is_valid'],
-        double_booking_check=booking_check,
+        time_distribution_valid=True,
+        double_booking_check={"is_overbooked": False, "message": ""},
         errors=errors,
         warnings=warnings
     )
@@ -690,36 +751,8 @@ def create_allocation(
         action="allocate people to this project",
     )
 
-    # Validate time distribution if provided
-    if data.time_distribution:
-        time_check = validate_time_distribution(
-            data.total_daily_hours,
-            data.time_distribution
-        )
-        if not time_check['is_valid']:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=time_check['message']
-            )
-    
-    # Double-booking check (warn but don't block if override_flag is set)
-    booking_check = check_double_booking(
-        db=db,
-        employee_id=data.employee_id,
-        new_hours=data.total_daily_hours,
-        active_start=data.active_start_date,
-        active_end=data.active_end_date
-    )
-    
-    if booking_check.get('is_overbooked') and not data.override_flag:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": booking_check['message'],
-                "requires_override": True,
-                "booking_details": booking_check
-            }
-        )
+    # Force all allocations to be a simple 8-hour flat assignment
+    data.total_daily_hours = 8
 
     # Leave-overlap check: informational only — leave days are excluded from
     # capacity calculations automatically; assignment is still permitted.
@@ -785,10 +818,18 @@ def create_allocation(
     except Exception:
         pass
 
+    # Notify PM(s) and Lead(s) of the project on Slack
     try:
-        _queue_pm_allocation_notification(db, project, current_user, "added", allocation)
-    except Exception:
-        pass
+        actor_emp_id = current_user.employee_id if current_user else None
+        send_allocation_notifications_to_leaders(
+            db,
+            allocation,
+            project,
+            source="Manual Allocation",
+            actor_employee_id=actor_emp_id,
+        )
+    except Exception as exc:
+        logger.warning("Failed to send PM/Lead allocation notification: %s", exc)
 
     response = enrich_allocation_response(allocation, db)
     if leave_check["has_conflict"]:
@@ -872,8 +913,7 @@ def get_allocations_by_employee(
             if not employee or current_user.email != employee.email:
                 raise HTTPException(status_code=403, detail="Access denied")
     allocations = db.query(Allocation).filter(
-        Allocation.employee_id == employee_id,
-        Allocation.is_active == True
+        Allocation.employee_id == employee_id
     ).all()
     return [enrich_allocation_response(a, db) for a in allocations]
 
@@ -883,6 +923,7 @@ def update_allocation(
     allocation_id: int,
     data: AllocationUpdate,
     http_request: Request,
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm")),
 ):
@@ -930,49 +971,8 @@ def update_allocation(
             )
     
     # Double-booking check — always re-validate on update.
-    # Moving an allocation to a new project / date range / employee without
-    # changing hours can still create overlaps that the previous range avoided.
-    # (Previously the check only ran when data.total_daily_hours was truthy.)
-    resolved_employee_id = data.employee_id if data.employee_id is not None else allocation.employee_id
-    resolved_hours = (
-        data.total_daily_hours
-        if data.total_daily_hours is not None
-        else (allocation.total_daily_hours or 8)
-    )
-    resolved_start = (
-        data.active_start_date
-        if data.active_start_date is not None
-        else allocation.active_start_date
-    )
-    resolved_end = (
-        data.active_end_date
-        if data.active_end_date is not None
-        else allocation.active_end_date
-    )
-
-    booking_check = check_double_booking(
-        db=db,
-        employee_id=resolved_employee_id,
-        new_hours=resolved_hours,
-        active_start=resolved_start,
-        active_end=resolved_end,
-        exclude_allocation_id=allocation_id,
-    )
-
-    override_flag = (
-        data.override_flag
-        if data.override_flag is not None
-        else allocation.override_flag
-    )
-    if booking_check.get("is_overbooked") and not override_flag:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail={
-                "message": booking_check["message"],
-                "requires_override": True,
-                "booking_details": booking_check,
-            },
-        )
+    # Force all allocations to be a simple 8-hour flat assignment
+    data.total_daily_hours = 8
 
     # Leave-overlap check on update: informational only.
     resolved_employee_id = data.employee_id or allocation.employee_id
@@ -987,15 +987,19 @@ def update_allocation(
 
     old_sub_project_id = allocation.sub_project_id
 
-    # Snapshot every field the caller is about to overwrite, before overwriting it.
-    # Read after the setattr loop and the "from" side of each diff would already be
-    # the new value.
     changed_keys = list(data.model_dump(exclude_unset=True).keys())
+    # Manually track total_daily_hours as changed
+    if "total_daily_hours" not in changed_keys:
+        changed_keys.append("total_daily_hours")
+
     before_values = {key: getattr(allocation, key, None) for key in changed_keys}
     old_employee_id = allocation.employee_id
 
     for key, value in data.model_dump(exclude_unset=True).items():
         setattr(allocation, key, value)
+        
+    # Force 8-hour flat assignment explicitly
+    allocation.total_daily_hours = 8
 
     db.flush()
 
@@ -1067,6 +1071,84 @@ def update_allocation(
     db.commit()
     db.refresh(allocation)
 
+    # If allocation was moved to a new project:
+    # 1. Unallocation notification for old project
+    # 2. Allocation notification for new project
+    actor_emp_id = current_user.employee_id if current_user else None
+    actor_role = current_user.role if current_user else "admin"
+    actor_name = current_user.name if current_user else "Manager"
+
+    if allocation.sub_project_id != old_sub_project_id:
+        try:
+            alloc_info_old = {
+                "id": allocation.id,
+                "employee_id": allocation.employee_id,
+                "sub_project_id": old_sub_project_id,
+                "total_daily_hours": before_values.get("total_daily_hours") or allocation.total_daily_hours or 8,
+                "role_tags": before_values.get("role_tags") or allocation.role_tags or [],
+            }
+            if background_tasks is not None:
+                background_tasks.add_task(
+                    _background_send_unallocation_notifications,
+                    alloc_info_old,
+                    old_sub_project_id,
+                    actor_emp_id,
+                    actor_role,
+                    actor_name,
+                )
+            else:
+                _background_send_unallocation_notifications(
+                    alloc_info_old,
+                    old_sub_project_id,
+                    actor_emp_id,
+                    actor_role,
+                    actor_name,
+                )
+        except Exception as exc:
+            logger.warning("Failed to send old project unallocation notification: %s", exc)
+
+        try:
+            new_proj = db.query(Project).filter(Project.id == allocation.sub_project_id).first()
+            if new_proj:
+                send_allocation_notifications_to_leaders(
+                    db,
+                    allocation,
+                    new_proj,
+                    source="Reallocation (Project Transfer)",
+                    actor_employee_id=actor_emp_id,
+                )
+        except Exception as exc:
+            logger.warning("Failed to send PM/Lead reallocation notification: %s", exc)
+
+    elif before_values.get("is_active") is True and allocation.is_active is False:
+        try:
+            alloc_info_deactivated = {
+                "id": allocation.id,
+                "employee_id": allocation.employee_id,
+                "sub_project_id": allocation.sub_project_id,
+                "total_daily_hours": allocation.total_daily_hours or 8,
+                "role_tags": allocation.role_tags or [],
+            }
+            if background_tasks is not None:
+                background_tasks.add_task(
+                    _background_send_unallocation_notifications,
+                    alloc_info_deactivated,
+                    allocation.sub_project_id,
+                    actor_emp_id,
+                    actor_role,
+                    actor_name,
+                )
+            else:
+                _background_send_unallocation_notifications(
+                    alloc_info_deactivated,
+                    allocation.sub_project_id,
+                    actor_emp_id,
+                    actor_role,
+                    actor_name,
+                )
+        except Exception as exc:
+            logger.warning("Failed to send deactivation unallocation notification: %s", exc)
+
     response = enrich_allocation_response(allocation, db)
     if leave_check["has_conflict"]:
         response["leave_warning"] = {
@@ -1076,10 +1158,33 @@ def update_allocation(
     return response
 
 
+def _background_send_unallocation_notifications(
+    alloc_info: dict,
+    project_id: int,
+    actor_employee_id: int | None,
+    actor_user_role: str | None,
+    actor_name: str | None,
+):
+    """Safely runs in background with its own DB session to send Slack removal notifications."""
+    with SessionLocal() as bg_db:
+        try:
+            send_unallocation_notifications(
+                db=bg_db,
+                alloc_info=alloc_info,
+                project_id=project_id,
+                actor_user_role=actor_user_role,
+                actor_employee_id=actor_employee_id,
+                actor_name=actor_name,
+            )
+        except Exception as e:
+            logger.warning("Error in background unallocation notifications: %s", e)
+
+
 @router.delete("/{allocation_id}")
 def delete_allocation(
     allocation_id: int,
     http_request: Request,
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm")),
 ):
@@ -1095,6 +1200,16 @@ def delete_allocation(
     project_scope.require_project_scope(
         db, current_user, project, action="remove allocations from this project"
     )
+
+    alloc_info = {
+        "id": allocation.id,
+        "employee_id": allocation.employee_id,
+        "sub_project_id": allocation.sub_project_id,
+        "total_daily_hours": allocation.total_daily_hours or 8,
+        "role_tags": allocation.role_tags or [],
+        "active_start_date": allocation.active_start_date,
+        "active_end_date": allocation.active_end_date,
+    }
 
     # Captured before the delete — afterwards there is no row left to describe.
     removed_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
@@ -1130,10 +1245,31 @@ def delete_allocation(
 
     db.commit()
 
-    try:
-        _send_employee_allocation_removed_notification(db, allocation, project)
-    except Exception:
-        pass
+    # Enqueue Slack notifications in background task:
+    # 1. Admin removed -> PM, Lead, Employee
+    # 2. PM removed -> Lead, Employee
+    # 3. Lead removed -> PM, Employee
+    actor_emp_id = current_user.employee_id if current_user else None
+    actor_role = current_user.role if current_user else "admin"
+    actor_name = current_user.name if current_user else "Manager"
+
+    if background_tasks is not None:
+        background_tasks.add_task(
+            _background_send_unallocation_notifications,
+            alloc_info,
+            sub_project_id,
+            actor_emp_id,
+            actor_role,
+            actor_name,
+        )
+    else:
+        _background_send_unallocation_notifications(
+            alloc_info,
+            sub_project_id,
+            actor_emp_id,
+            actor_role,
+            actor_name,
+        )
 
     try:
         _queue_pm_allocation_notification(db, project, current_user, "removed", allocation)

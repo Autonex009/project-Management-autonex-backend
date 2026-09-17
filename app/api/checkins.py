@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 from typing import Optional, List
 from pydantic import BaseModel
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response, BackgroundTasks, Request
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -18,6 +18,7 @@ from app.models.employee import Employee
 from app.models.user import User
 from app.services.auth_service import get_current_user, require_role
 from app.services.project_scope import can_act_on_project, has_full_access
+from app.services.allocation_service import sync_employee_allocations_from_checkin
 from app.schemas.checkin import (
     CheckInCreate,
     CheckOutUpdate,
@@ -330,6 +331,8 @@ def get_today_status(
 @router.post("", response_model=CheckInResponse)
 def submit_checkin(
     payload: CheckInCreate,
+    http_request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -369,7 +372,6 @@ def submit_checkin(
 
     db.commit()
     db.refresh(checkin)
-
     # --- Send Slack confirmation DM & update reminder message button ---
     try:
         from app.models.employee import Employee
@@ -411,6 +413,21 @@ def submit_checkin(
                     )
     except Exception as exc:
         logger.warning(f"Error triggering Slack check-in notifications: {exc}")
+
+    # Sync allocations strictly to match the submitted checkin project_ids
+    valid_project_ids = [pid for pid in payload.project_ids if isinstance(pid, int)]
+    
+    try:
+        from app.services.allocation_service import sync_employee_allocations_from_checkin
+        sync_employee_allocations_from_checkin(
+            db=db,
+            employee_id=employee_id,
+            submitted_project_ids=valid_project_ids,
+            background_tasks=background_tasks,
+            http_request=http_request
+        )
+    except Exception as exc:
+        logger.warning(f"Error syncing allocations from checkin: {exc}")
 
     return checkin
 

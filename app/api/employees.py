@@ -45,6 +45,7 @@ from app.services.auth_service import (
 from app.services.email_service import try_send_email_changed_email
 from app.services.identity_validator import check_duplicate_identity
 from app.services import audit_service
+from app.services import document_service as _doc_svc
 
 # Column → display name for audit diffs. Anything unmapped falls back to a humanised
 # column name, so a new field still shows up rather than being silently dropped.
@@ -55,6 +56,7 @@ EMPLOYEE_FIELD_LABELS = {
     "phone": "Phone",
     "designation": "Designation",
     "employee_type": "Employee type",
+    "work_model": "Work model",
     "status": "Status",
     "working_hours_per_day": "Working hours/day",
     "weekly_availability": "Weekly availability",
@@ -262,6 +264,22 @@ def create_employee(
 
     db.commit()
     db.refresh(employee)
+
+    # ── Auto-generate internship offer letter for interns / contractors ─────────
+    if is_intern_or_contractor(employee.employee_type):
+        try:
+            _doc_svc.generate_document(
+                employee_id=employee.id,
+                doc_type="internship_offer_letter",
+                db=db,
+                uploaded_by=current_user.id,
+            )
+        except Exception as _exc:
+            logging.getLogger(__name__).warning(
+                "Auto-generation of internship_offer_letter failed for employee %s: %s",
+                employee.id,
+                _exc,
+            )
 
     # Deliver welcome email with credentials to employee
     portal_url = (
@@ -745,11 +763,18 @@ def employee_stats(db: Session = Depends(get_db)):
         "archived": archived_count
     }
 
+    by_work_model_raw = db.query(
+        func.coalesce(Employee.work_model, "WFO"),
+        func.count(Employee.id)
+    ).filter(Employee.status != "archived").group_by(func.coalesce(Employee.work_model, "WFO")).all()
+    by_work_model = {str(row[0]).upper(): row[1] for row in by_work_model_raw}
+
     return {
         "by_designation": dict(by_designation),
         "by_status": by_status_dict,
         "by_type": dict(by_type),
         "by_type_active": dict(by_type_active),
+        "by_work_model": by_work_model,
         "total": total_roster
     }
 
@@ -1281,6 +1306,22 @@ def convert_to_fulltime(
 
     db.commit()
     db.refresh(employee)
+
+    # ── Auto-generate full-time offer letter on conversion ──────────────────────
+    try:
+        _doc_svc.generate_document(
+            employee_id=employee.id,
+            doc_type="fulltime_offer_letter",
+            db=db,
+            uploaded_by=current_user.id,
+        )
+    except Exception as _exc:
+        logging.getLogger(__name__).warning(
+            "Auto-generation of fulltime_offer_letter failed for employee %s: %s",
+            employee.id,
+            _exc,
+        )
+
     return employee
 
 
@@ -1311,9 +1352,13 @@ def delete_employee(
         # Clear allocations for this employee — counted before the delete so the entry
         # can say how many project assignments this silently removed.
         removed_allocations = db.query(Allocation).filter(
-            Allocation.employee_id == employee.id
+            Allocation.employee_id == employee.id,
+            Allocation.is_active == True
         ).count()
-        db.query(Allocation).filter(Allocation.employee_id == employee.id).delete(synchronize_session=False)
+        db.query(Allocation).filter(Allocation.employee_id == employee.id).update(
+            {"is_active": False, "deactivated_reason": "Employee archived"},
+            synchronize_session=False
+        )
         db.flush()
 
         audit_service.record(

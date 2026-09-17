@@ -2,9 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system deps for psycopg2-binary and general build tools
+# Install system deps and LibreOffice
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gcc libpq-dev && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        gcc \
+        libpq-dev \
+        libreoffice-writer && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies

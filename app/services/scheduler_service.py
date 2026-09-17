@@ -62,9 +62,11 @@ ENCORD_SYNC_HOUR = int(os.getenv("ENCORD_SYNC_HOUR", "23"))
 ENCORD_SYNC_MINUTE = int(os.getenv("ENCORD_SYNC_MINUTE", "30"))
 
 
-# Daily check-in reminders — mid-morning nudge to whoever hasn't checked in yet,
+# Daily check-in reminders — early morning & mid-morning nudge to whoever hasn't checked in yet,
 # then a later nudge to PMs/leads who still have unconfirmed check-ins. Weekdays
 # only. Hours are 24h local time.
+EARLY_CHECKIN_REMINDER_HOUR = int(os.getenv("EARLY_CHECKIN_REMINDER_HOUR", "8"))
+EARLY_CHECKIN_REMINDER_MINUTE = int(os.getenv("EARLY_CHECKIN_REMINDER_MINUTE", "45"))
 CHECKIN_REMINDER_HOUR = int(os.getenv("CHECKIN_REMINDER_HOUR", "10"))
 CHECKIN_REMINDER_MINUTE = int(os.getenv("CHECKIN_REMINDER_MINUTE", "0"))
 PM_CONFIRM_REMINDER_HOUR = int(os.getenv("PM_CONFIRM_REMINDER_HOUR", "12"))
@@ -73,6 +75,8 @@ LATE_WARNING_HOUR = int(os.getenv("LATE_WARNING_HOUR", "10"))
 LATE_WARNING_MINUTE = int(os.getenv("LATE_WARNING_MINUTE", "45"))
 ADMIN_REPORT_HOUR = int(os.getenv("ADMIN_REPORT_HOUR", "11"))
 ADMIN_REPORT_MINUTE = int(os.getenv("ADMIN_REPORT_MINUTE", "10"))
+EVENING_REPORT_HOUR = int(os.getenv("EVENING_REPORT_HOUR", "18"))
+EVENING_REPORT_MINUTE = int(os.getenv("EVENING_REPORT_MINUTE", "30"))
 LATE_CHECKIN_CHANNEL_ID = os.getenv("LATE_CHECKIN_CHANNEL_ID", "C0BV91K4PD5")
 
 # Onboarding checks
@@ -94,6 +98,14 @@ LUNCH_REPORT_HOUR = int(os.getenv("LUNCH_REPORT_HOUR", "11"))
 LUNCH_REPORT_MINUTE = int(os.getenv("LUNCH_REPORT_MINUTE", "0"))
 LUNCH_REPORT_PRIMARY_EMAIL = os.getenv("LUNCH_REPORT_PRIMARY_EMAIL", "jadhavashish061@gmail.com")
 LUNCH_REPORT_FALLBACK_EMAIL = os.getenv("LUNCH_REPORT_FALLBACK_EMAIL", "kisanjena40@gmail.com")
+
+# Internship lifecycle alert — run once per day (default 9:00 AM IST)
+INTERNSHIP_ALERT_HOUR = int(os.getenv("INTERNSHIP_ALERT_HOUR", "9"))
+INTERNSHIP_ALERT_MINUTE = int(os.getenv("INTERNSHIP_ALERT_MINUTE", "0"))
+
+# Monthly work model auto-sync — 1st of every month (default 00:15 AM IST)
+MONTHLY_WORK_MODEL_HOUR = int(os.getenv("MONTHLY_WORK_MODEL_HOUR", "0"))
+MONTHLY_WORK_MODEL_MINUTE = int(os.getenv("MONTHLY_WORK_MODEL_MINUTE", "15"))
 
 
 def _scheduled_hiring_sync() -> None:
@@ -263,6 +275,7 @@ def _scheduled_checkin_reminders() -> None:
         from app.models.leave import Leave
         from app.models.daily_checkin import DailyCheckIn
         from app.services.slack_service import (
+            SlackRateLimitError,
             try_get_or_cache_employee_slack_user_id,
             try_send_checkin_reminder_message,
             record_today_slack_reminder,
@@ -305,12 +318,11 @@ def _scheduled_checkin_reminders() -> None:
                     sent += 1
                     record_today_slack_reminder(employee.id, channel_id, ts)
                     time.sleep(1.5)  # Base sleep to avoid rate limits
+            except SlackRateLimitError as exc:
+                logger.warning("[scheduler] Rate limit hit sending reminder to %s, sleeping %s seconds...", employee.email, exc.retry_after_seconds)
+                time.sleep(exc.retry_after_seconds)
             except Exception as exc:
-                if "429" in str(exc) or "rate" in str(exc).lower():
-                    logger.warning("[scheduler] Rate limit hit sending reminder to %s, sleeping...", employee.email)
-                    time.sleep(10)
-                else:
-                    logger.error("[scheduler] Failed sending checkin reminder to %s: %s", employee.email, exc)
+                logger.error("[scheduler] Failed sending checkin reminder to %s: %s", employee.email, exc)
 
         logger.info("[scheduler] Check-in reminders sent to %s employee(s)", sent)
     except Exception as exc:
@@ -379,6 +391,7 @@ def _scheduled_pm_confirm_reminders() -> None:
         from app.models.allocation import Allocation
         from app.api.checkins import _get_scoped_project_ids
         from app.services.slack_service import (
+            SlackRateLimitError,
             try_get_or_cache_employee_slack_user_id,
             try_send_pm_confirm_reminder_message,
         )
@@ -454,12 +467,11 @@ def _scheduled_pm_confirm_reminders() -> None:
                 ):
                     sent += 1
                     time.sleep(1.5)  # Avoid Slack API rate limit
+            except SlackRateLimitError as exc:
+                logger.warning("[scheduler] Rate limit hit sending PM reminder, sleeping %s seconds...", exc.retry_after_seconds)
+                time.sleep(exc.retry_after_seconds)
             except Exception as exc:
-                if "429" in str(exc) or "rate" in str(exc).lower():
-                    logger.warning("[scheduler] Rate limit hit sending PM reminder, sleeping...")
-                    time.sleep(10)
-                else:
-                    logger.error("[scheduler] Failed sending PM reminder: %s", exc)
+                logger.error("[scheduler] Failed sending PM reminder: %s", exc)
                     
         logger.info("[scheduler] PM confirm reminders sent to %s manager(s)", sent)
     except Exception as exc:
@@ -538,13 +550,8 @@ def _scheduled_admin_report() -> None:
     try:
         from app.utils.business_time import today_ist
         from app.constants.leave_types import is_fixed_holiday, is_weekend
-        from app.models.employee import Employee
-        from app.models.leave import Leave
-        from app.models.daily_checkin import DailyCheckIn
         from app.services.slack_service import try_send_admin_late_list
-        from sqlalchemy import not_
-        from datetime import datetime, time as dtime, timezone
-        from zoneinfo import ZoneInfo
+        from app.services.stats_engine import _generate_admin_report_payload
 
         today = today_ist()
 
@@ -552,62 +559,157 @@ def _scheduled_admin_report() -> None:
             logger.info("[scheduler] Skipping admin report because today is a weekend or holiday.")
             return
 
-        checked_in_query = db.query(DailyCheckIn.employee_id).filter(
-            DailyCheckIn.checkin_date == today
-        )
-        on_leave_query = db.query(Leave.employee_id).filter(
-            Leave.status == "approved",
-            Leave.start_date <= today,
-            Leave.end_date >= today,
-        )
+        # 1. Generate stats payload via the new Stats Engine
+        stats_payload = _generate_admin_report_payload(db, target_date=today)
 
-        # 1. Pending: Did not check in and not on leave
-        pending_employees = db.query(Employee).filter(
-            Employee.status == "active",
-            not_(Employee.id.in_(checked_in_query)),
-            not_(Employee.id.in_(on_leave_query))
-        ).all()
-        pending_list = [(emp.name, emp.email) for emp in pending_employees]
-
-        # 2. Late Check-in: Checked in today, but after 11:00 AM IST
-        IST = ZoneInfo("Asia/Kolkata")
-        late_threshold_ist = datetime.combine(today, dtime(11, 0), tzinfo=IST)
-        late_threshold_utc = late_threshold_ist.astimezone(timezone.utc)
-
-        late_checkins = db.query(Employee, DailyCheckIn.checked_in_at).join(
-            DailyCheckIn, Employee.id == DailyCheckIn.employee_id
-        ).filter(
-            Employee.status == "active",
-            DailyCheckIn.checkin_date == today,
-            DailyCheckIn.checked_in_at > late_threshold_utc
-        ).all()
-        late_checkin_list = [
-            (
-                emp.name,
-                emp.email,
-                (
-                    (checkin_time if checkin_time.tzinfo else checkin_time.replace(tzinfo=timezone.utc))
-                    .astimezone(IST)
-                    .strftime("%I:%M %p")
-                    if checkin_time
-                    else "—"
-                ),
-            )
-            for emp, checkin_time in late_checkins
-        ]
-
-        if late_checkin_list or pending_list:
+        if stats_payload["late_list"] or stats_payload["pending_list"]:
             try_send_admin_late_list(
                 channel_id=LATE_CHECKIN_CHANNEL_ID,
-                late_checkins=late_checkin_list,
-                pending_checkins=pending_list
+                stats_payload=stats_payload
             )
-            logger.info("[scheduler] Sent admin report (Late: %s, Pending: %s)", len(late_checkin_list), len(pending_list))
+            logger.info("[scheduler] Sent admin report (Late: %s, Pending: %s)", len(stats_payload["late_list"]), len(stats_payload["pending_list"]))
         else:
             logger.info("[scheduler] No late or pending check-ins today! Admin report skipped.")
 
     except Exception as exc:
         logger.error("[scheduler] Admin report job failed: %s", exc)
+    finally:
+        db.close()
+
+
+def _scheduled_evening_report() -> None:
+    """Compile and send the final end-of-day check-in summary."""
+    db = SessionLocal()
+    try:
+        from app.utils.business_time import today_ist
+        from app.constants.leave_types import is_fixed_holiday, is_weekend
+        from app.services.slack_service import try_send_admin_late_list
+        from app.services.stats_engine import _generate_admin_report_payload
+
+        today = today_ist()
+
+        if is_weekend(today) or is_fixed_holiday(today):
+            logger.info("[scheduler] Skipping evening report because today is a weekend or holiday.")
+            return
+
+        # Use the same Stats Engine
+        stats_payload = _generate_admin_report_payload(db, target_date=today)
+
+        try_send_admin_late_list(
+            channel_id=LATE_CHECKIN_CHANNEL_ID,
+            stats_payload=stats_payload
+        )
+        logger.info("[scheduler] Sent evening check-in summary report.")
+
+    except Exception as exc:
+        logger.error("[scheduler] Evening report job failed: %s", exc)
+    finally:
+        db.close()
+
+
+def _check_internship_endings() -> None:
+    """Daily job: fire 30d, 7d and 0d alerts for interns whose internship_end_date
+    is approaching or has arrived today.
+
+    For each match:
+      - Creates an in-app Notification for every HR / admin user.
+      - Sends an email alert to the intern themselves.
+    Failures per-employee are logged and swallowed so one bad record never
+    blocks the rest.
+    """
+    from datetime import date
+    from app.models.employee import Employee
+    from app.models.user import User
+    from app.models.notification import Notification
+    from app.constants.leave_types import is_intern_or_contractor
+    from app.services.email_service import try_send_internship_ending_alert
+
+    ALERT_DAYS = [0, 7, 30]
+
+    db = SessionLocal()
+    try:
+        today = date.today()
+
+        # Fetch all HR/admin user IDs for in-app notifications
+        hr_admin_user_ids = [
+            uid
+            for (uid,) in db.query(User.id).filter(
+                User.role.in_(["hr", "admin"]),
+                User.is_active == True,
+            ).all()
+        ]
+
+        total_alerts = 0
+        for days in ALERT_DAYS:
+            from datetime import timedelta
+            target_date = today + timedelta(days=days)
+
+            interns = (
+                db.query(Employee)
+                .filter(
+                    Employee.status == "active",
+                    Employee.internship_end_date == target_date,
+                )
+                .all()
+            )
+
+            for emp in interns:
+                end_str = emp.internship_end_date.strftime("%d %B %Y")
+                try:
+                    # ── In-app notifications for HR/admins ──────────────────
+                    if days == 0:
+                        title = f"{emp.name}'s internship ends today"
+                        msg = (
+                            f"{emp.name} ({emp.designation or 'Intern'})'s internship ends "
+                            f"today ({end_str}). Please take the necessary action."
+                        )
+                        notif_type = "internship_ending_today"
+                    else:
+                        title = f"{emp.name}'s internship ends in {days} day{'s' if days != 1 else ''}"
+                        msg = (
+                            f"{emp.name} ({emp.designation or 'Intern'})'s internship is "
+                            f"ending on {end_str} ({days} day{'s' if days != 1 else ''} away)."
+                        )
+                        notif_type = f"internship_ending_{days}d"
+
+                    for uid in hr_admin_user_ids:
+                        db.add(Notification(
+                            user_id=uid,
+                            title=title,
+                            message=msg,
+                            type=notif_type,
+                        ))
+
+                    # ── Email alert to the intern ───────────────────────────
+                    linked_user = (
+                        db.query(User)
+                        .filter(User.employee_id == emp.id, User.is_active == True)
+                        .first()
+                    )
+                    if linked_user:
+                        try_send_internship_ending_alert(
+                            to_email=emp.email,
+                            to_name=emp.name,
+                            days_remaining=days,
+                            internship_end_date=end_str,
+                        )
+
+                    total_alerts += 1
+                except Exception as exc:
+                    logger.error(
+                        "[scheduler] Internship alert failed for employee %s: %s",
+                        emp.id, exc,
+                    )
+
+        if total_alerts:
+            db.commit()
+        logger.info(
+            "[scheduler] Internship endings check: fired %d alert(s) for dates %s",
+            total_alerts,
+            [str(today + __import__('datetime').timedelta(days=d)) for d in ALERT_DAYS],
+        )
+    except Exception as exc:
+        logger.error("[scheduler] Internship endings check failed: %s", exc)
     finally:
         db.close()
 
@@ -675,7 +777,20 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
-    # Employee check-in reminder – weekdays at CHECKIN_REMINDER_HOUR:MINUTE.
+    # Early morning employee check-in reminder – weekdays at EARLY_CHECKIN_REMINDER_HOUR:MINUTE (default 8:45 AM).
+    _scheduler.add_job(
+        _scheduled_checkin_reminders,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=EARLY_CHECKIN_REMINDER_HOUR,
+        minute=EARLY_CHECKIN_REMINDER_MINUTE,
+        id="early_checkin_reminder",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Employee check-in reminder – weekdays at CHECKIN_REMINDER_HOUR:MINUTE (default 10:00 AM).
     _scheduler.add_job(
         _scheduled_checkin_reminders,
         trigger="cron",
@@ -721,6 +836,18 @@ def start_scheduler() -> None:
         hour=ADMIN_REPORT_HOUR,
         minute=ADMIN_REPORT_MINUTE,
         id="late_admin_report",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    _scheduler.add_job(
+        _scheduled_evening_report,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=EVENING_REPORT_HOUR,
+        minute=EVENING_REPORT_MINUTE,
+        id="evening_admin_report",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
@@ -780,6 +907,31 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
+    # Internship lifecycle alerts — 30d, 7d, and 0d warnings (daily at 9:00 AM IST)
+    _scheduler.add_job(
+        _check_internship_endings,
+        trigger="cron",
+        hour=INTERNSHIP_ALERT_HOUR,
+        minute=INTERNSHIP_ALERT_MINUTE,
+        id="internship_endings_check",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Monthly work model auto-adjustment — 1st of every month at 00:15 AM IST
+    _scheduler.add_job(
+        _scheduled_monthly_work_model_sync,
+        trigger="cron",
+        day=1,
+        hour=MONTHLY_WORK_MODEL_HOUR,
+        minute=MONTHLY_WORK_MODEL_MINUTE,
+        id="monthly_work_model_sync",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     logger.info(
         "[scheduler] Started — Encord sync every %s min; hiring sync %s",
         ENCORD_SYNC_MINUTE,
@@ -813,6 +965,16 @@ def _scheduled_lunch_report() -> None:
             logger.error("[scheduler] Lunch report email failed for one or more recipients")
     except Exception as exc:
         logger.exception("[scheduler] Lunch report job crashed: %s", exc)
+
+def _scheduled_monthly_work_model_sync() -> None:
+    """Evaluate previous month's check-in records and auto-adjust work models (WFO <-> WFH)."""
+    db = SessionLocal()
+    try:
+        from app.services.work_model_service import sync_monthly_work_models
+        res = sync_monthly_work_models(db)
+        logger.info("[scheduler] Monthly work model sync complete: %s", res)
+    except Exception as exc:
+        logger.exception("[scheduler] Monthly work model sync failed: %s", exc)
     finally:
         db.close()
 

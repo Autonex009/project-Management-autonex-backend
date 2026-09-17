@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="doc-title">Certificate of Internship Completion</div>
+
+<p style="text-align:center; margin-bottom:28px;">
+  <span class="badge">This is to certify that</span>
+</p>
+
+<p style="text-align:center; font-size:18pt; font-weight:900; color:#1a1a2e; margin-bottom:6px;">
+  {{ employee_name }}
+</p>
+<p style="text-align:center; color:#555; margin-bottom:28px;">
+  {{ employee_email }}
+</p>
+
+<p style="text-align:center; font-size:11pt; line-height:1.9;">
+  has successfully completed an internship at <span class="highlight">{{ company_name }}</span>
+  in the role of <span class="highlight">{{ designation }}</span>
+  from <span class="highlight">{{ start_date }}</span> to <span class="highlight">{{ end_date }}</span>.
+</p>
+
+<p style="text-align:center; margin-top:20px; font-size:11pt; line-height:1.9; color:#374151;">
+  During this period, {{ employee_name }} demonstrated dedication, professionalism, and strong
+  technical abilities. We wish them continued success in their future endeavours.
+</p>
+
+<div class="signature-block" style="margin-top:64px;">
+  <div class="sig-col">
+    <div class="sig-line"></div>
+    <div class="sig-name">{{ hr_signatory }}</div>
+    <div class="sig-title">Human Resources</div>
+    <div class="sig-title">{{ company_name }}</div>
+  </div>
+  <div class="sig-col" style="text-align:right;">
+    <div class="sig-line" style="margin-left:auto;"></div>
+    <div class="sig-name">Authorized Signatory</div>
+    <div class="sig-title">{{ company_name }}</div>
+  </div>
+</div>
+{% endblock %}

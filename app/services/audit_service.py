@@ -193,3 +193,55 @@ def record(
             "Failed to record audit entry action=%s entity=%s:%s",
             action, entity_type, entity_id,
         )
+
+
+def log(
+    db: Session,
+    *,
+    actor_id: Optional[int],
+    action: str,
+    target_type: str,
+    target_id: Optional[int] = None,
+    metadata: Optional[dict] = None,
+) -> None:
+    """Lightweight audit shim for document operations.
+
+    Accepts a bare ``actor_id`` (instead of a full User object) and a free-form
+    ``metadata`` dict. Used by the employee-documents API so it does not have to
+    re-fetch the User row just to call :func:`record`.
+
+    All errors are swallowed — see the same rule in :func:`record`.
+    """
+    try:
+        # Resolve actor name/email for display without a mandatory DB hit.
+        actor_name: Optional[str] = None
+        actor_email: Optional[str] = None
+        if actor_id is not None:
+            actor_row = db.query(User).filter(User.id == actor_id).first()
+            if actor_row:
+                actor_name = actor_row.name
+                actor_email = actor_row.email
+
+        summary_parts = [action.replace("_", " ").capitalize()]
+        if metadata:
+            if "doc_type" in metadata:
+                summary_parts.append(str(metadata["doc_type"]).replace("_", " "))
+            if "employee_id" in metadata:
+                summary_parts.append(f"employee #{metadata['employee_id']}")
+
+        entry = AuditLog(
+            actor_id=actor_id,
+            actor_name=actor_name,
+            actor_email=actor_email,
+            action=action,
+            action_type="Updated",
+            category="Documents",
+            entity_type=target_type,
+            entity_id=target_id,
+            details=[{"field": k, "value": str(v)} for k, v in (metadata or {}).items()],
+            summary=" · ".join(summary_parts),
+        )
+        db.add(entry)
+        db.commit()
+    except Exception:
+        logger.exception("Failed to record document audit entry action=%s", action)
