@@ -38,6 +38,11 @@ from app.models import (
     encord_activity,
     vendor,
     audit_log,
+    daily_checkin,
+    email_otp,
+    employee_badge,
+    employee_note,
+    onboarding_pipeline,
 )
 
 

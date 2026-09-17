@@ -29,6 +29,7 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     must_change_password = Column(Boolean, default=False, nullable=False)
     employment_type = Column(String(50), nullable=True)
+    work_description = Column(Text, nullable=True)
     password_reset_token_hash = Column(String(64), nullable=True)
     password_reset_expires_at = Column(TIMESTAMP, nullable=True)
     

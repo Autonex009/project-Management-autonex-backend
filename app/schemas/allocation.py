@@ -64,6 +64,11 @@ class AllocationResponse(AllocationBase):
     employee_name: Optional[str] = None
     project_name: Optional[str] = None
     
+    # History and Status fields
+    is_active: bool = True
+    deactivated_at: Optional[datetime] = None
+    deactivated_reason: Optional[str] = None
+    
     class Config:
         from_attributes = True
 
@@ -120,6 +125,10 @@ class ProjectAllocationRow(BaseModel):
     wfo_count: int = 0
     wfh_count: int = 0
     on_leave_count: int = 0
+    daily_presence_total: int = 0
+    daily_presence_wfo: int = 0
+    daily_presence_wfh: int = 0
+    temp_roster: List[dict] = []
     allocated_preview: List[AllocatedEmployeePreview] = []
     total_allocated_count: int = 0
 

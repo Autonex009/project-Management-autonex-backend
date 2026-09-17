@@ -27,3 +27,5 @@ reportlab>=4.0.0
 docxtpl>=0.20.0   # Word template rendering (.docx → filled .docx)
 xhtml2pdf>=0.2.11  # HTML → PDF fallback (used when LibreOffice is not available)
 num2words==0.5.14
+
+tenacity==8.3.0
