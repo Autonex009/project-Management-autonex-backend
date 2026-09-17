@@ -6,10 +6,14 @@ Access is always through time-limited signed URLs — never via public links.
 Folder convention: /{employee_id}/{doc_type}/{version}.pdf
 """
 import json
+import logging
 import os
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
@@ -82,17 +86,22 @@ def upload_document(
         return stored_path
 
     url = f"{SUPABASE_URL}/storage/v1/object/{DOCS_BUCKET}/{stored_path}"
-    headers = _auth_headers(content_type)
+    # Use x-upsert so the request works for both new and existing files.
+    headers = {**_auth_headers(content_type), "x-upsert": "true"}
+
+    logger.info("[upload_document] Uploading to: %s", url)
 
     def _put() -> None:
         req = urllib.request.Request(url, data=file_bytes, headers=headers, method="POST")
-        with urllib.request.urlopen(req):
-            pass
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            logger.info("[upload_document] Supabase response %s: %s", resp.status, body)
 
     try:
         _put()
     except urllib.error.HTTPError as err:
         body = err.read().decode("utf-8", errors="ignore")
+        logger.error("[upload_document] Supabase HTTP %s: %s", err.code, body)
         if err.code in (404, 400) or "not found" in body.lower() or "bucket" in body.lower():
             _ensure_private_bucket_exists()
             try:
@@ -106,6 +115,9 @@ def upload_document(
             raise RuntimeError(
                 f"Document upload to '{DOCS_BUCKET}' failed ({err.code}): {body}"
             ) from err
+    except Exception as exc:
+        logger.error("[upload_document] Unexpected error: %s", exc)
+        raise RuntimeError(f"Document upload to '{DOCS_BUCKET}' failed: {exc}") from exc
 
     return stored_path
 
@@ -120,9 +132,7 @@ def get_signed_url(stored_path: str, expires_in: int = SIGNED_URL_EXPIRY_SECONDS
 
     # TEMPORARY: Local storage fallback
     if not is_supabase_configured():
-        import urllib.parse
         encoded_path = urllib.parse.quote(stored_path)
-        # Note: Assuming backend is running on localhost:8000. For production without Supabase, adjust hostname.
         return f"http://localhost:8000/api/employees/documents/local/{encoded_path}"
 
     url = f"{SUPABASE_URL}/storage/v1/object/sign/{DOCS_BUCKET}/{stored_path}"
@@ -135,9 +145,15 @@ def get_signed_url(stored_path: str, expires_in: int = SIGNED_URL_EXPIRY_SECONDS
             data = json.loads(resp.read())
             signed = data.get("signedURL") or data.get("signedUrl") or ""
             if signed.startswith("/"):
-                signed = f"{SUPABASE_URL}{signed}"
+                # Supabase returns signedURL as "/object/sign/..." (no /storage/v1 prefix)
+                signed = f"{SUPABASE_URL}/storage/v1{signed}"
             return signed or None
-    except Exception:
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        logger.error("[get_signed_url] Supabase HTTP %s for path '%s': %s", e.code, stored_path, body)
+        return None
+    except Exception as e:
+        logger.error("[get_signed_url] Unexpected error for path '%s': %s", stored_path, e)
         return None
 
 
@@ -158,9 +174,16 @@ def delete_document(stored_path: str) -> bool:
         return True
 
     url = f"{SUPABASE_URL}/storage/v1/object/{DOCS_BUCKET}/{stored_path}"
+    logger.info("[delete_document] Sending DELETE to: %s", url)
     req = urllib.request.Request(url, headers=_auth_headers(), method="DELETE")
     try:
         with urllib.request.urlopen(req):
+            logger.info("[delete_document] Deleted '%s' from Supabase", stored_path)
             return True
-    except Exception:
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        logger.error("[delete_document] Supabase HTTP %s for path '%s': %s", e.code, stored_path, body)
+        return False
+    except Exception as e:
+        logger.error("[delete_document] Unexpected error for path '%s': %s", stored_path, e)
         return False
