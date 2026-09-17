@@ -31,7 +31,8 @@ from app.schemas.allocation import (
 )
 from app.services.allocation_validator import (
     check_leave_conflict,
-    get_all_employees_allocation_status
+    get_all_employees_allocation_status,
+    validate_time_distribution,
 )
 from app.services.slack_service import (
     notify_employee_allocation_created,

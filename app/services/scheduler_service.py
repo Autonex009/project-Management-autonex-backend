@@ -492,6 +492,7 @@ def _scheduled_late_warning() -> None:
         from app.services.slack_service import (
             try_get_or_cache_employee_slack_user_id,
             try_send_late_warning_message,
+            record_today_slack_reminder,
         )
         from sqlalchemy import not_
         import time
