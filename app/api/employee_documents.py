@@ -317,6 +317,34 @@ def delete_employee_document(
 
     return {"detail": "Document deactivated", "doc_id": doc_id}
 
+@router.get("/test-delete-debug")
+def test_delete_debug(path: str):
+    """Temporary endpoint to test Supabase deletion and see the exact response on screen."""
+    import urllib.request
+    import json
+    import os
+    
+    SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+    SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
+    DOCS_BUCKET = "employee-documents"
+    
+    url = f"{SUPABASE_URL}/storage/v1/object/remove/{DOCS_BUCKET}"
+    payload = json.dumps({"prefixes": [path]}).encode("utf-8")
+    
+    req = urllib.request.Request(url, data=payload, headers={
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "apiKey": SUPABASE_KEY,
+        "Content-Type": "application/json"
+    }, method="POST")
+    
+    try:
+        with urllib.request.urlopen(req) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            return {"status": resp.status, "body": body, "key_used": SUPABASE_KEY[:10] + "..." if SUPABASE_KEY else "NONE"}
+    except urllib.error.HTTPError as e:
+        return {"status": e.code, "error_body": e.read().decode("utf-8", errors="ignore")}
+    except Exception as e:
+        return {"error": str(e)}
 
 # ── GET /api/employees/{id}/documents/summary ─────────────────────────────────
 
