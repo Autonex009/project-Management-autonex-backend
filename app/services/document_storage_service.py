@@ -173,11 +173,10 @@ def delete_document(stored_path: str) -> bool:
                 return False
         return True
 
-    # Use POST to the remove endpoint (matches JS SDK implementation)
-    url = f"{SUPABASE_URL}/storage/v1/object/remove/{DOCS_BUCKET}"
+    url = f"{SUPABASE_URL}/storage/v1/object/{DOCS_BUCKET}"
     payload = json.dumps({"prefixes": [stored_path]}).encode("utf-8")
-    logger.warning("[delete_document] Sending POST to: %s with prefixes: ['%s']", url, stored_path)
-    req = urllib.request.Request(url, data=payload, headers=_auth_headers("application/json"), method="POST")
+    logger.warning("[delete_document] Sending DELETE to: %s with prefixes: ['%s']", url, stored_path)
+    req = urllib.request.Request(url, data=payload, headers=_auth_headers("application/json"), method="DELETE")
     try:
         with urllib.request.urlopen(req) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
