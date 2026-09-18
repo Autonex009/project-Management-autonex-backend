@@ -1796,7 +1796,9 @@ def try_send_password_reset_message(employee_email: str, reset_link: str) -> boo
 
 
 def _checkin_frontend_url() -> str:
-    base = (os.getenv("FRONTEND_URL") or "http://localhost:5173").strip().rstrip("/")
+    base = (os.getenv("PORTAL_URL") or "https://portal.autonexai360.com").strip().rstrip("/")
+    if base.endswith("/employee/dashboard"):
+        return base
     return f"{base}/employee/dashboard"
 
 
