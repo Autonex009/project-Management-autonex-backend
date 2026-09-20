@@ -142,6 +142,20 @@ def initialize_knowledge_base():
         _initialized = True
         return
 
+    # Semantic search is optional. With no key configured the service still works
+    # in keyword-only mode, so that is a supported configuration rather than a
+    # failure and must not be reported as one — an ERROR here reads like the chat
+    # feature is broken when it is merely running in its reduced mode.
+    if not os.getenv("EMBEDDING_API_KEY"):
+        _chunks = all_chunks
+        _initialized = True
+        logger.warning(
+            "EMBEDDING_API_KEY not set — policy search is running in keyword-only "
+            "mode with %d chunks. Set EMBEDDING_API_KEY to enable semantic search.",
+            len(_chunks),
+        )
+        return
+
     # Generate embeddings
     try:
         client = _get_client()
@@ -168,11 +182,14 @@ def initialize_knowledge_base():
         logger.info("Knowledge base initialized: %d chunks with embeddings", len(_chunks))
 
     except Exception as e:
-        logger.error("Failed to generate embeddings: %s", e)
-        # Fall back to keyword-only search
+        # A key *is* configured, so this is a real failure (auth rejected, quota,
+        # network) and stays at ERROR — but say what the consequence is.
+        logger.error(
+            "Embedding generation failed (%s) — policy search falling back to "
+            "keyword-only mode with %d chunks", e, len(all_chunks),
+        )
         _chunks = all_chunks
         _initialized = True
-        logger.info("Knowledge base initialized (keyword-only mode): %d chunks", len(_chunks))
 
 
 def search_policy(query: str, top_k: int = TOP_K) -> list[dict]:
