@@ -75,13 +75,20 @@ def _build_engine():
         )
 
     # ── Railway (long-running server) ───────────────────────────────────
+    # Sizes are env-tunable so capacity can be matched to the actual Postgres
+    # connection budget without shipping code. Budget check before raising them:
+    #   replicas x (DB_POOL_SIZE + DB_MAX_OVERFLOW)  +  headroom for migrations
+    # must stay under the server limit. Note that a Supabase pooler URL on port
+    # 5432 is Supavisor *session* mode, which pins one backend per client
+    # connection and does not multiplex; port 6543 is transaction mode.
+    # Defaults below are the current production values — unset env == no change.
     return create_engine(
         DATABASE_URL,
         pool_pre_ping=True,
-        pool_size=3,
-        max_overflow=5,
-        pool_recycle=300,
-        pool_timeout=15,
+        pool_size=int(os.getenv("DB_POOL_SIZE", "3")),
+        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "5")),
+        pool_recycle=int(os.getenv("DB_POOL_RECYCLE", "300")),
+        pool_timeout=int(os.getenv("DB_POOL_TIMEOUT", "15")),
         connect_args=connect_args,
     )
 

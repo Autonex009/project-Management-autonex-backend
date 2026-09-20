@@ -25,6 +25,13 @@ def is_supabase_configured() -> bool:
     return bool(SUPABASE_URL and SUPABASE_KEY)
 
 
+# Outbound storage calls run inside request handlers that are holding a pooled
+# database connection. Without an explicit timeout urllib blocks on the global
+# socket default (None = forever), so one unresponsive Supabase endpoint pins a
+# connection until the worker dies — which is how the pool gets exhausted.
+STORAGE_TIMEOUT_SECONDS = int(os.getenv("STORAGE_TIMEOUT_SECONDS", "15"))
+STORAGE_UPLOAD_TIMEOUT_SECONDS = int(os.getenv("STORAGE_UPLOAD_TIMEOUT_SECONDS", "30"))
+
 AVATAR_BUCKET = "avatars"
 
 
@@ -61,7 +68,7 @@ def upload_to_bucket(
 
     def _put() -> None:
         req = urllib.request.Request(url, data=file_bytes, headers=headers, method="POST")
-        with urllib.request.urlopen(req):
+        with urllib.request.urlopen(req, timeout=STORAGE_UPLOAD_TIMEOUT_SECONDS):
             pass
 
     try:
@@ -111,7 +118,7 @@ def delete_from_bucket(bucket: str, file_url: str) -> bool:
         method="DELETE",
     )
     try:
-        with urllib.request.urlopen(req):
+        with urllib.request.urlopen(req, timeout=STORAGE_TIMEOUT_SECONDS):
             return True
     except Exception:
         return False
@@ -130,7 +137,7 @@ def _ensure_bucket_exists(bucket: str = "guidelines") -> None:
     payload = json.dumps({"id": bucket, "name": bucket, "public": True}).encode("utf-8")
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(req):
+        with urllib.request.urlopen(req, timeout=STORAGE_TIMEOUT_SECONDS):
             pass
     except Exception:
         # Ignore if bucket already exists or error occurs
@@ -163,7 +170,7 @@ def upload_guideline_file(
 
     def _put() -> None:
         req = urllib.request.Request(url, data=file_bytes, headers=headers, method="POST")
-        with urllib.request.urlopen(req):
+        with urllib.request.urlopen(req, timeout=STORAGE_UPLOAD_TIMEOUT_SECONDS):
             pass
 
     try:
@@ -206,7 +213,7 @@ def delete_guideline_file(file_url: str, upload_dir: Optional[Path] = None) -> b
         }
         req = urllib.request.Request(url, headers=headers, method="DELETE")
         try:
-            with urllib.request.urlopen(req):
+            with urllib.request.urlopen(req, timeout=STORAGE_TIMEOUT_SECONDS):
                 return True
         except Exception:
             return False

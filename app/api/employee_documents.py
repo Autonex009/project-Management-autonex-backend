@@ -4,6 +4,7 @@ Endpoints for listing, uploading (manual), generating (template-based),
 downloading, and deleting employee documents.
 """
 import io
+import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -31,6 +32,8 @@ from app.services.document_storage_service import (
     is_supabase_configured,
 )
 from app.services.document_service import generate_document
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(
     prefix="/api/employees",
@@ -293,18 +296,22 @@ def delete_employee_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    # Delete from Supabase storage (best-effort — log but don't block if it fails)
-    if doc.file_url:
-        deleted = delete_document(doc.file_url)
-        if not deleted:
-            import logging
-            logging.getLogger(__name__).warning(
-                "[delete_employee_document] Failed to delete '%s' from Supabase storage",
-                doc.file_url,
-            )
+    stored_path = doc.file_url
 
     doc.is_active = False
     db.commit()
+
+    # Storage deletion is best-effort and deliberately runs *after* the commit:
+    # if it ran first and the commit then failed, the row would stay active while
+    # the underlying file was already gone. The call is bounded by
+    # STORAGE_TIMEOUT_SECONDS so a slow bucket cannot hold this request — and its
+    # pooled DB connection — open indefinitely.
+    if stored_path:
+        if not delete_document(stored_path):
+            logger.warning(
+                "[delete_employee_document] Failed to delete '%s' from Supabase storage",
+                stored_path,
+            )
 
     audit_service.log(
         db=db,
