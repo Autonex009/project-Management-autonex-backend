@@ -1,9 +1,15 @@
 """
 Knowledge service for policy document retrieval (RAG pipeline).
 
-Uses Gemini text-embedding-004 for embedding generation and cosine similarity
-for retrieval. At the current document scale (~5 policy files), in-memory search
-is more than sufficient — no external vector DB required.
+Embeds policy documents and retrieves them by cosine similarity. At the current
+document scale (~5 policy files), in-memory search is more than sufficient — no
+external vector DB required.
+
+The embedding provider is configured, not hard-coded: any OpenAI-compatible
+/embeddings endpoint works via EMBEDDING_BASE_URL + EMBEDDING_MODEL. Note that
+the previous default pointed at DeepSeek, which does not serve an embeddings API
+at all, so semantic search could never come up regardless of the key supplied.
+Without a working provider the service degrades to keyword-only search.
 """
 import os
 import logging
@@ -18,7 +24,11 @@ logger = logging.getLogger(__name__)
 
 # ── Configuration ────────────────────────────────────────────────────
 KNOWLEDGE_DIR = Path(__file__).resolve().parent.parent / "knowledge"
-EMBEDDING_MODEL = "deepseek-embedding"  # Or use another model if deepseek releases one or it is different
+# Any OpenAI-compatible embeddings endpoint. Examples:
+#   OpenAI  — base https://api.openai.com/v1                              model text-embedding-3-small
+#   Gemini  — base https://generativelanguage.googleapis.com/v1beta/openai model text-embedding-004
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", "https://api.openai.com/v1")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 CHUNK_SIZE = 500  # characters per chunk
 CHUNK_OVERLAP = 100
 TOP_K = 5
@@ -37,7 +47,7 @@ def _get_client() -> openai.Client:
     api_key = os.getenv("EMBEDDING_API_KEY")
     if not api_key:
         raise RuntimeError("EMBEDDING_API_KEY not set in environment")
-    return openai.Client(api_key=api_key, base_url="https://api.deepseek.com")
+    return openai.Client(api_key=api_key, base_url=EMBEDDING_BASE_URL)
 
 
 def _split_into_chunks(text: str, source: str) -> list[dict]:
@@ -142,6 +152,22 @@ def initialize_knowledge_base():
         _initialized = True
         return
 
+    # Semantic search is optional. With no key configured the service still works
+    # in keyword-only mode, so that is a supported configuration rather than a
+    # failure and must not be reported as one — an ERROR here reads like the chat
+    # feature is broken when it is merely running in its reduced mode.
+    if not os.getenv("EMBEDDING_API_KEY"):
+        _chunks = all_chunks
+        _initialized = True
+        # INFO, not WARNING: running without embeddings is a supported way to
+        # deploy this app, not something the operator needs to act on.
+        logger.info(
+            "EMBEDDING_API_KEY not set — policy search using keyword-only mode "
+            "with %d chunks. Set EMBEDDING_API_KEY to enable semantic search.",
+            len(_chunks),
+        )
+        return
+
     # Generate embeddings
     try:
         client = _get_client()
@@ -168,11 +194,15 @@ def initialize_knowledge_base():
         logger.info("Knowledge base initialized: %d chunks with embeddings", len(_chunks))
 
     except Exception as e:
-        logger.error("Failed to generate embeddings: %s", e)
-        # Fall back to keyword-only search
+        # A key *is* configured, so this is a real failure (auth rejected, quota,
+        # network) and stays at ERROR — but say what the consequence is.
+        logger.error(
+            "Embedding generation failed for model %s at %s (%s) — policy search "
+            "falling back to keyword-only mode with %d chunks",
+            EMBEDDING_MODEL, EMBEDDING_BASE_URL, e, len(all_chunks),
+        )
         _chunks = all_chunks
         _initialized = True
-        logger.info("Knowledge base initialized (keyword-only mode): %d chunks", len(_chunks))
 
 
 def search_policy(query: str, top_k: int = TOP_K) -> list[dict]:
