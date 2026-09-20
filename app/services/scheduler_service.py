@@ -265,30 +265,32 @@ def _scheduled_encord_sync() -> None:
         db.close()
 
 
-def _scheduled_checkin_reminders() -> None:
-    """Nudge every active employee who hasn't checked in yet today."""
+def _collect_pending_checkin_targets() -> "list[dict] | None":
+    """Who still needs a check-in nudge today — resolved with a short-lived session.
+
+    Returns ``None`` when today is a weekend or fixed holiday (caller logs its own
+    skip message), otherwise a list of plain dicts.
+
+    The DB connection is released before the caller starts talking to Slack. The
+    send loop sleeps ~1.5s per employee (and up to the full retry-after on a 429),
+    so holding a pooled connection across it pinned one of the pool's few slots for
+    minutes at a time and starved request handlers — the cause of the
+    ``QueuePool limit of size 3 overflow 5 reached`` timeouts.
+    """
+    from app.utils.business_time import today_ist
+    from app.constants.leave_types import is_fixed_holiday, is_weekend
+    from app.models.employee import Employee
+    from app.models.leave import Leave
+    from app.models.daily_checkin import DailyCheckIn
+    from app.services.slack_service import try_get_or_cache_employee_slack_user_id
+    from sqlalchemy import not_
+
+    today = today_ist()
+    if is_weekend(today) or is_fixed_holiday(today):
+        return None
+
     db = SessionLocal()
     try:
-        from app.utils.business_time import today_ist
-        from app.constants.leave_types import is_fixed_holiday, is_weekend
-        from app.models.employee import Employee
-        from app.models.leave import Leave
-        from app.models.daily_checkin import DailyCheckIn
-        from app.services.slack_service import (
-            SlackRateLimitError,
-            try_get_or_cache_employee_slack_user_id,
-            try_send_checkin_reminder_message,
-            record_today_slack_reminder,
-        )
-        from sqlalchemy import not_
-        import time
-
-        today = today_ist()
-
-        if is_weekend(today) or is_fixed_holiday(today):
-            logger.info("[scheduler] Skipping check-in reminders because today is a weekend or holiday.")
-            return
-
         checked_in_query = db.query(DailyCheckIn.employee_id).filter(
             DailyCheckIn.checkin_date == today
         )
@@ -304,31 +306,60 @@ def _scheduled_checkin_reminders() -> None:
             not_(Employee.id.in_(on_leave_query))
         ).all()
 
-        sent = 0
+        targets = []
         for employee in employees:
+            # Returns the cached employee.slack_user_id without any network call in
+            # the steady state; only an employee whose id has never been resolved
+            # costs a Slack lookup here.
             slack_id = try_get_or_cache_employee_slack_user_id(db, employee)
             if not slack_id:
                 continue
-            
+            targets.append({
+                "id": employee.id,
+                "name": employee.name,
+                "email": employee.email,
+                "slack_id": slack_id,
+            })
+        return targets
+    finally:
+        db.close()
+
+
+def _scheduled_checkin_reminders() -> None:
+    """Nudge every active employee who hasn't checked in yet today."""
+    from app.services.slack_service import (
+        SlackRateLimitError,
+        try_send_checkin_reminder_message,
+        record_today_slack_reminder,
+    )
+    import time
+
+    try:
+        targets = _collect_pending_checkin_targets()
+        if targets is None:
+            logger.info("[scheduler] Skipping check-in reminders because today is a weekend or holiday.")
+            return
+
+        # No DB session is held below — every call here is Slack I/O or a sleep.
+        sent = 0
+        for target in targets:
             try:
                 ts, channel_id = try_send_checkin_reminder_message(
-                    employee_slack_user_id=slack_id, employee_name=employee.name
+                    employee_slack_user_id=target["slack_id"], employee_name=target["name"]
                 )
                 if ts and channel_id:
                     sent += 1
-                    record_today_slack_reminder(employee.id, channel_id, ts)
+                    record_today_slack_reminder(target["id"], channel_id, ts)
                     time.sleep(1.5)  # Base sleep to avoid rate limits
             except SlackRateLimitError as exc:
-                logger.warning("[scheduler] Rate limit hit sending reminder to %s, sleeping %s seconds...", employee.email, exc.retry_after_seconds)
+                logger.warning("[scheduler] Rate limit hit sending reminder to %s, sleeping %s seconds...", target["email"], exc.retry_after_seconds)
                 time.sleep(exc.retry_after_seconds)
             except Exception as exc:
-                logger.error("[scheduler] Failed sending checkin reminder to %s: %s", employee.email, exc)
+                logger.error("[scheduler] Failed sending checkin reminder to %s: %s", target["email"], exc)
 
         logger.info("[scheduler] Check-in reminders sent to %s employee(s)", sent)
     except Exception as exc:
         logger.error("[scheduler] Check-in reminder job failed: %s", exc)
-    finally:
-        db.close()
 
 
 def _refresh_materialized_view() -> None:
@@ -482,67 +513,38 @@ def _scheduled_pm_confirm_reminders() -> None:
 
 def _scheduled_late_warning() -> None:
     """Nudge active employees who still haven't checked in by the late warning time."""
-    db = SessionLocal()
+    from app.services.slack_service import (
+        try_send_late_warning_message,
+        record_today_slack_reminder,
+    )
+    import time
+
     try:
-        from app.utils.business_time import today_ist
-        from app.constants.leave_types import is_fixed_holiday, is_weekend
-        from app.models.employee import Employee
-        from app.models.leave import Leave
-        from app.models.daily_checkin import DailyCheckIn
-        from app.services.slack_service import (
-            try_get_or_cache_employee_slack_user_id,
-            try_send_late_warning_message,
-            record_today_slack_reminder,
-        )
-        from sqlalchemy import not_
-        import time
-
-        today = today_ist()
-
-        if is_weekend(today) or is_fixed_holiday(today):
+        targets = _collect_pending_checkin_targets()
+        if targets is None:
             logger.info("[scheduler] Skipping late warning because today is a weekend or holiday.")
             return
 
-        checked_in_query = db.query(DailyCheckIn.employee_id).filter(
-            DailyCheckIn.checkin_date == today
-        )
-        on_leave_query = db.query(Leave.employee_id).filter(
-            Leave.status == "approved",
-            Leave.start_date <= today,
-            Leave.end_date >= today,
-        )
-
-        employees = db.query(Employee).filter(
-            Employee.status == "active",
-            not_(Employee.id.in_(checked_in_query)),
-            not_(Employee.id.in_(on_leave_query))
-        ).all()
-
+        # No DB session is held below — every call here is Slack I/O or a sleep.
         sent = 0
-        for employee in employees:
-            slack_id = try_get_or_cache_employee_slack_user_id(db, employee)
-            if not slack_id:
-                continue
-            
+        for target in targets:
             try:
                 ts, channel_id = try_send_late_warning_message(
-                    employee_slack_user_id=slack_id, employee_name=employee.name
+                    employee_slack_user_id=target["slack_id"], employee_name=target["name"]
                 )
                 if ts and channel_id:
                     sent += 1
-                    record_today_slack_reminder(employee.id, channel_id, ts)
+                    record_today_slack_reminder(target["id"], channel_id, ts)
                     time.sleep(1.5)
             except Exception as exc:
                 if "429" in str(exc) or "rate" in str(exc).lower():
                     time.sleep(10)
                 else:
-                    logger.error("[scheduler] Failed sending late warning to %s: %s", employee.email, exc)
+                    logger.error("[scheduler] Failed sending late warning to %s: %s", target["email"], exc)
 
         logger.info("[scheduler] Late check-in warnings sent to %s employee(s)", sent)
     except Exception as exc:
         logger.error("[scheduler] Late warning job failed: %s", exc)
-    finally:
-        db.close()
 
 
 def _scheduled_admin_report() -> None:
