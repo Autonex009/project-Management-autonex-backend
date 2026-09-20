@@ -159,9 +159,11 @@ def initialize_knowledge_base():
     if not os.getenv("EMBEDDING_API_KEY"):
         _chunks = all_chunks
         _initialized = True
-        logger.warning(
-            "EMBEDDING_API_KEY not set — policy search is running in keyword-only "
-            "mode with %d chunks. Set EMBEDDING_API_KEY to enable semantic search.",
+        # INFO, not WARNING: running without embeddings is a supported way to
+        # deploy this app, not something the operator needs to act on.
+        logger.info(
+            "EMBEDDING_API_KEY not set — policy search using keyword-only mode "
+            "with %d chunks. Set EMBEDDING_API_KEY to enable semantic search.",
             len(_chunks),
         )
         return
