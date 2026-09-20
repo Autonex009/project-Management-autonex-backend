@@ -5,11 +5,13 @@ from pathlib import Path
 from arq import create_pool
 from arq.connections import RedisSettings
 
-from sqlalchemy import inspect, text
+import anyio.to_thread
 
 from app.db.database import Base, engine
 from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log, employee_badge, onboarding_pipeline, employee_document
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from app.api.projects import router as project_router
@@ -48,15 +50,46 @@ from app.api.checkins import router as checkins_router
 from app.api.onboarding_pipeline import router as onboarding_pipeline_router
 from app.api.employee_documents import router as employee_documents_router
 
-Base.metadata.create_all(bind=engine)
-
 logger = logging.getLogger(__name__)
 
 
-seed_skills()
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # --- SCHEMA + CATALOG BOOTSTRAP ---
+    # These used to run at module import, which meant merely importing this module
+    # opened a DB connection and ran DDL — and seed_skills() additionally DELETEs
+    # any skill outside ALLOWED_SKILLS. Any tooling that imported the app (alembic
+    # env, a REPL, a test collector) silently did both. Running them here means
+    # they happen once, on an actual server start, and a transient DB error is
+    # logged rather than crashing the import. Set SKIP_DB_BOOTSTRAP=true where the
+    # schema is managed solely by migrations.
+    if os.getenv("SKIP_DB_BOOTSTRAP", "false").lower() != "true":
+        try:
+            Base.metadata.create_all(bind=engine)
+        except Exception as e:
+            logger.error("Schema create_all failed at startup: %s", e)
+        try:
+            seed_skills()
+        except Exception as e:
+            logger.error("Skill seeding failed at startup: %s", e)
+
+    # --- REQUEST CONCURRENCY CEILING ---
+    # Almost every endpoint here is a sync `def`, so FastAPI runs it on Starlette's
+    # anyio threadpool — 40 threads by default. Each one needs a pooled DB
+    # connection, but the pool tops out at pool_size + max_overflow (8 on Railway).
+    # The surplus threads therefore queue *inside* the connection pool and fail at
+    # pool_timeout with a 500. Capping threads near pool capacity moves the queue in
+    # front of the handler instead: requests wait, then succeed, rather than
+    # burning a 15s timeout each. Tune with WEB_CONCURRENCY_LIMIT.
+    try:
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        configured = os.getenv("WEB_CONCURRENCY_LIMIT")
+        if configured:
+            limiter.total_tokens = int(configured)
+        logger.info("[startup] request thread limit = %s", limiter.total_tokens)
+    except Exception as e:
+        logger.warning("Could not set request thread limit: %s", e)
+
     # --- ARQ REDIS POOL SETUP ---
     # Only attempt Redis when REDIS_URL is set. On Railway it's injected (background
     # job queue used). On Vercel/serverless (and local dev) it's absent, so we skip
@@ -97,6 +130,40 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Autonex Resource Planning Tool V2", lifespan=lifespan)
+
+
+@app.exception_handler(SQLAlchemyTimeoutError)
+async def _db_pool_timeout_handler(request: Request, exc: SQLAlchemyTimeoutError):
+    """Answer pool-checkout timeouts with 503 instead of an unhandled 500.
+
+    A checkout timeout means the process is saturated, not that the request was
+    invalid. Letting it escape produced a ~60-line traceback per request; under
+    load that tripped Railway's 500 logs/sec limit and dropped the very lines
+    needed to diagnose the incident. 503 + Retry-After also tells the frontend to
+    back off rather than retry immediately and deepen the saturation.
+    """
+    logger.error(
+        "DB pool checkout timed out for %s %s — pool saturated",
+        request.method,
+        request.url.path,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Service temporarily busy. Please retry shortly."},
+        headers={"Retry-After": "5"},
+    )
+
+
+@app.get("/health", include_in_schema=False)
+async def health():
+    """Liveness probe. Deliberately touches no database.
+
+    During the pool-exhaustion incident every DB-backed route returned 500, which
+    made the service look wholly down. An async, DB-free probe answers a narrower
+    question — is the process up and serving? — so saturation can be told apart
+    from a crash. Being async, it also does not consume a request worker thread.
+    """
+    return {"status": "ok"}
 
 
 if os.environ.get("VERCEL"):

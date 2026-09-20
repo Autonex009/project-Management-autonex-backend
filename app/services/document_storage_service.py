@@ -24,6 +24,13 @@ SIGNED_URL_EXPIRY_SECONDS = 3600  # 1 hour
 # TEMPORARY: Local storage fallback directory
 LOCAL_STORAGE_DIR = "local_storage/employee_documents"
 
+# Outbound storage calls run inside request handlers that are holding a pooled
+# database connection. Without an explicit timeout urllib blocks on the global
+# socket default (None = forever), so one unresponsive Supabase endpoint pins a
+# connection until the worker dies — which is how the pool gets exhausted.
+STORAGE_TIMEOUT_SECONDS = int(os.getenv("STORAGE_TIMEOUT_SECONDS", "15"))
+STORAGE_UPLOAD_TIMEOUT_SECONDS = int(os.getenv("STORAGE_UPLOAD_TIMEOUT_SECONDS", "30"))
+
 
 def is_supabase_configured() -> bool:
     return bool(SUPABASE_URL and SUPABASE_KEY)
@@ -53,7 +60,7 @@ def _ensure_private_bucket_exists() -> None:
         url, data=payload, headers=_auth_headers("application/json"), method="POST"
     )
     try:
-        with urllib.request.urlopen(req):
+        with urllib.request.urlopen(req, timeout=STORAGE_TIMEOUT_SECONDS):
             pass
     except Exception:
         # Bucket likely already exists — ignore
@@ -93,7 +100,7 @@ def upload_document(
 
     def _put() -> None:
         req = urllib.request.Request(url, data=file_bytes, headers=headers, method="POST")
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=STORAGE_UPLOAD_TIMEOUT_SECONDS) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
             logger.info("[upload_document] Supabase response %s: %s", resp.status, body)
 
@@ -141,7 +148,7 @@ def get_signed_url(stored_path: str, expires_in: int = SIGNED_URL_EXPIRY_SECONDS
         url, data=payload, headers=_auth_headers("application/json"), method="POST"
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=STORAGE_TIMEOUT_SECONDS) as resp:
             data = json.loads(resp.read())
             signed = data.get("signedURL") or data.get("signedUrl") or ""
             if signed.startswith("/"):
@@ -179,7 +186,7 @@ def delete_document(stored_path: str) -> bool:
     logger.warning("[delete_document] Sending POST to: %s with prefixes: ['%s']", url, stored_path)
     req = urllib.request.Request(url, data=payload, headers=_auth_headers("application/json"), method="POST")
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=STORAGE_TIMEOUT_SECONDS) as resp:
             body = resp.read().decode("utf-8", errors="ignore")
             logger.warning("[delete_document] Supabase response %s: %s", resp.status, body)
             return True
