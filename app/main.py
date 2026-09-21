@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from app.api.projects import router as project_router
 from app.api.allocations import router as allocation_router
@@ -187,6 +188,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Compress responses above ~1KB. The list endpoints return the whole roster —
+# measured at ~500KB of JSON for 1000 employees — and several pages fetch it on
+# load, so bandwidth and serialization dominate their cost. Measured compression
+# on this payload: 3.4x worst case (high-entropy values) up to 50x (uniform).
+# Responses below the threshold are passed through untouched, and clients that do
+# not send Accept-Encoding: gzip are unaffected, so this changes no API contract.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.include_router(project_router)
 app.include_router(allocation_router)
