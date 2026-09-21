@@ -328,6 +328,82 @@ def get_today_status(
     )
 
 
+def _notify_checkin_on_slack(employee_id: int, work_mode: str, checked_in_str: str) -> None:
+    """Confirm a check-in on Slack. Runs after the response has been sent.
+
+    Takes plain values rather than ORM objects: by the time a background task
+    runs, the request's session is closed and its instances are detached. The
+    short session opened here is closed before any Slack call, so no pooled
+    connection is held across network I/O.
+    """
+    from app.db.database import SessionLocal
+    from app.models.employee import Employee
+    from app.services.slack_service import (
+        lookup_user_id_by_email,
+        try_send_checkin_success_message,
+        update_checkin_reminder_to_completed,
+        pop_today_slack_reminder,
+        find_today_slack_reminder,
+    )
+
+    try:
+        db = SessionLocal()
+        try:
+            employee = db.query(Employee).filter(Employee.id == employee_id).first()
+            if not employee:
+                return
+            employee_name = employee.name
+            employee_email = employee.email
+            slack_id = employee.slack_user_id
+        finally:
+            db.close()
+
+        if not slack_id:
+            # First check-in for this employee: resolve the Slack id with no
+            # session open, then reopen a short one purely to cache it. Doing the
+            # lookup inside the session would put a Slack round trip back inside
+            # the connection window, which is what this whole function exists to
+            # avoid.
+            if not employee_email:
+                return
+            try:
+                slack_id = lookup_user_id_by_email(employee_email)
+            except Exception as exc:
+                logger.warning("Slack user lookup failed for %s: %s", employee_email, exc)
+                return
+            if not slack_id:
+                return
+            db = SessionLocal()
+            try:
+                db.query(Employee).filter(Employee.id == employee_id).update(
+                    {"slack_user_id": slack_id}
+                )
+                db.commit()
+            finally:
+                db.close()
+
+        # No DB session is held from here on — these are Slack round trips.
+        try_send_checkin_success_message(
+            employee_slack_user_id=slack_id,
+            employee_name=employee_name,
+            work_mode=work_mode,
+            checked_in_at_str=checked_in_str,
+        )
+
+        rem_channel_id, rem_ts = pop_today_slack_reminder(employee_id)
+        if not (rem_channel_id and rem_ts):
+            rem_channel_id, rem_ts = find_today_slack_reminder(slack_id)
+
+        if rem_channel_id and rem_ts:
+            update_checkin_reminder_to_completed(
+                channel_id=rem_channel_id,
+                ts=rem_ts,
+                employee_name=employee_name,
+            )
+    except Exception as exc:
+        logger.warning(f"Error triggering Slack check-in notifications: {exc}")
+
+
 @router.post("", response_model=CheckInResponse)
 def submit_checkin(
     payload: CheckInCreate,
@@ -372,47 +448,25 @@ def submit_checkin(
 
     db.commit()
     db.refresh(checkin)
-    # --- Send Slack confirmation DM & update reminder message button ---
-    try:
-        from app.models.employee import Employee
-        from app.services.slack_service import (
-            try_get_or_cache_employee_slack_user_id,
-            try_send_checkin_success_message,
-            update_checkin_reminder_to_completed,
-            pop_today_slack_reminder,
-            find_today_slack_reminder,
-        )
 
-        employee = db.query(Employee).filter(Employee.id == employee_id).first()
-        if employee:
-            slack_id = try_get_or_cache_employee_slack_user_id(db, employee)
-            if slack_id:
-                if checkin.checked_in_at:
-                    chk_at = checkin.checked_in_at
-                    if chk_at.tzinfo is None:
-                        chk_at = chk_at.replace(tzinfo=timezone.utc)
-                    now_str = chk_at.astimezone(IST).strftime("%I:%M %p")
-                else:
-                    now_str = "N/A"
-                try_send_checkin_success_message(
-                    employee_slack_user_id=slack_id,
-                    employee_name=employee.name,
-                    work_mode=checkin.work_mode,
-                    checked_in_at_str=now_str,
-                )
+    # Slack confirmation runs after the response, not inside it. Everyone checks
+    # in within a few minutes of the 10:00 reminder, and these are three blocking
+    # Slack calls; done inline they kept this request's pooled DB connection
+    # checked out for roughly a second each time, which caps the whole service at
+    # about eight check-ins per second and turns the morning rush into pool
+    # timeouts. The notification is advisory — the check-in is already committed
+    # above — so it is safe to run afterwards.
+    if checkin.checked_in_at:
+        chk_at = checkin.checked_in_at
+        if chk_at.tzinfo is None:
+            chk_at = chk_at.replace(tzinfo=timezone.utc)
+        checked_in_str = chk_at.astimezone(IST).strftime("%I:%M %p")
+    else:
+        checked_in_str = "N/A"
 
-                rem_channel_id, rem_ts = pop_today_slack_reminder(employee_id)
-                if not (rem_channel_id and rem_ts):
-                    rem_channel_id, rem_ts = find_today_slack_reminder(slack_id)
-
-                if rem_channel_id and rem_ts:
-                    update_checkin_reminder_to_completed(
-                        channel_id=rem_channel_id,
-                        ts=rem_ts,
-                        employee_name=employee.name,
-                    )
-    except Exception as exc:
-        logger.warning(f"Error triggering Slack check-in notifications: {exc}")
+    background_tasks.add_task(
+        _notify_checkin_on_slack, employee_id, checkin.work_mode, checked_in_str
+    )
 
     # Sync allocations strictly to match the submitted checkin project_ids
     valid_project_ids = [pid for pid in payload.project_ids if isinstance(pid, int)]
