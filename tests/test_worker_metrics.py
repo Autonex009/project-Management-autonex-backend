@@ -64,11 +64,11 @@ def test_the_live_worker_is_the_instrumented_one():
 
 @pytest.mark.anyio
 async def test_successful_job_is_counted_and_timed():
-    before = _sample("arq_jobs_total", job="sample_job", outcome="success")
+    before = _sample("arq_jobs_total", task="sample_job", outcome="success")
     assert await sample_job({}) == "done"
 
-    assert _sample("arq_jobs_total", job="sample_job", outcome="success") == before + 1
-    assert _sample("arq_job_duration_seconds_count", job="sample_job") == 1.0
+    assert _sample("arq_jobs_total", task="sample_job", outcome="success") == before + 1
+    assert _sample("arq_job_duration_seconds_count", task="sample_job") == 1.0
 
 
 @pytest.mark.anyio
@@ -77,8 +77,8 @@ async def test_failing_job_is_counted_as_failure_and_still_raises():
     with pytest.raises(RuntimeError, match="encord exploded"):
         await failing_job({})
 
-    assert _sample("arq_jobs_total", job="failing_job", outcome="failure") == 1.0
-    assert _sample("arq_jobs_total", job="failing_job", outcome="success") == 0.0
+    assert _sample("arq_jobs_total", task="failing_job", outcome="failure") == 1.0
+    assert _sample("arq_jobs_total", task="failing_job", outcome="success") == 0.0
 
 
 @pytest.mark.anyio
@@ -91,8 +91,8 @@ async def test_cancelled_job_releases_the_in_progress_gauge():
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert _sample("arq_jobs_in_progress", job="hanging_job") == 0.0
-    assert _sample("arq_jobs_total", job="hanging_job", outcome="failure") == 1.0
+    assert _sample("arq_jobs_in_progress", task="hanging_job") == 0.0
+    assert _sample("arq_jobs_total", task="hanging_job", outcome="failure") == 1.0
 
 
 @pytest.mark.anyio
@@ -100,8 +100,8 @@ async def test_queue_wait_is_measured_from_the_enqueue_timestamp():
     enqueued = datetime.now(timezone.utc) - timedelta(seconds=30)
     await waited_job({"enqueue_time": enqueued})
 
-    assert _sample("arq_job_queue_latency_seconds_count", job="waited_job") == 1.0
-    total = _sample("arq_job_queue_latency_seconds_sum", job="waited_job")
+    assert _sample("arq_job_queue_latency_seconds_count", task="waited_job") == 1.0
+    total = _sample("arq_job_queue_latency_seconds_sum", task="waited_job")
     assert 29 <= total <= 40
 
 

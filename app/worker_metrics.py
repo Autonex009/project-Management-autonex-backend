@@ -31,27 +31,29 @@ logger = logging.getLogger(__name__)
 
 _JOB_BUCKETS = (1, 5, 15, 30, 60, 120, 300, 600, 1800, float("inf"))
 
+# Labelled "task", not "job": Prometheus reserves "job" for the scrape job name
+# and would quietly rename a colliding label to exported_job.
 JOBS_TOTAL = Counter(
     "arq_jobs_total",
     "arq jobs that finished, by outcome",
-    ["job", "outcome"],
+    ["task", "outcome"],
 )
 JOB_DURATION = Histogram(
     "arq_job_duration_seconds",
     "Wall time spent executing an arq job",
-    ["job"],
+    ["task"],
     buckets=_JOB_BUCKETS,
 )
 QUEUE_LATENCY = Histogram(
     "arq_job_queue_latency_seconds",
     "Time a job waited between being enqueued and being picked up",
-    ["job"],
+    ["task"],
     buckets=_JOB_BUCKETS,
 )
 JOBS_IN_PROGRESS = Gauge(
     "arq_jobs_in_progress",
     "arq jobs currently executing",
-    ["job"],
+    ["task"],
 )
 QUEUE_DEPTH = Gauge(
     "arq_queue_depth",
@@ -59,7 +61,7 @@ QUEUE_DEPTH = Gauge(
 )
 
 
-def instrumented(task):
+def instrumented(task_fn):
     """Wrap an arq task so it reports queue wait, duration and outcome.
 
     functools.wraps matters beyond cosmetics here: arq registers a job under
@@ -67,29 +69,29 @@ def instrumented(task):
     would silently break dispatch rather than fail loudly.
     """
 
-    @functools.wraps(task)
+    @functools.wraps(task_fn)
     async def wrapper(ctx, *args, **kwargs):
-        job = task.__qualname__
+        task = task_fn.__qualname__
         enqueue_time = ctx.get("enqueue_time")
         if enqueue_time is not None:
-            QUEUE_LATENCY.labels(job).observe(
+            QUEUE_LATENCY.labels(task).observe(
                 (datetime.now(timezone.utc) - enqueue_time).total_seconds()
             )
 
         started = time.perf_counter()
         outcome = "failure"
-        JOBS_IN_PROGRESS.labels(job).inc()
+        JOBS_IN_PROGRESS.labels(task).inc()
         try:
-            result = await task(ctx, *args, **kwargs)
+            result = await task_fn(ctx, *args, **kwargs)
             outcome = "success"
             return result
         finally:
             # finally, not except: a job killed by arq's timeout raises
             # CancelledError, and a sync that hangs until the timeout is the
             # failure most worth counting.
-            JOBS_IN_PROGRESS.labels(job).dec()
-            JOB_DURATION.labels(job).observe(time.perf_counter() - started)
-            JOBS_TOTAL.labels(job, outcome).inc()
+            JOBS_IN_PROGRESS.labels(task).dec()
+            JOB_DURATION.labels(task).observe(time.perf_counter() - started)
+            JOBS_TOTAL.labels(task, outcome).inc()
 
     return wrapper
 
