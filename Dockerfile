@@ -23,7 +23,9 @@ RUN mkdir -p /app/uploads
 
 # We remove the EXPOSE instruction as Railway handles it dynamically
 
-# Binds IPv6 because Railway's private network is IPv6-only, which is how
-# Prometheus reaches /metrics. A :: socket still accepts IPv4, so public
-# traffic through Railway's proxy is unaffected.
-CMD ["sh", "-c", "uvicorn app.main:app --host :: --port $PORT"]
+# Must stay IPv4. Binding :: does NOT give a dual-stack socket here: asyncio
+# sets IPV6_V6ONLY on AF_INET6 sockets in create_server, so `--host ::` listens
+# on IPv6 only and Railway's public proxy (IPv4) gets no origin response.
+# Prometheus therefore scrapes this service over its public domain, not the
+# private network — see monitoring/prometheus/prometheus.yml.
+CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port $PORT"]

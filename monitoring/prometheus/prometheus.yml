@@ -3,19 +3,26 @@ global:
   scrape_timeout: 10s
 
 scrape_configs:
-  # Both services sit on Railway's private network, which is IPv6-only — hence
-  # `uvicorn --host ::` in the API Dockerfile and WORKER_METRICS_HOST=:: on the
-  # worker. The token is written to a file by entrypoint.sh from METRICS_TOKEN,
-  # because Prometheus does not expand environment variables in this config and
-  # the secret must not be committed.
+  # The token is written to a file by entrypoint.sh from METRICS_TOKEN, because
+  # Prometheus does not expand environment variables in this config and the
+  # secret must not be committed.
+
+  # Scraped over the public domain, not the private network. uvicorn cannot
+  # serve both: asyncio forces IPV6_V6ONLY on an AF_INET6 socket, so binding ::
+  # for private scraping would stop Railway's IPv4 public proxy reaching the
+  # app at all. TLS plus the bearer token is what protects this path, and
+  # /metrics answers 404 without the token.
   - job_name: backend
+    scheme: https
     metrics_path: /metrics
     authorization:
       type: Bearer
       credentials_file: /tmp/metrics_token
     static_configs:
-      - targets: ["project-management-autonex-backend.railway.internal:8000"]
+      - targets: ["project-management-autonex-backend-production.up.railway.app"]
 
+  # The worker stays private: its metrics server is a socketserver, which does
+  # not set IPV6_V6ONLY, so binding :: is genuinely dual-stack there.
   - job_name: worker
     metrics_path: /metrics
     authorization:
