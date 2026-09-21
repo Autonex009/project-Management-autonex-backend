@@ -43,6 +43,7 @@ from app.api.encord_sync import router as encord_sync_router
 from app.api.analytics import router as analytics_router, me_router as analytics_me_router
 from app.api.audit_logs import router as audit_logs_router
 from app.seed_skills import seed_skills
+from app.observability import setup_metrics
 from app.services.scheduler_service import start_scheduler, shutdown_scheduler
 from app.api.employee_notes import router as employee_notes_router
 from app.api.badges import router as badges_router
@@ -196,6 +197,10 @@ app.add_middleware(
 # Responses below the threshold are passed through untouched, and clients that do
 # not send Accept-Encoding: gzip are unaffected, so this changes no API contract.
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Registered last so it wraps the middleware above and times the full request.
+# No-ops on Vercel — see app/observability.py.
+setup_metrics(app)
 
 app.include_router(project_router)
 app.include_router(allocation_router)
