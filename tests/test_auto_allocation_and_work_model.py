@@ -23,6 +23,8 @@ from app.models.daily_checkin import DailyCheckIn
 from app.models.leave import Leave
 from app.models.audit_log import AuditLog
 
+import app.services.allocation_service as allocation_service
+from app.constants.leave_types import is_fixed_holiday, is_weekend
 from app.services.allocation_service import (
     check_employee_project_streak,
     sync_employee_allocations_from_checkin,
@@ -56,7 +58,51 @@ def make_checkin(**kwargs):
     return DailyCheckIn(**kwargs)
 
 
-def test_idle_employee_1_day_checkin_does_not_allocate(db):
+def _latest_working_day(d):
+    """Walk back to the nearest day the streak logic counts as worked."""
+    while is_weekend(d) or is_fixed_holiday(d):
+        d -= timedelta(days=1)
+    return d
+
+
+def _working_days_ending(anchor, count):
+    """The `count` most recent working days up to and including `anchor`, oldest first.
+
+    Derived with the same weekend/holiday helpers the streak check uses, so the
+    fixture cannot drift from the rule it is exercising.
+    """
+    days = []
+    d = anchor
+    while len(days) < count:
+        if not (is_weekend(d) or is_fixed_holiday(d)):
+            days.append(d)
+        d -= timedelta(days=1)
+    return list(reversed(days))
+
+
+@pytest.fixture()
+def today(monkeypatch):
+    """Pin the service clock to the most recent working day.
+
+    sync_employee_allocations_from_checkin() reads the wall clock
+    (datetime.utcnow()) rather than taking a date, so a test that seeds check-ins
+    around a fixed calendar date only passes on that date. These tests previously
+    hard-coded 2026-09-16 and had been failing since the day after it. Anchoring
+    to the real calendar and freezing the service clock to the same day keeps them
+    deterministic on any run date, weekends and holidays included.
+    """
+    anchor = _latest_working_day(date.today())
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def utcnow(cls):
+            return datetime(anchor.year, anchor.month, anchor.day, 12, 0, 0)
+
+    monkeypatch.setattr(allocation_service, "datetime", _FrozenDateTime)
+    return anchor
+
+
+def test_idle_employee_1_day_checkin_does_not_allocate(db, today):
     """An idle employee checking in on Day 1 should NOT be auto-allocated."""
     emp = Employee(name="John Doe", email="john@example.com", employee_type="Full-time", designation="Annotator", status="active")
     db.add(emp)
@@ -65,12 +111,10 @@ def test_idle_employee_1_day_checkin_does_not_allocate(db):
     user = User(name="John Doe", email="john@example.com", password_hash="dummy", role="employee", employee_id=emp.id)
     db.add(user)
 
-    today = date.today()
     proj = Project(name="Project Alpha", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=today - timedelta(days=180), project_status="active")
     db.add(proj)
     db.commit()
 
-    # Today is Day 1
     chk = make_checkin(employee_id=emp.id, checkin_date=today, work_mode="WFO", project_ids=[proj.id])
     db.add(chk)
     db.commit()
@@ -89,7 +133,7 @@ def test_idle_employee_1_day_checkin_does_not_allocate(db):
     assert len(allocs) == 0, "Idle employee should not be allocated on Day 1"
 
 
-def test_idle_employee_7_consecutive_working_days_auto_allocates(db):
+def test_idle_employee_7_consecutive_working_days_auto_allocates(db, today):
     """An idle employee checking in for 7 consecutive working days on the same project gets auto-allocated."""
     emp = Employee(name="Streak Hero", email="hero@example.com", employee_type="Full-time", designation="Annotator", status="active")
     db.add(emp)
@@ -98,30 +142,15 @@ def test_idle_employee_7_consecutive_working_days_auto_allocates(db):
     user = User(name="Streak Hero", email="hero@example.com", password_hash="dummy", role="employee", employee_id=emp.id)
     db.add(user)
 
-    today = date.today()
     proj = Project(name="Alpha Project", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=today - timedelta(days=180), project_status="active")
     db.add(proj)
     db.commit()
 
-    # Create 6 previous working days check-ins ending before today
-    working_days = []
-    days_back = 1
-    
-    from app.constants.leave_types import is_weekend, is_fixed_holiday
-    
-    while len(working_days) < 6:
-        d = today - timedelta(days=days_back)
-        if not is_weekend(d) and not is_fixed_holiday(d):
-            working_days.insert(0, d)
-        days_back += 1
-        
-    for d in working_days:
+    # A check-in on each of the working days leading up to and including today, so
+    # the 7-day streak lands on today whenever the suite happens to run.
+    for d in _working_days_ending(today, 8):
         chk = make_checkin(employee_id=emp.id, checkin_date=d, work_mode="WFO", project_ids=[proj.id])
         db.add(chk)
-
-    # Today is Day 7
-    chk_today = make_checkin(employee_id=emp.id, checkin_date=today, work_mode="WFO", project_ids=[proj.id])
-    db.add(chk_today)
     db.commit()
 
     # Verify helper directly
@@ -162,7 +191,7 @@ def test_idle_employee_7_consecutive_working_days_auto_allocates(db):
     assert "_background_notify_allocation" in task_func_names
 
 
-def test_streak_broken_by_missing_working_day(db):
+def test_streak_broken_by_missing_working_day(db, today):
     """If employee misses a working day check-in, streak is broken and no allocation occurs."""
     emp = Employee(name="Missing Person", email="miss@example.com", employee_type="Full-time", designation="Annotator", status="active")
     db.add(emp)
@@ -171,26 +200,13 @@ def test_streak_broken_by_missing_working_day(db):
     user = User(name="Missing Person", email="miss@example.com", password_hash="dummy", role="employee", employee_id=emp.id)
     db.add(user)
 
-    today = date.today()
     proj = Project(name="Beta Project", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=today - timedelta(days=180), project_status="active")
     db.add(proj)
     db.commit()
 
-    from app.constants.leave_types import is_weekend, is_fixed_holiday
-    
-    # Get previous 2 working days
-    prev_working_days = []
-    days_back = 1
-    while len(prev_working_days) < 2:
-        d = today - timedelta(days=days_back)
-        if not is_weekend(d) and not is_fixed_holiday(d):
-            prev_working_days.insert(0, d)
-        days_back += 1
-        
-    for d in prev_working_days:
+    # Only the last three working days, so the run of 7 is broken by the gap before them.
+    for d in _working_days_ending(today, 3):
         db.add(make_checkin(employee_id=emp.id, checkin_date=d, work_mode="WFO", project_ids=[proj.id]))
-
-    db.add(make_checkin(employee_id=emp.id, checkin_date=today, work_mode="WFO", project_ids=[proj.id]))
     db.commit()
 
     streak_met = check_employee_project_streak(db, emp.id, proj.id, today, required_streak=7)
@@ -203,7 +219,7 @@ def test_streak_broken_by_missing_working_day(db):
     assert len(allocs) == 0
 
 
-def test_pm_lead_admin_never_auto_allocated(db):
+def test_pm_lead_admin_never_auto_allocated(db, today):
     """PMs, Leads, and Admins are excluded from auto-allocation even with a 7-day streak."""
     for role in ["pm", "team_lead", "admin"]:
         emp = Employee(name=f"Lead {role}", email=f"{role}@example.com", employee_type="Full-time", designation="Lead", status="active")
@@ -213,24 +229,13 @@ def test_pm_lead_admin_never_auto_allocated(db):
         user = User(name=f"Lead {role}", email=f"{role}@example.com", password_hash="dummy", role=role, employee_id=emp.id)
         db.add(user)
 
-        today = date.today()
         proj = Project(name=f"Proj {role}", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=today - timedelta(days=180), project_status="active")
         db.add(proj)
         db.commit()
 
-        from app.constants.leave_types import is_weekend, is_fixed_holiday
-        
-        working_days = []
-        days_back = 1
-        while len(working_days) < 6:
-            d = today - timedelta(days=days_back)
-            if not is_weekend(d) and not is_fixed_holiday(d):
-                working_days.insert(0, d)
-            days_back += 1
-            
-        working_days.append(today)
-            
-        for d in working_days:
+        # A full 7-working-day streak ending today — the allocation must still be
+        # refused on role grounds, not because the streak was unmet.
+        for d in _working_days_ending(today, 7):
             db.add(make_checkin(employee_id=emp.id, checkin_date=d, work_mode="WFO", project_ids=[proj.id]))
         db.commit()
 
