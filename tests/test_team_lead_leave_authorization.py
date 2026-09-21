@@ -156,8 +156,8 @@ def _pending_leave(db, employee_id):
         # Must be one of the values LeaveSchema accepts, or the list endpoint fails
         # serialising the row rather than returning it.
         leave_type="casual_sick",
-        start_date=date(2026, 3, 2),
-        end_date=date(2026, 3, 2),
+        start_date=date.today() + timedelta(days=5),
+        end_date=date.today() + timedelta(days=5),
         reason="Personal",
         status="pending",
         flagged=False,

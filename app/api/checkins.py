@@ -478,7 +478,8 @@ def submit_checkin(
             employee_id=employee_id,
             submitted_project_ids=valid_project_ids,
             background_tasks=background_tasks,
-            http_request=http_request
+            http_request=http_request,
+            target_date=today,
         )
     except Exception as exc:
         logger.warning(f"Error syncing allocations from checkin: {exc}")
