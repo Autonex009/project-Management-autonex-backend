@@ -36,6 +36,7 @@ from app.db.database import get_db
 from app.models.employee import Employee
 from app.models.leave import Leave
 from app.models.payroll import PayrollLeaveAdjustment, PayrollRun, PayrollBonus, PayrollAdditionalPayment, Salary
+from app.models.perf_eval import PerfEvaluation
 from app.models.user import User
 from app.constants.leave_types import (
     is_non_working_day,
@@ -285,7 +286,9 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
                         balances: dict, saved_adjustments: dict = None,
                         base_salary: Optional[float] = None,
                         bonus_limit: float = 0.0, bonus: float = 0.0,
-                        additional_payment: float = 0.0) -> dict:
+                        additional_payment: float = 0.0,
+                        bonus_eligible: bool = True,
+                        bonus_ineligible_reason: Optional[str] = None) -> dict:
     """
     Each leave in `approved_leaves` carries `auto_unpaid_days` (from the annual-quota
     classifier) and `days_in_month` (working days within the month).
@@ -368,7 +371,7 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
     payable_days = working_days - total_deducted_days
     # Bonus is discretionary and capped at the employee's limit; additional
     # payments are free-form. Both add on top of the post-deduction salary.
-    bonus_amount = round(max(0.0, min(bonus or 0.0, bonus_limit or 0.0)), 2)
+    bonus_amount = round(max(0.0, min(bonus or 0.0, bonus_limit or 0.0)), 2) if bonus_eligible else 0.0
     additional_amount = round(max(0.0, additional_payment or 0.0), 2)
     final_salary = round(max(base - total_deduction, 0) + bonus_amount + additional_amount, 2)
 
@@ -390,6 +393,8 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
         "payable_days": payable_days,
         "bonus_limit": round(bonus_limit or 0.0, 2),
         "bonus": bonus_amount,
+        "bonus_eligible": bonus_eligible,
+        "bonus_ineligible_reason": bonus_ineligible_reason,
         "additional_payment": additional_amount,
         "final_salary": final_salary,
     }
@@ -467,6 +472,14 @@ def preview_payroll(
             for a in db.query(PayrollAdditionalPayment).filter(PayrollAdditionalPayment.payroll_run_id == existing_run.id).all()
         }
 
+    # Self-evaluations submitted for this payroll month (employees eligible for bonus)
+    submitted_eval_emp_ids = {
+        row[0]
+        for row in db.query(PerfEvaluation.employee_id)
+        .filter(PerfEvaluation.period == month)
+        .all()
+    }
+
     rows = []
     for salary_row in salary_rows:
         # Resolve the matching active employee by name; without one there's no
@@ -490,6 +503,8 @@ def preview_payroll(
                 orphan_emp, [], working_days, {},
                 None, base_salary=orphan_base,
                 bonus_limit=0.0, bonus=0.0, additional_payment=0.0,
+                bonus_eligible=False,
+                bonus_ineligible_reason="No employee record",
             )
             orphan_row["salary_missing"] = False
             orphan_row["is_orphan"] = True
@@ -558,12 +573,22 @@ def preview_payroll(
                 "reason": leave.reason or "",
             })
 
+        has_completed_eval = emp.id in submitted_eval_emp_ids
+        bonus_eligible = has_completed_eval and (emp_bonus_limit > 0)
+        bonus_ineligible_reason = None
+        if emp_bonus_limit <= 0:
+            bonus_ineligible_reason = "No bonus limit configured in salary"
+        elif not has_completed_eval:
+            bonus_ineligible_reason = "Self-evaluation not completed by 25th deadline"
+
         row = _build_employee_row(
             emp, month_leaves, working_days, balances,
             saved_adjustments if existing_run else None,
             base_salary=emp_base_salary,
             bonus_limit=emp_bonus_limit, bonus=emp_bonus,
             additional_payment=emp_additional,
+            bonus_eligible=bonus_eligible,
+            bonus_ineligible_reason=bonus_ineligible_reason,
         )
         row["salary_missing"] = emp_base_salary is None
         rows.append(row)
@@ -689,7 +714,15 @@ def save_payroll(
         _normalize_name(s.full_name): (_read_pay(s.opt_bonus_monthly) or 0.0)
         for s in db.query(Salary).all()
     }
+    submitted_eval_emp_ids = {
+        row[0]
+        for row in db.query(PerfEvaluation.employee_id)
+        .filter(PerfEvaluation.period == run.month)
+        .all()
+    }
     for b in body.bonuses:
+        if b.employee_id not in submitted_eval_emp_ids:
+            continue
         limit = bonus_limit_by_name.get(_normalize_name(emp_name_by_id.get(b.employee_id, "")), 0.0)
         amount = max(0.0, min(b.amount or 0.0, limit))
         if amount <= 0:
