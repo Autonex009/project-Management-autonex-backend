@@ -111,7 +111,7 @@ def test_idle_employee_1_day_checkin_does_not_allocate(db, today):
     user = User(name="John Doe", email="john@example.com", password_hash="dummy", role="employee", employee_id=emp.id)
     db.add(user)
 
-    proj = Project(name="Project Alpha", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=date(2026, 1, 1), project_status="active")
+    proj = Project(name="Project Alpha", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=today - timedelta(days=180), project_status="active")
     db.add(proj)
     db.commit()
 
@@ -126,6 +126,7 @@ def test_idle_employee_1_day_checkin_does_not_allocate(db, today):
         submitted_project_ids=[proj.id],
         background_tasks=bg,
         http_request=None,
+        target_date=today,
     )
 
     allocs = db.query(Allocation).filter(Allocation.employee_id == emp.id, Allocation.is_active == True).all()
@@ -141,7 +142,7 @@ def test_idle_employee_7_consecutive_working_days_auto_allocates(db, today):
     user = User(name="Streak Hero", email="hero@example.com", password_hash="dummy", role="employee", employee_id=emp.id)
     db.add(user)
 
-    proj = Project(name="Alpha Project", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=date(2026, 1, 1), project_status="active")
+    proj = Project(name="Alpha Project", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=today - timedelta(days=180), project_status="active")
     db.add(proj)
     db.commit()
 
@@ -164,6 +165,7 @@ def test_idle_employee_7_consecutive_working_days_auto_allocates(db, today):
         submitted_project_ids=[proj.id],
         background_tasks=bg,
         http_request=None,
+        target_date=today,
     )
 
     # Assert allocation is created and active
@@ -198,7 +200,7 @@ def test_streak_broken_by_missing_working_day(db, today):
     user = User(name="Missing Person", email="miss@example.com", password_hash="dummy", role="employee", employee_id=emp.id)
     db.add(user)
 
-    proj = Project(name="Beta Project", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=date(2026, 1, 1), project_status="active")
+    proj = Project(name="Beta Project", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=today - timedelta(days=180), project_status="active")
     db.add(proj)
     db.commit()
 
@@ -211,7 +213,7 @@ def test_streak_broken_by_missing_working_day(db, today):
     assert streak_met is False
 
     bg = BackgroundTasks()
-    sync_employee_allocations_from_checkin(db, emp.id, [proj.id], bg, None)
+    sync_employee_allocations_from_checkin(db, emp.id, [proj.id], bg, None, target_date=today)
 
     allocs = db.query(Allocation).filter(Allocation.employee_id == emp.id, Allocation.is_active == True).all()
     assert len(allocs) == 0
@@ -227,7 +229,7 @@ def test_pm_lead_admin_never_auto_allocated(db, today):
         user = User(name=f"Lead {role}", email=f"{role}@example.com", password_hash="dummy", role=role, employee_id=emp.id)
         db.add(user)
 
-        proj = Project(name=f"Proj {role}", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=date(2026, 1, 1), project_status="active")
+        proj = Project(name=f"Proj {role}", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=today - timedelta(days=180), project_status="active")
         db.add(proj)
         db.commit()
 
@@ -238,7 +240,7 @@ def test_pm_lead_admin_never_auto_allocated(db, today):
         db.commit()
 
         bg = BackgroundTasks()
-        sync_employee_allocations_from_checkin(db, emp.id, [proj.id], bg, None)
+        sync_employee_allocations_from_checkin(db, emp.id, [proj.id], bg, None, target_date=today)
 
         allocs = db.query(Allocation).filter(Allocation.employee_id == emp.id, Allocation.is_active == True).all()
         assert len(allocs) == 0, f"Role {role} should never be auto-allocated"
@@ -246,23 +248,36 @@ def test_pm_lead_admin_never_auto_allocated(db, today):
 
 def test_monthly_work_model_switches_to_wfh(db):
     """If an employee works 100% WFH on all working days in a month (>= 15 days), switch work_model to WFH."""
+    today = date.today()
+    target_eval_date = date(today.year, today.month, 1)
+    if today.month == 1:
+        prev_year = today.year - 1
+        prev_month = 12
+    else:
+        prev_year = today.year
+        prev_month = today.month - 1
+
+    month_start = date(prev_year, prev_month, 1)
+    if prev_month == 12:
+        month_end = date(prev_year, 12, 31)
+    else:
+        month_end = date(prev_year, prev_month + 1, 1) - timedelta(days=1)
+
     emp = Employee(name="Remote Worker", email="remote@example.com", employee_type="Full-time", designation="Developer", status="active", work_model="WFO")
     db.add(emp)
     db.commit()
-    emp.created_at = datetime(2026, 8, 1)
+    emp.created_at = datetime(prev_year, prev_month, 1) - timedelta(days=15)
     db.commit()
 
-    # Target date: Oct 1, 2026 -> evaluates September 2026
-    # Create 20 working day check-ins in September 2026 with work_mode="WFH"
-    cur = date(2026, 9, 1)
-    month_end = date(2026, 9, 30)
+    # Create working day check-ins in previous month with work_mode="WFH"
+    cur = month_start
     while cur <= month_end:
         if cur.weekday() < 5:  # Mon-Fri
             db.add(make_checkin(employee_id=emp.id, checkin_date=cur, work_mode="WFH", project_ids=[1]))
         cur += timedelta(days=1)
     db.commit()
 
-    result = sync_monthly_work_models(db, target_date=date(2026, 10, 1), min_threshold_days=15)
+    result = sync_monthly_work_models(db, target_date=target_eval_date, min_threshold_days=15)
 
     assert result["switched_to_wfh_count"] == 1
     assert "Remote Worker" in result["switched_to_wfh"]
@@ -281,15 +296,29 @@ def test_monthly_work_model_switches_to_wfh(db):
 
 def test_monthly_work_model_mixed_mode_no_switch(db):
     """An employee who worked both WFO and WFH should NOT have their work_model changed."""
+    today = date.today()
+    target_eval_date = date(today.year, today.month, 1)
+    if today.month == 1:
+        prev_year = today.year - 1
+        prev_month = 12
+    else:
+        prev_year = today.year
+        prev_month = today.month - 1
+
+    month_start = date(prev_year, prev_month, 1)
+    if prev_month == 12:
+        month_end = date(prev_year, 12, 31)
+    else:
+        month_end = date(prev_year, prev_month + 1, 1) - timedelta(days=1)
+
     emp = Employee(name="Hybrid Worker", email="hybrid@example.com", employee_type="Full-time", designation="Developer", status="active", work_model="WFO")
     db.add(emp)
     db.commit()
-    emp.created_at = datetime(2026, 8, 1)
+    emp.created_at = datetime(prev_year, prev_month, 1) - timedelta(days=15)
     db.commit()
 
-    # September 2026: 10 WFH days and 10 WFO days
-    cur = date(2026, 9, 1)
-    month_end = date(2026, 9, 30)
+    # Mixed check-ins in previous month: 10 WFH days and remaining WFO
+    cur = month_start
     wfh_count = 0
     while cur <= month_end:
         if cur.weekday() < 5:
@@ -299,7 +328,7 @@ def test_monthly_work_model_mixed_mode_no_switch(db):
         cur += timedelta(days=1)
     db.commit()
 
-    result = sync_monthly_work_models(db, target_date=date(2026, 10, 1), min_threshold_days=15)
+    result = sync_monthly_work_models(db, target_date=target_eval_date, min_threshold_days=15)
 
     assert result["switched_to_wfh_count"] == 0
     assert result["switched_to_wfo_count"] == 0
@@ -329,7 +358,7 @@ def test_pm_and_lead_receive_slack_on_allocation(db, monkeypatch):
         project_type="Annotation",
         total_tasks=100,
         estimated_time_per_task=1.0,
-        start_date=date(2026, 1, 1),
+        start_date=date.today() - timedelta(days=180),
         project_status="active",
         assigned_employee_ids=[pm_emp.id],
     )
@@ -396,7 +425,7 @@ def test_admin_unallocates_notifies_pm_lead_and_employee(db, monkeypatch):
     db.add_all([pm_emp, lead_emp, worker, admin_emp])
     db.flush()
 
-    proj = Project(name="Project Omega", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=date(2026, 1, 1), project_status="active", assigned_employee_ids=[pm_emp.id])
+    proj = Project(name="Project Omega", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=date.today() - timedelta(days=180), project_status="active", assigned_employee_ids=[pm_emp.id])
     db.add(proj)
     db.flush()
 
@@ -443,7 +472,7 @@ def test_pm_unallocates_notifies_lead_and_employee_only(db, monkeypatch):
     db.add_all([pm_emp, lead_emp, worker])
     db.flush()
 
-    proj = Project(name="Project Omega 2", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=date(2026, 1, 1), project_status="active", assigned_employee_ids=[pm_emp.id])
+    proj = Project(name="Project Omega 2", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=date.today() - timedelta(days=180), project_status="active", assigned_employee_ids=[pm_emp.id])
     db.add(proj)
     db.flush()
 
@@ -489,7 +518,7 @@ def test_lead_unallocates_notifies_pm_and_employee_only(db, monkeypatch):
     db.add_all([pm_emp, lead_emp, worker])
     db.flush()
 
-    proj = Project(name="Project Omega 3", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=date(2026, 1, 1), project_status="active", assigned_employee_ids=[pm_emp.id])
+    proj = Project(name="Project Omega 3", client="TestClient", project_type="Annotation", total_tasks=100, estimated_time_per_task=1.0, start_date=date.today() - timedelta(days=180), project_status="active", assigned_employee_ids=[pm_emp.id])
     db.add(proj)
     db.flush()
 

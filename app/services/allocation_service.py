@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
-from datetime import datetime
-from typing import List, Set
+from datetime import datetime, date
+from typing import List, Set, Optional
 from fastapi import BackgroundTasks
 from app.db.database import SessionLocal
 from app.models.allocation import Allocation
@@ -151,7 +151,8 @@ def sync_employee_allocations_from_checkin(
     employee_id: int,
     submitted_project_ids: List[int],
     background_tasks: BackgroundTasks,
-    http_request
+    http_request,
+    target_date: Optional[date] = None,
 ):
     """
     Syncs the employee's active allocations from check-in.
@@ -188,8 +189,7 @@ def sync_employee_allocations_from_checkin(
     
     affected_project_ids = set()
     newly_allocated_ids: List[tuple[int, int]] = []
-    now = datetime.utcnow()
-    today = now.date()
+    today = target_date if target_date is not None else datetime.utcnow().date()
     
     # 3. Add new projects (Auto-allocate only if 7-day streak is met)
     for pid in submitted_set:
