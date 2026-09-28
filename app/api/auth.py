@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 from typing import Optional, List, Literal
 from jose import ExpiredSignatureError, JWTError
+from sqlalchemy.orm import joinedload
 
 from app.db.database import get_db
 from app.models.user import User, RefreshToken
@@ -182,7 +183,6 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     """Authenticate with email + password, returns JWT."""
     logger.info("[login] Attempt: email=%s portal=%s", body.email, body.portal)
 
-    from sqlalchemy.orm import joinedload
     user = db.query(User).options(joinedload(User.employee)).filter(User.email == body.email).first()
     
     if not user:
