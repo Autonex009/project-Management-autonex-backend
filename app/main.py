@@ -182,6 +182,15 @@ _cors_origins = [
     for origin in os.getenv("CORS_ORIGINS", _default_origins).split(",")
     if origin.strip()
 ]
+# Automatically append frontend URLs if they are set but not in CORS_ORIGINS
+for env_url in [os.getenv("FRONTEND_URL"), os.getenv("APP_URL")]:
+    if env_url:
+        clean_url = env_url.strip().rstrip("/")
+        if clean_url and clean_url not in _cors_origins:
+            _cors_origins.append(clean_url)
+            
+# For Vercel preview environments, it's safer to allow the specific domains
+_cors_origins.append("https://project-management-autonex-frontend.vercel.app")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
