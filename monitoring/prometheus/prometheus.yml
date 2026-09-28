@@ -1,0 +1,31 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+
+scrape_configs:
+  # Both services sit on Railway's private network, which is IPv6-only — hence
+  # `uvicorn --host ::` in the API Dockerfile and WORKER_METRICS_HOST=:: on the
+  # worker. The token is written to a file by entrypoint.sh from METRICS_TOKEN,
+  # because Prometheus does not expand environment variables in this config and
+  # the secret must not be committed.
+  - job_name: backend
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/metrics_token
+    static_configs:
+      - targets: ["project-management-autonex-backend.railway.internal:8000"]
+
+  - job_name: worker
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /tmp/metrics_token
+    static_configs:
+      - targets: ["worker-service.railway.internal:9110"]
+
+  # Prometheus scraping itself. Free, and it answers "is the scraper healthy?"
+  # without a second system to watch this one.
+  - job_name: prometheus
+    static_configs:
+      - targets: ["[::1]:9090"]

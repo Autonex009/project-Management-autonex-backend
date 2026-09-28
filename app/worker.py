@@ -10,6 +10,7 @@ from app.db.database import SessionLocal
 from app.db.database import Base, engine
 from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor
 from app.services import encord_sync_service
+from app.worker_metrics import instrumented, start_metrics_server, watch_queue_depth
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ def perform_sync(start: Optional[datetime], end: Optional[datetime]):
     finally:
         db.close()
 
+@instrumented
 async def run_encord_sync(ctx, start: Optional[datetime], end: Optional[datetime]):
     """
     The async ARQ task. 
@@ -43,6 +45,7 @@ def _perform_user_sync(log_id: str, employee_id: int, start: datetime, end: date
     finally:
         db.close()
 
+@instrumented
 async def run_user_sync_task(ctx, log_id: str, employee_id: int, start: datetime, end: datetime):
     logger.info("Worker picked up user Encord sync — employee=%s start=%s end=%s", employee_id, start, end)
     result = await asyncio.to_thread(_perform_user_sync, log_id, employee_id, start, end)
@@ -89,10 +92,23 @@ async def run_user_sync_task(ctx, log_id: str, employee_id: int, start: datetime
     await asyncio.to_thread(_sync_user_badges)
     return result
 
+async def startup(ctx):
+    start_metrics_server()
+    ctx["queue_depth_task"] = asyncio.create_task(watch_queue_depth(ctx["redis"]))
+
+
+async def shutdown(ctx):
+    task = ctx.get("queue_depth_task")
+    if task:
+        task.cancel()
+
+
 # ARQ looks for this specific class name when starting up
 class WorkerSettings:
     functions = [run_encord_sync, run_user_sync_task]
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
-    
+
     # Optional: Prevent out-of-memory errors on Railway by limiting concurrent jobs
     max_jobs = 2
+    on_startup = startup
+    on_shutdown = shutdown

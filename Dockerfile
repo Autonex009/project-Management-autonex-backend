@@ -23,4 +23,7 @@ RUN mkdir -p /app/uploads
 
 # We remove the EXPOSE instruction as Railway handles it dynamically
 
-CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port $PORT"]
+# Binds IPv6 because Railway's private network is IPv6-only, which is how
+# Prometheus reaches /metrics. A :: socket still accepts IPv4, so public
+# traffic through Railway's proxy is unaffected.
+CMD ["sh", "-c", "uvicorn app.main:app --host :: --port $PORT"]
