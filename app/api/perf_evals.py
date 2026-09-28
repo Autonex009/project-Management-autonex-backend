@@ -628,16 +628,26 @@ def create_eval(
     current_period = f"{now_ist.year:04d}-{now_ist.month:02d}"
 
     if current_user.role != "admin":
+        # OLD LOCK: 22nd to 25th
+        # if now_ist.day < 22:
+        #     raise HTTPException(
+        #         status_code=403,
+        #         detail="Performance evaluations can only be submitted between the 22nd and 25th of the month. The submission window has not opened yet.",
+        #     )
+        # if now_ist.day > 25:
+        #     raise HTTPException(
+        #         status_code=403,
+        #         detail="The self-evaluation window closed on the 25th of the month. Submissions are locked to finalize monthly payroll processing.",
+        #     )
+
+        # NEW LOCK: 22nd to the last day of the current month
         if now_ist.day < 22:
             raise HTTPException(
                 status_code=403,
-                detail="Performance evaluations can only be submitted between the 22nd and 25th of the month. The submission window has not opened yet.",
+                detail="Performance evaluations can only be submitted between the 22nd and the end of the month. The submission window has not opened yet.",
             )
-        if now_ist.day > 25:
-            raise HTTPException(
-                status_code=403,
-                detail="The self-evaluation window closed on the 25th of the month. Submissions are locked to finalize monthly payroll processing.",
-            )
+        # (When the month rolls over, now_ist.day becomes 1, hitting the `< 22` block above.
+        # Thus, no upper bound check on now_ist.day is mathematically necessary).
         if payload.period != current_period:
             raise HTTPException(
                 status_code=400,

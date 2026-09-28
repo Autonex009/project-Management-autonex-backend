@@ -81,3 +81,10 @@ autonex.db.bak
 generate_audit_doc.py
 .agents/
 graphify-out/
+
+# Local Architecture & Planning Docs (About_Project)
+About_Project/existing_architecture/
+About_Project/existing architecture/
+About_Project/new_feature/
+About_Project/new feature/
+About_Project/optimization/
