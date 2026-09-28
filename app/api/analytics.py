@@ -268,8 +268,9 @@ ANNOTATOR_ROLES = {"ANNOTATOR", "ANNOTATOR_REVIEWER"}
 REVIEWER_ROLES = {"REVIEWER", "ANNOTATOR_REVIEWER"}
 ACTIVE_THRESHOLD_SECONDS = 3600
 
-# Autonex employees use Encord accounts ending in this suffix.
+# Autonex team and employees use Encord accounts with encord.com or .ai
 AUTONEX_EMAIL_SUFFIX = "_theta@encord.ai"
+AUTONEX_EMAIL_DOMAINS = ("encord.com", "encord.ai", ".ai")
 
 
 def _get_pm_associated_sub_project_ids(db: Session, current_user: User) -> Optional[set[int]]:
@@ -333,10 +334,12 @@ def _get_pm_associated_sub_project_ids(db: Session, current_user: User) -> Optio
 
 
 def is_autonex_email(email: str | None) -> bool:
-    # Stripped before the suffix test: a padded user_email would otherwise fail it
-    # and drop the row out of the Autonex cohort entirely — not just mislabelled,
-    # but missing from the leaderboard, the Autonex tab and the team averages.
-    return bool(email) and email.strip().lower().endswith(AUTONEX_EMAIL_SUFFIX)
+    # Includes all Encord IDs ending with encord.com or .ai (e.g. _theta@encord.ai, _kappa@encord.ai,
+    # aryan.mundra@encord.ai, sukrut@encord.com, etc.)
+    if not email:
+        return False
+    e = email.strip().lower()
+    return e.endswith(AUTONEX_EMAIL_DOMAINS)
 
 
 # Annotator / reviewer HEAD-COUNTS are classified by the Encord workflow stage the
