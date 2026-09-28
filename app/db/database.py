@@ -67,8 +67,8 @@ def _build_engine():
         return create_engine(
             DATABASE_URL,
             pool_pre_ping=True,
-            pool_size=1,        # keep one warm connection (min pool size 1, never max 1)
-            max_overflow=4,     # allow short bursts of concurrency within an instance
+            pool_size=10,
+            max_overflow=20,
             pool_recycle=60,    # drop connections after 60s to avoid stale/leaked idle conns
             pool_timeout=10,
             connect_args=connect_args,

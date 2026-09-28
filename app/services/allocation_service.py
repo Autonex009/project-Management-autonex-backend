@@ -108,11 +108,12 @@ def check_employee_project_streak(
         pids = chk.project_ids if isinstance(chk.project_ids, list) else []
         checkin_by_date[chk.checkin_date] = pids
 
-    # If target_date is in checkin_by_date, verify it contains project_id
-    if target_date in checkin_by_date:
-        today_pids = checkin_by_date[target_date]
-        if not any(p == project_id or str(p) == str(project_id) for p in today_pids):
-            return False
+    # If target_date is not in checkin_by_date or doesn't have project_id, streak is not met
+    if target_date not in checkin_by_date:
+        return False
+    today_pids = checkin_by_date[target_date]
+    if not any(p == project_id or str(p) == str(project_id) for p in today_pids):
+        return False
 
     streak_count = 1
     current_date = target_date - timedelta(days=1)
@@ -151,7 +152,8 @@ def sync_employee_allocations_from_checkin(
     employee_id: int,
     submitted_project_ids: List[int],
     background_tasks: BackgroundTasks,
-    http_request
+    http_request,
+    target_date = None
 ):
     """
     Syncs the employee's active allocations from check-in.
@@ -186,10 +188,14 @@ def sync_employee_allocations_from_checkin(
     if actor_user and actor_user.role in ("pm", "team_lead", "admin"):
         return
     
+    from app.services.project_scope import escalates_to_admin, escalates_to_pm
+    if escalates_to_admin(db, employee_id) or escalates_to_pm(db, employee_id):
+        return
+    
     affected_project_ids = set()
     newly_allocated_ids: List[tuple[int, int]] = []
-    now = datetime.utcnow()
-    today = now.date()
+    from app.utils.business_time import today_ist
+    today = target_date or today_ist()
     
     # 3. Add new projects (Auto-allocate only if 7-day streak is met)
     for pid in submitted_set:

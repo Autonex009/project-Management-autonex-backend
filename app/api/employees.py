@@ -394,6 +394,7 @@ def list_employees_paginated(
     time_from: Optional[str] = None,
     time_to: Optional[str] = None,
     office_floor: Optional[str] = None,
+    col_work_model: Optional[str] = None,
     team_only: bool = False,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
@@ -484,6 +485,13 @@ def list_employees_paginated(
                 desig_conditions.append(func.lower(Employee.designation) == d)
         if desig_conditions:
             query = query.filter(or_(*desig_conditions))
+
+    if col_work_model:
+        wm_conditions = []
+        for wm in [x.strip().upper() for x in col_work_model.split(",")]:
+            wm_conditions.append(func.upper(Employee.work_model) == wm)
+        if wm_conditions:
+            query = query.filter(or_(*wm_conditions))
 
     if designation:
         # Exact match for the designation tab filter

@@ -93,10 +93,10 @@ def test_submission_window_before_22nd_rejected(client_and_db):
         }
         resp = client.post("/api/perf-evals", json=payload)
         assert resp.status_code == 403
-        assert "submitted between the 22nd and 25th" in resp.json()["detail"]
+        assert "between the 22nd and the end of the month" in resp.json()["detail"]
 
 
-def test_submission_window_after_25th_rejected(client_and_db):
+def test_submission_window_after_end_of_month_rejected(client_and_db):
     client, db, auth_state = client_and_db
     emp = Employee(id=1, name="Alice", email="alice@x.com", employee_type="Full-time", status="active")
     user = User(id=1, email="alice@x.com", password_hash="hash", name="Alice", role="employee", employee_id=1, is_active=True)
@@ -104,8 +104,8 @@ def test_submission_window_after_25th_rejected(client_and_db):
     db.add_all([emp, user])
     db.commit()
 
-    # Mock IST date to 26th September 2026 (closed window)
-    fake_now = datetime(2026, 9, 26, 9, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    # Mock IST date to 1st October 2026 (closed window for September)
+    fake_now = datetime(2026, 10, 1, 9, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
     with patch("app.api.perf_evals.datetime") as mock_dt:
         mock_dt.now.return_value = fake_now
         payload = {
@@ -117,10 +117,10 @@ def test_submission_window_after_25th_rejected(client_and_db):
         }
         resp = client.post("/api/perf-evals", json=payload)
         assert resp.status_code == 403
-        assert "closed on the 25th of the month" in resp.json()["detail"]
+        assert "The submission window has not opened yet" in resp.json()["detail"]
 
 
-def test_submission_window_between_22nd_and_25th_accepted(client_and_db):
+def test_submission_window_between_22nd_and_end_of_month_accepted(client_and_db):
     client, db, auth_state = client_and_db
     emp = Employee(id=1, name="Alice", email="alice@x.com", employee_type="Full-time", status="active")
     user = User(id=1, email="alice@x.com", password_hash="hash", name="Alice", role="employee", employee_id=1, is_active=True)
