@@ -9,6 +9,8 @@ from sqlalchemy.sql import func
 from app.db.database import Base
 
 
+from sqlalchemy.orm import relationship
+
 class User(Base):
     __tablename__ = "users"
 
@@ -22,6 +24,7 @@ class User(Base):
     
     # Link to employee record (for pm/employee users)
     employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
+    employee = relationship("Employee", foreign_keys=[employee_id])
     
     # Skills stored as JSON array (used during signup)
     skills = Column(JSON, nullable=True)

@@ -102,6 +102,8 @@ DESIGNATION_ACCESS = {
 
 
 def _lookup_employee(user: User, db: Session) -> Optional[Employee]:
+    if hasattr(user, 'employee') and user.employee is not None:
+        return user.employee
     employee = None
     if user.employee_id:
         employee = db.query(Employee).filter(Employee.id == user.employee_id).first()
@@ -110,10 +112,10 @@ def _lookup_employee(user: User, db: Session) -> Optional[Employee]:
     return employee
 
 
-def get_user_designation(user: User, db: Session) -> Optional[str]:
-    employee = _lookup_employee(user, db)
-    if employee and employee.designation:
-        return employee.designation
+def get_user_designation(user: User, db: Session, employee: Optional[Employee] = None) -> Optional[str]:
+    emp = employee or _lookup_employee(user, db)
+    if emp and emp.designation:
+        return emp.designation
     if user.role == "admin":
         return "Admin"
     return None
@@ -126,9 +128,9 @@ def get_access_role(designation: Optional[str], fallback_role: str) -> str:
 
 
 def build_user_response(user: User, db: Session) -> UserResponse:
-    designation = get_user_designation(user, db)
+    employee = user.employee if hasattr(user, 'employee') and user.employee is not None else _lookup_employee(user, db)
+    designation = get_user_designation(user, db, employee)
     access_role = get_access_role(designation, user.role)
-    employee = _lookup_employee(user, db)
     return UserResponse(
         id=user.id,
         name=user.name,
@@ -180,15 +182,11 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     """Authenticate with email + password, returns JWT."""
     logger.info("[login] Attempt: email=%s portal=%s", body.email, body.portal)
 
-    user = db.query(User).filter(User.email == body.email).first()
+    from sqlalchemy.orm import joinedload
+    user = db.query(User).options(joinedload(User.employee)).filter(User.email == body.email).first()
+    
     if not user:
-        # Say WHICH thing is wrong, and where the email stands. The generic
-        # "invalid email or password" is the textbook answer because it hides
-        # whether an address is registered, but on a closed staff portal that
-        # secrecy only cost people time — they could not tell a typo from a
-        # missing account. `field` tells the form which input to mark.
         logger.warning("[login] User not found: %s", body.email)
-        employee = db.query(Employee).filter(Employee.email == body.email).first()
         request_row = (
             db.query(SignupRequestRecord)
             .filter(SignupRequestRecord.email == body.email)
@@ -208,18 +206,20 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
                 "field": "email",
                 "message": "Your access request was declined. Contact an admin if you think that's a mistake.",
             }
-        elif employee:
-            detail = {
-                "code": "no_login_yet",
-                "field": "email",
-                "message": "This email is on the employee roster but has no login yet. Use Request Access or ask an admin to create one.",
-            }
         else:
-            detail = {
-                "code": "email_not_found",
-                "field": "email",
-                "message": "No account exists for this email. Check the spelling, or use Request Access.",
-            }
+            employee = db.query(Employee).filter(Employee.email == body.email).first()
+            if employee:
+                detail = {
+                    "code": "no_login_yet",
+                    "field": "email",
+                    "message": "This email is on the employee roster but has no login yet. Use Request Access or ask an admin to create one.",
+                }
+            else:
+                detail = {
+                    "code": "email_not_found",
+                    "field": "email",
+                    "message": "No account exists for this email. Check the spelling, or use Request Access.",
+                }
         raise HTTPException(status_code=401, detail=detail)
 
     logger.debug("[login] User found: id=%s is_active=%s role=%s", user.id, user.is_active, user.role)
