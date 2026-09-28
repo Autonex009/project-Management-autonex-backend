@@ -101,7 +101,9 @@ DESIGNATION_ACCESS = {
 }
 
 
-def _lookup_employee(user: User, db: Session) -> Optional[Employee]:
+def _lookup_employee(user: User, db: Session, pre_fetched_employee: Optional[Employee] = None) -> Optional[Employee]:
+    if pre_fetched_employee:
+        return pre_fetched_employee
     employee = None
     if user.employee_id:
         employee = db.query(Employee).filter(Employee.id == user.employee_id).first()
@@ -110,8 +112,8 @@ def _lookup_employee(user: User, db: Session) -> Optional[Employee]:
     return employee
 
 
-def get_user_designation(user: User, db: Session) -> Optional[str]:
-    employee = _lookup_employee(user, db)
+def get_user_designation(user: User, db: Session, pre_fetched_employee: Optional[Employee] = None) -> Optional[str]:
+    employee = _lookup_employee(user, db, pre_fetched_employee)
     if employee and employee.designation:
         return employee.designation
     if user.role == "admin":
@@ -125,10 +127,10 @@ def get_access_role(designation: Optional[str], fallback_role: str) -> str:
     return DESIGNATION_ACCESS.get(designation, fallback_role)
 
 
-def build_user_response(user: User, db: Session) -> UserResponse:
-    designation = get_user_designation(user, db)
+def build_user_response(user: User, db: Session, pre_fetched_employee: Optional[Employee] = None) -> UserResponse:
+    employee = _lookup_employee(user, db, pre_fetched_employee)
+    designation = get_user_designation(user, db, employee)
     access_role = get_access_role(designation, user.role)
-    employee = _lookup_employee(user, db)
     return UserResponse(
         id=user.id,
         name=user.name,
@@ -180,15 +182,21 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     """Authenticate with email + password, returns JWT."""
     logger.info("[login] Attempt: email=%s portal=%s", body.email, body.portal)
 
-    user = db.query(User).filter(User.email == body.email).first()
+    # Fetch both the User and their associated Employee record in one single trip
+    # using an explicit outer join. This is 100% Vercel-safe because it doesn't
+    # rely on the SQLAlchemy model mapper's relationship bindings.
+    result = (
+        db.query(User, Employee)
+        .outerjoin(Employee, User.employee_id == Employee.id)
+        .filter(User.email == body.email)
+        .first()
+    )
+    user, employee = result if result else (None, None)
+
     if not user:
-        # Say WHICH thing is wrong, and where the email stands. The generic
-        # "invalid email or password" is the textbook answer because it hides
-        # whether an address is registered, but on a closed staff portal that
-        # secrecy only cost people time — they could not tell a typo from a
-        # missing account. `field` tells the form which input to mark.
         logger.warning("[login] User not found: %s", body.email)
-        employee = db.query(Employee).filter(Employee.email == body.email).first()
+        
+        # Check waitlist lazily before querying employee roster
         request_row = (
             db.query(SignupRequestRecord)
             .filter(SignupRequestRecord.email == body.email)
@@ -208,18 +216,20 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
                 "field": "email",
                 "message": "Your access request was declined. Contact an admin if you think that's a mistake.",
             }
-        elif employee:
-            detail = {
-                "code": "no_login_yet",
-                "field": "email",
-                "message": "This email is on the employee roster but has no login yet. Use Request Access or ask an admin to create one.",
-            }
         else:
-            detail = {
-                "code": "email_not_found",
-                "field": "email",
-                "message": "No account exists for this email. Check the spelling, or use Request Access.",
-            }
+            employee = db.query(Employee).filter(Employee.email == body.email).first()
+            if employee:
+                detail = {
+                    "code": "no_login_yet",
+                    "field": "email",
+                    "message": "This email is on the employee roster but has no login yet. Use Request Access or ask an admin to create one.",
+                }
+            else:
+                detail = {
+                    "code": "email_not_found",
+                    "field": "email",
+                    "message": "No account exists for this email. Check the spelling, or use Request Access.",
+                }
         raise HTTPException(status_code=401, detail=detail)
 
     logger.debug("[login] User found: id=%s is_active=%s role=%s", user.id, user.is_active, user.role)
@@ -280,7 +290,7 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
             db.refresh(user)
             logger.info("[login] Auto-linked user id=%s to employee id=%s", user.id, user.employee_id)
 
-    response_user = build_user_response(user, db)
+    response_user = build_user_response(user, db, pre_fetched_employee=employee)
     # HR uses the Admin login page but carries its own combined role.
     # Team leads use the PM login page: same portal, same layout, view-only once
     # inside. Without this they would be turned away as a "wrong portal" account.
