@@ -9,6 +9,8 @@ registry, so sharing the default one would make importing app.main after this
 module raise on duplicate names and take the rest of the suite with it.
 """
 import os
+if "VERCEL" in os.environ:
+    del os.environ["VERCEL"]
 
 import pytest
 from fastapi import FastAPI
