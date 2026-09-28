@@ -24,7 +24,7 @@ class User(Base):
     
     # Link to employee record (for pm/employee users)
     employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
-    employee = relationship("Employee", foreign_keys=[employee_id])
+    employee = relationship("Employee")
     
     # Skills stored as JSON array (used during signup)
     skills = Column(JSON, nullable=True)
