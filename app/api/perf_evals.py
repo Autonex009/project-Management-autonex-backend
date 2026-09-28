@@ -623,14 +623,26 @@ def create_eval(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    from calendar import monthrange
-    today = datetime.today()
-    last_day = monthrange(today.year, today.month)[1]
-    if today.day < last_day - 6:
-        raise HTTPException(
-            status_code=403,
-            detail="Performance evaluations can only be submitted during the last week of the month."
-        )
+    from zoneinfo import ZoneInfo
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    current_period = f"{now_ist.year:04d}-{now_ist.month:02d}"
+
+    if current_user.role != "admin":
+        if now_ist.day < 22:
+            raise HTTPException(
+                status_code=403,
+                detail="Performance evaluations can only be submitted between the 22nd and 25th of the month. The submission window has not opened yet.",
+            )
+        if now_ist.day > 25:
+            raise HTTPException(
+                status_code=403,
+                detail="The self-evaluation window closed on the 25th of the month. Submissions are locked to finalize monthly payroll processing.",
+            )
+        if payload.period != current_period:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Self-evaluations can only be submitted for the active month ({current_period}).",
+            )
 
     # Deliberately NOT has_team_read: submitting an evaluation *for* someone else is a
     # manager's action. A team lead falls through to the self-check below, so it can still
