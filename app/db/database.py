@@ -14,6 +14,11 @@ if DATABASE_URL is None:
     DATABASE_URL = "sqlite:///./autonex.db"
     print(f"Warning: No DATABASE_URL found in .env file. Using SQLite: {DATABASE_URL}")
 else:
+    # SQLAlchemy 2.1 defaults to psycopg (v3) for 'postgresql://'.
+    # We must explicitly force it to use psycopg2 since that's what we have installed.
+    if DATABASE_URL.startswith("postgresql://"):
+        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
+        
     # Print confirmation but hide password for security
     db_info = DATABASE_URL.split('@')[0] if '@' in DATABASE_URL else DATABASE_URL
     print(f"Using database: {db_info}...")

@@ -101,9 +101,9 @@ DESIGNATION_ACCESS = {
 }
 
 
-def _lookup_employee(user: User, db: Session) -> Optional[Employee]:
-    if hasattr(user, 'employee') and user.employee is not None:
-        return user.employee
+def _lookup_employee(user: User, db: Session, pre_fetched_employee: Optional[Employee] = None) -> Optional[Employee]:
+    if pre_fetched_employee:
+        return pre_fetched_employee
     employee = None
     if user.employee_id:
         employee = db.query(Employee).filter(Employee.id == user.employee_id).first()
@@ -112,10 +112,10 @@ def _lookup_employee(user: User, db: Session) -> Optional[Employee]:
     return employee
 
 
-def get_user_designation(user: User, db: Session, employee: Optional[Employee] = None) -> Optional[str]:
-    emp = employee or _lookup_employee(user, db)
-    if emp and emp.designation:
-        return emp.designation
+def get_user_designation(user: User, db: Session, pre_fetched_employee: Optional[Employee] = None) -> Optional[str]:
+    employee = _lookup_employee(user, db, pre_fetched_employee)
+    if employee and employee.designation:
+        return employee.designation
     if user.role == "admin":
         return "Admin"
     return None
@@ -127,8 +127,8 @@ def get_access_role(designation: Optional[str], fallback_role: str) -> str:
     return DESIGNATION_ACCESS.get(designation, fallback_role)
 
 
-def build_user_response(user: User, db: Session) -> UserResponse:
-    employee = user.employee if hasattr(user, 'employee') and user.employee is not None else _lookup_employee(user, db)
+def build_user_response(user: User, db: Session, pre_fetched_employee: Optional[Employee] = None) -> UserResponse:
+    employee = _lookup_employee(user, db, pre_fetched_employee)
     designation = get_user_designation(user, db, employee)
     access_role = get_access_role(designation, user.role)
     return UserResponse(
@@ -182,11 +182,21 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     """Authenticate with email + password, returns JWT."""
     logger.info("[login] Attempt: email=%s portal=%s", body.email, body.portal)
 
-    from sqlalchemy.orm import joinedload
-    user = db.query(User).options(joinedload(User.employee)).filter(User.email == body.email).first()
-    
+    # Fetch both the User and their associated Employee record in one single trip
+    # using an explicit outer join. This is 100% Vercel-safe because it doesn't
+    # rely on the SQLAlchemy model mapper's relationship bindings.
+    result = (
+        db.query(User, Employee)
+        .outerjoin(Employee, User.employee_id == Employee.id)
+        .filter(User.email == body.email)
+        .first()
+    )
+    user, employee = result if result else (None, None)
+
     if not user:
         logger.warning("[login] User not found: %s", body.email)
+        
+        # Check waitlist lazily before querying employee roster
         request_row = (
             db.query(SignupRequestRecord)
             .filter(SignupRequestRecord.email == body.email)
@@ -280,7 +290,7 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
             db.refresh(user)
             logger.info("[login] Auto-linked user id=%s to employee id=%s", user.id, user.employee_id)
 
-    response_user = build_user_response(user, db)
+    response_user = build_user_response(user, db, pre_fetched_employee=employee)
     # HR uses the Admin login page but carries its own combined role.
     # Team leads use the PM login page: same portal, same layout, view-only once
     # inside. Without this they would be turned away as a "wrong portal" account.

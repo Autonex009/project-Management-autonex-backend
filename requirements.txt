@@ -5,6 +5,7 @@ jinja2>=3.1.0
 pydantic>=2.0.0
 pydantic[email]
 python-dotenv>=1.0.0
+# used dev staging (incoming changes)
 psycopg2-binary==2.9.10
 python-jose[cryptography]>=3.3.0
 cryptography>=42.0.0
