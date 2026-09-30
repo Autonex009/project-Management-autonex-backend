@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, BackgroundTasks
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -443,20 +443,12 @@ def employee_document_history(
 
 # ── POST /api/employees/{id}/documents/bulk-generate ─────────────────────────
 
-@router.post("/{employee_id}/documents/bulk-generate")
-def bulk_generate_employee_documents(
-    employee_id: int,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """Generate (or regenerate) all auto-generatable documents for an employee.
-
-    Skips org_policy (must be uploaded manually). Returns per-doc results so the
-    frontend can show which succeeded and which failed without stopping on the first
-    error.
-    """
-    _get_employee_or_404(employee_id, db)
-
+def _bg_bulk_generate_docs(employee_id: int, user_id: int):
+    """Background worker for bulk document generation."""
+    from app.db.database import SessionLocal
+    from app.services.document_generator import generate_document
+    from app.services import audit_service
+    
     GENERATABLE = [
         "internship_offer_letter",
         "fulltime_offer_letter",
@@ -464,19 +456,19 @@ def bulk_generate_employee_documents(
         "experience_letter",
         "salary_structure",
     ]
-
-    results = []
+    
     for doc_type in GENERATABLE:
+        db = SessionLocal()
         try:
             doc = generate_document(
                 employee_id=employee_id,
                 doc_type=doc_type,
                 db=db,
-                uploaded_by=current_user.id,
+                uploaded_by=user_id,
             )
             audit_service.log(
                 db=db,
-                actor_id=current_user.id,
+                actor_id=user_id,
                 action="document_generated",
                 target_type="employee_document",
                 target_id=doc.id,
@@ -487,8 +479,27 @@ def bulk_generate_employee_documents(
                     "bulk": True,
                 },
             )
-            results.append({"doc_type": doc_type, "status": "ok", "version": doc.version})
+            db.commit()
         except Exception as exc:
-            results.append({"doc_type": doc_type, "status": "error", "detail": str(exc)})
+            logger.error("Bulk generate failed for %s (emp %s): %s", doc_type, employee_id, exc)
+            db.rollback()
+        finally:
+            db.close()
 
-    return {"employee_id": employee_id, "results": results}
+@router.post("/{employee_id}/documents/bulk-generate")
+def bulk_generate_employee_documents(
+    employee_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Queue bulk document generation to a background task."""
+    _get_employee_or_404(employee_id, db)
+    
+    background_tasks.add_task(
+        _bg_bulk_generate_docs,
+        employee_id=employee_id,
+        user_id=current_user.id
+    )
+
+    return {"message": "Bulk document generation started in background.", "employee_id": employee_id}

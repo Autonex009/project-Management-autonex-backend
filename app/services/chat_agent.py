@@ -13,12 +13,14 @@ import json
 import logging
 import os
 import uuid
+import asyncio
 from datetime import date, datetime
 from typing import AsyncGenerator, Optional
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 from sqlalchemy.orm import Session
 
+from app.db.database import SessionLocal
 from app.models.chat import ChatConversation, ChatMessage
 from app.models.employee import Employee
 from app.services import chat_tools
@@ -32,11 +34,11 @@ MODEL = "deepseek-chat"
 BASE_URL = "https://api.deepseek.com"
 
 
-def _get_client() -> OpenAI:
+def _get_client() -> AsyncOpenAI:
     api_key = os.getenv("CHATBOT_API_KEY")
     if not api_key:
         raise RuntimeError("CHATBOT_API_KEY not set")
-    return OpenAI(api_key=api_key, base_url=BASE_URL)
+    return AsyncOpenAI(api_key=api_key, base_url=BASE_URL)
 
 
 # ── System Prompt ───────────────────────────────────────────────────
@@ -327,6 +329,28 @@ def _save_message(
     db.commit()
 
 
+def _sync_fetch_init_data(employee_id: int, conversation_id: str, message: str, user_id: int, role: str) -> list[dict]:
+    with SessionLocal() as db:
+        employee = db.query(Employee).filter(Employee.id == employee_id).first()
+        employee_name = employee.name if employee else "User"
+        employee_type = employee.employee_type if employee else "Full-time"
+        
+        messages = [
+            {"role": "system", "content": _build_system_prompt(employee_name, employee_type, role)},
+            *_load_history(conversation_id, db),
+            {"role": "user", "content": message},
+        ]
+        _save_message(conversation_id, user_id, "user", message, db=db)
+        return messages
+
+def _sync_execute_tool_wrapped(tool_name: str, tool_args: dict, employee_id: int) -> dict:
+    with SessionLocal() as db:
+        return _execute_tool(tool_name, tool_args, employee_id, db)
+
+def _sync_save_model_response(conversation_id: str, user_id: int, final_text: str):
+    with SessionLocal() as db:
+        _save_message(conversation_id, user_id, "model", final_text, db=db)
+
 # ── Main chat function (streaming SSE) ──────────────────────────────
 async def chat_stream(
     message: str,
@@ -334,50 +358,25 @@ async def chat_stream(
     user_id: int,
     employee_id: int,
     role: str,
-    db: Session,
 ) -> AsyncGenerator[str, None]:
     """
     Process a chat message and yield SSE events.
-
-    Yields JSON strings formatted as SSE data lines:
-    - {"type": "token", "content": "..."}
-    - {"type": "tool_call", "tool": "...", "status": "running"}
-    - {"type": "tool_result", "tool": "...", "data": {...}}
-    - {"type": "action_confirm", "action": "...", "details": {...}}
-    - {"type": "done"}
-    - {"type": "error", "message": "..."}
     """
     try:
         client = _get_client()
 
-        # Get employee info for system prompt
-        employee = db.query(Employee).filter(Employee.id == employee_id).first()
-        employee_name = employee.name if employee else "User"
-        employee_type = employee.employee_type if employee else "Full-time"
+        messages = await asyncio.to_thread(
+            _sync_fetch_init_data, employee_id, conversation_id, message, user_id, role
+        )
 
-        # The system prompt is a message here rather than a separate field, which is the
-        # OpenAI-compatible shape DeepSeek expects.
-        messages = [
-            {"role": "system", "content": _build_system_prompt(employee_name, employee_type, role)},
-            *_load_history(conversation_id, db),
-            {"role": "user", "content": message},
-        ]
+        response = await client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            tools=TOOL_DEFINITIONS,
+            temperature=0.7,
+            max_tokens=2048,
+        )
 
-        # Save user message
-        _save_message(conversation_id, user_id, "user", message, db=db)
-
-        def _complete(msgs: list[dict]):
-            return client.chat.completions.create(
-                model=MODEL,
-                messages=msgs,
-                tools=TOOL_DEFINITIONS,
-                temperature=0.7,
-                max_tokens=2048,
-            )
-
-        response = _complete(messages)
-
-        # Process response — may need multiple rounds for tool calls
         max_rounds = 5
         final_text = ""
 
@@ -386,16 +385,12 @@ async def chat_stream(
             tool_calls = choice.tool_calls or []
 
             if not tool_calls:
-                # No more tool calls — collect final text
                 final_text += choice.content or ""
                 break
 
-            # Any prose the model emitted alongside the tool calls goes out first.
             if choice.content:
                 yield json.dumps({"type": "token", "content": choice.content})
 
-            # The assistant turn must be replayed verbatim before its tool results, or the
-            # next request has tool responses answering nothing.
             messages.append({
                 "role": "assistant",
                 "content": choice.content or "",
@@ -414,76 +409,50 @@ async def chat_stream(
 
             for call in tool_calls:
                 tool_name = call.function.name
-                # Arguments arrive as a JSON *string*, and a model can emit malformed JSON.
-                # Treating that as "no arguments" keeps the conversation alive instead of
-                # collapsing the whole reply into an error.
                 try:
                     tool_args = json.loads(call.function.arguments or "{}")
                 except (TypeError, ValueError):
-                    logger.warning(
-                        "Unparseable arguments for tool %s: %r",
-                        tool_name, call.function.arguments,
-                    )
+                    logger.warning("Unparseable arguments for tool %s: %r", tool_name, call.function.arguments)
                     tool_args = {}
 
-                yield json.dumps({
-                    "type": "tool_call",
-                    "tool": tool_name,
-                    "status": "running",
-                })
+                yield json.dumps({"type": "tool_call", "tool": tool_name, "status": "running"})
 
-                result = _execute_tool(tool_name, tool_args, employee_id, db)
+                result = await asyncio.to_thread(_sync_execute_tool_wrapped, tool_name, tool_args, employee_id)
 
-                yield json.dumps({
-                    "type": "tool_result",
-                    "tool": tool_name,
-                    "data": result,
-                })
+                yield json.dumps({"type": "tool_result", "tool": tool_name, "data": result})
 
-                # Check if this is a confirmation action
                 if result.get("requires_confirmation"):
-                    yield json.dumps({
-                        "type": "action_confirm",
-                        "action": result["action"],
-                        "details": result["details"],
-                    })
+                    yield json.dumps({"type": "action_confirm", "action": result["action"], "details": result["details"]})
 
-                # Each result is addressed to the call that asked for it; without the id
-                # the API cannot pair them up.
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.id,
                     "content": json.dumps(result, default=str),
                 })
 
-            # Continue the conversation with tool results
-            response = _complete(messages)
-        else:
-            # Ran out of rounds with the model still asking for tools. Say so rather than
-            # returning an empty bubble.
-            logger.warning("Chat hit the %d-round tool limit", max_rounds)
-            final_text = final_text or (
-                "I wasn't able to finish that — could you rephrase or narrow it down?"
+            response = await client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                tools=TOOL_DEFINITIONS,
+                temperature=0.7,
+                max_tokens=2048,
             )
+        else:
+            logger.warning("Chat hit the %d-round tool limit", max_rounds)
+            final_text = final_text or ("I wasn't able to finish that — could you rephrase or narrow it down?")
 
-        # Yield the final text in chunks for streaming feel
         if final_text:
-            # Stream by splitting on line boundaries first, then sub-chunk long lines.
-            # This preserves ALL whitespace and markdown formatting exactly.
             lines = final_text.split("\n")
             for line_idx, line in enumerate(lines):
-                # Add newline back (except last line)
                 line_with_nl = line + ("\n" if line_idx < len(lines) - 1 else "")
-                # Sub-chunk long lines at ~40 char boundaries (on word boundaries)
                 if len(line_with_nl) > 50:
                     pos = 0
                     while pos < len(line_with_nl):
                         end = min(pos + 40, len(line_with_nl))
-                        # Extend to next space boundary to avoid splitting words
                         if end < len(line_with_nl):
                             space_pos = line_with_nl.find(" ", end)
                             if space_pos != -1 and space_pos < end + 15:
-                                end = space_pos + 1  # Include the space
+                                end = space_pos + 1
                             else:
                                 end = min(pos + 55, len(line_with_nl))
                         yield json.dumps({"type": "token", "content": line_with_nl[pos:end]})
@@ -491,10 +460,8 @@ async def chat_stream(
                 else:
                     yield json.dumps({"type": "token", "content": line_with_nl})
 
-        # Save assistant response
-        _save_message(conversation_id, user_id, "model", final_text, db=db)
+        await asyncio.to_thread(_sync_save_model_response, conversation_id, user_id, final_text)
 
-        # Done
         yield json.dumps({"type": "done"})
 
     except Exception as e:

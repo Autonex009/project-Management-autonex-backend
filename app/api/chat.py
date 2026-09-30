@@ -55,7 +55,6 @@ class CancelLeaveRequest(BaseModel):
 async def stream_chat(
     body: ChatRequest,
     user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
 ):
     """
     Streaming chat endpoint using Server-Sent Events (SSE).
@@ -83,7 +82,6 @@ async def stream_chat(
             user_id=user.id,
             employee_id=employee_id,
             role=role,
-            db=db,
         ):
             yield f"data: {event_data}\n\n"
 
