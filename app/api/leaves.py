@@ -5,7 +5,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from typing import List, Optional
 from app.utils.business_time import now_ist, today_ist
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Query, Body, BackgroundTasks
 from fastapi import Request as HTTPRequest
 from sqlalchemy.orm import Session
 from sqlalchemy import or_
@@ -1147,10 +1147,113 @@ def validate_consecutive_leaves(
 
 
 
+
+def _bg_notify_leave_applied(leave_id: int, exceeds_by: float):
+    """Background worker to handle Slack and in-app notifications without holding a route connection."""
+    from app.db.database import SessionLocal
+    with SessionLocal() as db:
+        leave = db.query(Leave).filter(Leave.id == leave_id).first()
+        if not leave:
+            return
+        employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
+        if not employee:
+            return
+            
+        leave._exceeds_by = exceeds_by  # Restore the dynamic property
+
+        # In-app notification: employee who applied
+        emp_user = db.query(User).filter(User.employee_id == employee.id).first()
+        if emp_user:
+            _push_notification(
+                db, emp_user.id,
+                "Leave request submitted",
+                f"Your {get_leave_type_label(leave.leave_type)} request ({leave.start_date} – {leave.end_date}) has been submitted and is pending approval.",
+                "leave_applied",
+            )
+            db.commit()
+
+        employee.slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
+
+        try_send_leave_applied_message(
+            employee_name=employee.name,
+            employee_email=employee.email,
+            leave_type=get_leave_type_label(leave.leave_type),
+            start_date=leave.start_date.isoformat(),
+            end_date=leave.end_date.isoformat(),
+        )
+
+        duration_days = 0.5 if leave.is_half_day else (leave.end_date - leave.start_date).days + 1
+        escalates_to_admin = project_scope.escalates_to_admin(db, employee.id)
+        escalates_to_pm = project_scope.escalates_to_pm(db, employee.id)
+        pm_targets = (
+            [] if escalates_to_admin else _get_pm_notification_targets(db, employee, leave)
+        )
+        if escalates_to_admin or not pm_targets:
+            notification_targets = _get_admin_notification_targets(db)
+        elif escalates_to_pm:
+            notification_targets = pm_targets + _get_admin_notification_targets(db)
+        else:
+            notification_targets = pm_targets
+            
+        notified_user_ids = set()
+        ts_list = []
+        ch_list = []
+        for target in notification_targets:
+            ts, ch = try_send_pm_leave_request_message(
+                pm_slack_user_id=target["pm_slack_user_id"],
+                pm_name=target["pm_employee"].name,
+                employee_name=employee.name,
+                employee_email=employee.email,
+                employee_designation=employee.designation,
+                leave_type=get_leave_type_label(leave.leave_type),
+                start_date=leave.start_date.isoformat(),
+                end_date=leave.end_date.isoformat(),
+                duration_days=duration_days,
+                reason=leave.reason,
+                impacted_projects=target["impacted_projects"],
+                leave_id=leave.id,
+                exceeds_limit=leave.flagged or False,
+                leave_balances_text=get_leave_balances_text(db, employee),
+                exceeds_limit_text=f"by {exceeds_by} days (Approval requires a mandatory remark)." if exceeds_by > 0 else None,
+            )
+            if ts and ch:
+                ts_list.append(ts)
+                ch_list.append(ch)
+                
+            pm_emp_id = getattr(target["pm_employee"], "id", None)
+            if pm_emp_id:
+                pm_user = db.query(User).filter(User.employee_id == pm_emp_id).first()
+                if pm_user and pm_user.id not in notified_user_ids:
+                    notified_user_ids.add(pm_user.id)
+                    _push_notification(
+                        db, pm_user.id,
+                        f"New leave request from {employee.name}",
+                        f"{employee.name} has requested {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date}.",
+                        "leave_applied",
+                    )
+
+        if ts_list:
+            leave.slack_pm_message_ts = ",".join(ts_list)
+            leave.slack_pm_channel_id = ",".join(ch_list)
+            db.commit()
+
+        if not pm_targets:
+            for admin_user in db.query(User).filter(User.role == "admin", User.is_active == True).all():
+                if admin_user.id not in notified_user_ids:
+                    notified_user_ids.add(admin_user.id)
+                    _push_notification(
+                        db, admin_user.id,
+                        f"New leave request from {employee.name}",
+                        f"{employee.name} has requested {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date} (no PM assigned).",
+                        "leave_applied",
+                    )
+        db.commit()
+
 @router.post("", response_model=LeaveSchema, status_code=201)
 def create_leave(
     payload: LeaveCreate,
     http_request: HTTPRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1324,105 +1427,8 @@ def create_leave(
         request=http_request,
     )
 
-    # In-app notification: employee who applied
-    emp_user = db.query(User).filter(User.employee_id == employee.id).first()
-    if emp_user:
-        _push_notification(
-            db, emp_user.id,
-            "Leave request submitted",
-            f"Your {get_leave_type_label(leave.leave_type)} request ({leave.start_date} – {leave.end_date}) has been submitted and is pending approval.",
-            "leave_applied",
-        )
-        db.commit()
-
-    employee.slack_user_id = try_get_or_cache_employee_slack_user_id(db, employee)
-
-    try_send_leave_applied_message(
-        employee_name=employee.name,
-        employee_email=employee.email,
-        leave_type=get_leave_type_label(leave.leave_type),
-        start_date=leave.start_date.isoformat(),
-        end_date=leave.end_date.isoformat(),
-    )
-
-    duration_days = 0.5 if leave.is_half_day else (leave.end_date - leave.start_date).days + 1
-    # Who is asked to decide, by the applicant's tier (see services/project_scope.py):
-    #
-    #   manager (PM / project manager / HR) → Admin only; no peer approves a peer
-    #   team lead                           → their project's PM *and* Admin
-    #   everyone else                       → the PM(s) and lead(s) of their projects,
-    #                                         falling back to Admin when none resolve
-    #
-    # Decided by designation rather than users.role so notification and approval agree on
-    # one definition, and so a person's rank is the same on every project they are on —
-    # a manager's own request escalates to Admin wherever they happen to be allocated.
-    escalates_to_admin = project_scope.escalates_to_admin(db, employee.id)
-    escalates_to_pm = project_scope.escalates_to_pm(db, employee.id)
-    pm_targets = (
-        [] if escalates_to_admin else _get_pm_notification_targets(db, employee, leave)
-    )
-    if escalates_to_admin or not pm_targets:
-        notification_targets = _get_admin_notification_targets(db)
-    elif escalates_to_pm:
-        notification_targets = pm_targets + _get_admin_notification_targets(db)
-    else:
-        notification_targets = pm_targets
-    notified_user_ids: set[int] = set()
-    ts_list = []
-    ch_list = []
-    for target in notification_targets:
-        ts, ch = try_send_pm_leave_request_message(
-            pm_slack_user_id=target["pm_slack_user_id"],
-            pm_name=target["pm_employee"].name,
-            employee_name=employee.name,
-            employee_email=employee.email,
-            employee_designation=employee.designation,
-            leave_type=get_leave_type_label(leave.leave_type),
-            start_date=leave.start_date.isoformat(),
-            end_date=leave.end_date.isoformat(),
-            duration_days=duration_days,
-            reason=leave.reason,
-            impacted_projects=target["impacted_projects"],
-            leave_id=leave.id,
-            exceeds_limit=leave.flagged or False,
-            leave_balances_text=get_leave_balances_text(db, employee),
-            exceeds_limit_text=f"by {leave._exceeds_by} days (Approval requires a mandatory remark)." if getattr(leave, '_exceeds_by', 0) > 0 else None,
-        )
-        if ts and ch:
-            ts_list.append(ts)
-            ch_list.append(ch)
-            
-        # In-app notification for PM (real PM only — admin fallback handled below)
-        pm_emp_id = getattr(target["pm_employee"], "id", None)
-        if pm_emp_id:
-            pm_user = db.query(User).filter(User.employee_id == pm_emp_id).first()
-            if pm_user and pm_user.id not in notified_user_ids:
-                notified_user_ids.add(pm_user.id)
-                _push_notification(
-                    db, pm_user.id,
-                    f"New leave request from {employee.name}",
-                    f"{employee.name} has requested {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date}.",
-                    "leave_applied",
-                )
-
-    if ts_list:
-        leave.slack_pm_message_ts = ",".join(ts_list)
-        leave.slack_pm_channel_id = ",".join(ch_list)
-        db.commit()
-
-    # Admin fallback: notify each admin exactly once (regardless of Slack-reachable count)
-    if not pm_targets:
-        for admin_user in db.query(User).filter(User.role == "admin", User.is_active == True).all():
-            if admin_user.id not in notified_user_ids:
-                notified_user_ids.add(admin_user.id)
-                _push_notification(
-                    db, admin_user.id,
-                    f"New leave request from {employee.name}",
-                    f"{employee.name} has requested {get_leave_type_label(leave.leave_type)} leave from {leave.start_date} to {leave.end_date} (no PM assigned).",
-                    "leave_applied",
-                )
-    db.commit()
-    db.refresh(leave)
+    # Enqueue Slack and in-app notifications in the background
+    background_tasks.add_task(_bg_notify_leave_applied, leave.id, exceeds_by)
 
     return _leave_to_schema(leave)
 
