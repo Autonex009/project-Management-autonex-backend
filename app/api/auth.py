@@ -5,7 +5,7 @@ import logging
 import os
 import re
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status, BackgroundTasks
 from sqlalchemy.orm import Session
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
@@ -352,7 +352,7 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
 
 
 @router.post("/forgot-password", response_model=MessageResponse)
-def forgot_password(body: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)):
+def forgot_password(body: ForgotPasswordRequest, request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
     Request a password reset link.
 
@@ -417,22 +417,17 @@ def forgot_password(body: ForgotPasswordRequest, request: Request, db: Session =
             reset_link=reset_link,
         )
 
-    # ── Production: send email ──────────────────────────────────────
-    try:
-        logger.info("[forgot-password] Sending reset email to %s", user.email)
-        send_password_reset_email(to_email=user.email, to_name=user.name, reset_link=reset_link)
-        logger.info("[forgot-password] Email sent to %s", user.email)
-    except Exception as exc:
-        logger.error("[forgot-password] Email send failed for %s: %s", user.email, exc)
-        # Roll back token so user can retry
-        user.password_reset_token_hash = None
-        user.password_reset_expires_at = None
-        db.add(user)
-        db.commit()
-        raise HTTPException(
-            status_code=503,
-            detail="Failed to send reset email. Please try again later.",
-        ) from exc
+    # ── Production: send email in background ────────────────────────
+    # We commit the DB transaction *before* the SMTP handshake, and use 
+    # BackgroundTasks to prevent the 14-connection pool from being exhausted 
+    # by unauthenticated email requests.
+    background_tasks.add_task(
+        send_password_reset_email,
+        to_email=user.email,
+        to_name=user.name,
+        reset_link=reset_link
+    )
+    logger.info("[forgot-password] Reset email queued for background delivery to %s", user.email)
 
     # The address is confirmed at this point, so name it: people check the wrong
     # mailbox otherwise.
