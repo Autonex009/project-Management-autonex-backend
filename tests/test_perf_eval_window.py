@@ -72,7 +72,7 @@ def client_and_db():
     Base.metadata.drop_all(bind=engine)
 
 
-def test_submission_window_before_22nd_rejected(client_and_db):
+def test_submission_window_before_20th_rejected(client_and_db):
     client, db, auth_state = client_and_db
     emp = Employee(id=1, name="Alice", email="alice@x.com", employee_type="Full-time", status="active")
     user = User(id=1, email="alice@x.com", password_hash="hash", name="Alice", role="employee", employee_id=1, is_active=True)
@@ -80,8 +80,8 @@ def test_submission_window_before_22nd_rejected(client_and_db):
     db.add_all([emp, user])
     db.commit()
 
-    # Mock IST date to 21st September 2026
-    fake_now = datetime(2026, 9, 21, 14, 30, tzinfo=ZoneInfo("Asia/Kolkata"))
+    # Mock IST date to 19th September 2026
+    fake_now = datetime(2026, 9, 19, 14, 30, tzinfo=ZoneInfo("Asia/Kolkata"))
     with patch("app.api.perf_evals.datetime") as mock_dt:
         mock_dt.now.return_value = fake_now
         payload = {
@@ -93,10 +93,10 @@ def test_submission_window_before_22nd_rejected(client_and_db):
         }
         resp = client.post("/api/perf-evals", json=payload)
         assert resp.status_code == 403
-        assert "between the 22nd and the end of the month" in resp.json()["detail"]
+        assert "between the 20th and 24th" in resp.json()["detail"]
 
 
-def test_submission_window_after_end_of_month_rejected(client_and_db):
+def test_submission_window_after_24th_rejected(client_and_db):
     client, db, auth_state = client_and_db
     emp = Employee(id=1, name="Alice", email="alice@x.com", employee_type="Full-time", status="active")
     user = User(id=1, email="alice@x.com", password_hash="hash", name="Alice", role="employee", employee_id=1, is_active=True)
@@ -104,8 +104,8 @@ def test_submission_window_after_end_of_month_rejected(client_and_db):
     db.add_all([emp, user])
     db.commit()
 
-    # Mock IST date to 1st October 2026 (closed window for September)
-    fake_now = datetime(2026, 10, 1, 9, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
+    # Mock IST date to 25th September 2026
+    fake_now = datetime(2026, 9, 25, 9, 0, tzinfo=ZoneInfo("Asia/Kolkata"))
     with patch("app.api.perf_evals.datetime") as mock_dt:
         mock_dt.now.return_value = fake_now
         payload = {
@@ -117,10 +117,10 @@ def test_submission_window_after_end_of_month_rejected(client_and_db):
         }
         resp = client.post("/api/perf-evals", json=payload)
         assert resp.status_code == 403
-        assert "The submission window has not opened yet" in resp.json()["detail"]
+        assert "between the 20th and 24th" in resp.json()["detail"]
 
 
-def test_submission_window_between_22nd_and_end_of_month_accepted(client_and_db):
+def test_submission_window_between_20th_and_24th_accepted(client_and_db):
     client, db, auth_state = client_and_db
     emp = Employee(id=1, name="Alice", email="alice@x.com", employee_type="Full-time", status="active")
     user = User(id=1, email="alice@x.com", password_hash="hash", name="Alice", role="employee", employee_id=1, is_active=True)

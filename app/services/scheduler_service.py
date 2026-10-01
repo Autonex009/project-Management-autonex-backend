@@ -953,6 +953,19 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
+    # Monthly self-evaluation reminder on the 20th
+    _scheduler.add_job(
+        _scheduled_self_eval_reminder,
+        trigger="cron",
+        day=20,
+        hour=9,
+        minute=0,
+        id="monthly_self_eval_reminder",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     logger.info(
         "[scheduler] Started — Encord sync every %s min; hiring sync %s",
         ENCORD_SYNC_MINUTE,
@@ -1029,6 +1042,46 @@ def _scheduled_monthly_work_model_sync() -> None:
     finally:
         db.close()
 
+
+def _scheduled_self_eval_reminder() -> None:
+    from app.models.employee import Employee
+    from app.services.slack_service import try_send_self_eval_reminder, SlackRateLimitError
+    import time
+    
+    db = SessionLocal()
+    targets = []
+    try:
+        # Fetch active employees who have a slack_user_id
+        # Depending on how 'active' is defined, we assume slack_user_id is enough, 
+        # or we might need Employee.status != 'inactive' if that column exists.
+        employees = db.query(Employee).filter(
+            Employee.slack_user_id.isnot(None)
+        ).all()
+        # Collect info into dicts so we don't hold ORM objects across async sleep boundaries
+        targets = [{"slack_id": emp.slack_user_id, "name": emp.name} for emp in employees]
+    except Exception as exc:
+        logger.exception("[scheduler] Failed to query employees for self-eval reminder: %s", exc)
+        return
+    finally:
+        db.close() # Return connection to pool!
+
+    if not targets:
+        return
+
+    sent = 0
+    for target in targets:
+        try:
+            ts, channel_id = try_send_self_eval_reminder(target["slack_id"], target["name"])
+            if ts and channel_id:
+                sent += 1
+                time.sleep(1.5)
+        except SlackRateLimitError as exc:
+            logger.warning("[scheduler] Rate limit hit sending self-eval reminder to %s, sleeping %s seconds...", target["name"], exc.retry_after_seconds)
+            time.sleep(exc.retry_after_seconds)
+        except Exception as exc:
+            logger.error("[scheduler] Failed sending self-eval reminder to %s: %s", target["name"], exc)
+    
+    logger.info("[scheduler] Self-eval reminders sent to %d/%d active employees.", sent, len(targets))
 
 def shutdown_scheduler() -> None:
     # guard against double-shutdown if called more than once

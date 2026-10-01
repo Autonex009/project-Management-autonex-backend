@@ -2342,3 +2342,46 @@ def try_overwrite_deleted_message(channel_id: str, ts: str):
         )
     except Exception as e:
         logger.error(f"Failed to overwrite deleted slack message: {e}")
+
+def try_send_self_eval_reminder(employee_slack_user_id: str, employee_name: str) -> tuple[str | None, str | None]:
+    """DM an employee reminding them about the self-evaluation window (20th-24th)."""
+    channel_id = open_direct_message_channel(employee_slack_user_id)
+    portal_url = (os.getenv("FRONTEND_URL") or "http://localhost:5173").strip().rstrip("/")
+    eval_url = f"{portal_url}/employee/self-evaluation"
+    
+    response = _slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": f"Self-Evaluation Window Open: {employee_name}, please submit your self-evaluation.",
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Monthly Self-Evaluation is Open!*\n\nHi {employee_name}, the self-evaluation window is open from the *20th to the 24th* of this month.\n\nCompleting your self-evaluation is *required* to remain eligible for the monthly bonus. Please submit it before the window closes on the 24th."
+                    }
+                },
+                {
+                    "type": "actions",
+                    "elements": [
+                        {
+                            "type": "button",
+                            "text": {
+                                "type": "plain_text",
+                                "text": "Complete Self-Evaluation",
+                                "emoji": True
+                            },
+                            "style": "primary",
+                            "url": eval_url,
+                            "action_id": "go_to_self_eval"
+                        }
+                    ]
+                }
+            ]
+        }
+    )
+    if response.get("ok"):
+        return (response.get("ts"), channel_id)
+    logger.error(f"Failed to send self-eval reminder to {employee_slack_user_id}: {response.get('error')}")
+    return (None, None)
