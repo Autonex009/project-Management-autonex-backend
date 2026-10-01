@@ -302,7 +302,7 @@ def create_employee(
 
 
 # ✅ LIST EMPLOYEES
-@router.get("", response_model=list[EmployeeResponse], dependencies=[Depends(require_role("admin", "pm"))])
+@router.get("", response_model=list[EmployeeResponse], dependencies=[Depends(require_role("admin", "pm", "team_lead"))])
 def list_employees(
     status: str = None,
     include_archived: bool = False,
