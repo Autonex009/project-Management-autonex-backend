@@ -90,11 +90,18 @@ def env():
     api.dependency_overrides[database.get_db] = override_get_db
     api.dependency_overrides[get_current_user] = lambda: _CALLER["user"]
 
+    import app.db.database as database_module
+    original_session_local = database_module.SessionLocal
+    database_module.SessionLocal = TestingSessionLocal
+
     db = TestingSessionLocal()
     seeded = _seed(db)
-    yield TestClient(api), db, seeded
-    db.close()
-    Base.metadata.drop_all(bind=engine)
+    try:
+        yield TestClient(api), db, seeded
+    finally:
+        database_module.SessionLocal = original_session_local
+        db.close()
+        Base.metadata.drop_all(bind=engine)
 
 
 def _seed(db):
