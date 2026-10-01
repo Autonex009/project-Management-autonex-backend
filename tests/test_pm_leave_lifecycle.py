@@ -91,10 +91,15 @@ def client_and_db():
     original_trigger = wfh_module.trigger_wfh_revalidation
     wfh_module.trigger_wfh_revalidation = lambda x: None
 
+    import app.db.database as database_module
+    original_session_local = database_module.SessionLocal
+    database_module.SessionLocal = TestingSessionLocal
+
     db = TestingSessionLocal()
     try:
         yield TestClient(app), db
     finally:
+        database_module.SessionLocal = original_session_local
         wfh_module.trigger_wfh_revalidation = original_trigger
         db.close()
         Base.metadata.drop_all(bind=engine)
