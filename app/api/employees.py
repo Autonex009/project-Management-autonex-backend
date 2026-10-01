@@ -121,8 +121,8 @@ def get_employees_slim(
     if status:
         query = query.filter(Employee.status == status)
 
+    from app.services import project_scope
     if team_only and current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
-        from app.services import project_scope
         manageable = project_scope.get_manageable_employee_ids(db, current_user)
         if manageable is not None:
             if not manageable:
@@ -1841,6 +1841,10 @@ async def trigger_encord_sync(
                 return run_user_sync(db_inline, log_id, employee_id, start_dt, end_dt)
             finally:
                 db_inline.close()
+        
+        # We MUST release the HTTP route's DB connection BEFORE waiting on the background thread.
+        # Otherwise, 1 user consumes 2 database connections simultaneously (Double-Booking).
+        db.close()
         
         try:
             result = await asyncio.to_thread(_inline)

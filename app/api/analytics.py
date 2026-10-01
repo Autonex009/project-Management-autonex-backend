@@ -334,12 +334,25 @@ def _get_pm_associated_sub_project_ids(db: Session, current_user: User) -> Optio
 
 
 def is_autonex_email(email: str | None) -> bool:
-    # Includes all Encord IDs ending with encord.com or .ai (e.g. _theta@encord.ai, _kappa@encord.ai,
-    # aryan.mundra@encord.ai, sukrut@encord.com, etc.)
     if not email:
         return False
     e = email.strip().lower()
-    return e.endswith(AUTONEX_EMAIL_DOMAINS)
+    
+    # Must be an encord.ai email
+    if not e.endswith("@encord.ai"):
+        return False
+        
+    # 1. Allow our vendor (Theta)
+    if e.endswith("_theta@encord.ai"):
+        return True
+        
+    # 2. Block other vendors who use an underscore before the domain
+    # Example: annotator12_kappa@encord.ai will be blocked
+    if "_" in e.split("@")[0]: 
+        return False
+        
+    # 3. Allow direct employees
+    return True
 
 
 # Annotator / reviewer HEAD-COUNTS are classified by the Encord workflow stage the
@@ -473,6 +486,32 @@ def _rows_for(db: Session, sp: DailySheet, start: date, end: date):
         q = q.filter(EncordDailyTimeSpent.encord_project_hash == sp.encord_project_hash)
     else:
         q = q.filter(EncordDailyTimeSpent.sub_project_id == sp.id)
+
+    # Restrict data to *only* people who are currently allocated to the project
+    # (or allow our vendor _theta explicitly, if they aren't in Allocation)
+    allocated_emp_ids = db.query(Employee.encord_id).join(
+        Allocation, Allocation.employee_id == Employee.id
+    ).filter(
+        Allocation.sub_project_id == sp.id,
+        Allocation.is_active == True,
+        Employee.encord_id.isnot(None)
+    ).all()
+
+    allocated_emails = [_norm_encord(r[0]) for r in allocated_emp_ids if r[0]]
+
+    # Also include the _theta vendor since they might not be directly allocated in the Employee table
+    from sqlalchemy import or_
+    
+    if allocated_emails:
+        q = q.filter(
+            or_(
+                _sql_norm_encord(EncordDailyTimeSpent.user_email).in_(allocated_emails),
+                EncordDailyTimeSpent.user_email.ilike("%_theta@encord.ai")
+            )
+        )
+    else:
+        q = q.filter(EncordDailyTimeSpent.user_email.ilike("%_theta@encord.ai"))
+
     return q.all()
 
 
@@ -567,6 +606,33 @@ def project_analytics(
             "total_hours": _hours(total),
             "daily": [{"date": d.isoformat(), "hours": _hours(s)} for d, s in sorted(days.items())],
         })
+        
+    # Append any active allocated team members who logged 0 hours
+    from app.models.allocation import Allocation
+    from app.models.employee import Employee
+    
+    # OPTIMIZATION: Targeted column query instead of loading full objects
+    allocated_employees = (
+        db.query(Employee.name, Employee.email, Employee.encord_id)
+        .join(Allocation, Allocation.employee_id == Employee.id)
+        .filter(Allocation.sub_project_id == sub_project_id, Allocation.is_active == True)
+        .all()
+    )
+    
+    # OPTIMIZATION: Normalize the keys to ensure case-insensitive matching O(1)
+    existing_emails_normalized = {_norm_encord(k) for k in user_daily.keys()}
+    
+    for emp_name, emp_email_fallback, emp_encord_id in allocated_employees:
+        email_to_use = emp_encord_id or emp_email_fallback
+        if email_to_use and _norm_encord(email_to_use) not in existing_emails_normalized:
+            annotators.append({
+                "user_email": email_to_use,
+                "employee_name": emp_name,
+                "role": "Allocated",
+                "total_hours": 0.0,
+                "daily": []
+            })
+            
     annotators.sort(key=lambda a: a["total_hours"], reverse=True)
 
     # Fixed reference windows (independent of the selected range), all ending today:

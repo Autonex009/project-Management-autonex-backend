@@ -74,10 +74,17 @@ def client_and_db():
     app.dependency_overrides[database.get_db] = override_get_db
     app.dependency_overrides[get_current_user] = override_get_current_user
 
+    import app.db.database as database_module
+    original_session_local = database_module.SessionLocal
+    database_module.SessionLocal = TestingSessionLocal
+
     db = TestingSessionLocal()
-    yield TestClient(app), db
-    db.close()
-    Base.metadata.drop_all(bind=engine)
+    try:
+        yield TestClient(app), db
+    finally:
+        database_module.SessionLocal = original_session_local
+        db.close()
+        Base.metadata.drop_all(bind=engine)
 
 
 def _seed_employee(db):

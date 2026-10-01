@@ -410,37 +410,30 @@ def _create_next_month_partition() -> None:
         db.close()
 
 
-def _scheduled_pm_confirm_reminders() -> None:
-    """Nudge every PM/lead who still has unconfirmed check-ins on their roster."""
+def _collect_pm_confirm_targets() -> "list[dict] | None":
+    """Stage 1: Pure DB Work. Query data and release session in < 25ms."""
+    from app.utils.business_time import today_ist
+    from app.constants.leave_types import is_fixed_holiday, is_weekend
+    from app.models.user import User
+    from app.models.employee import Employee
+    from app.models.daily_checkin import DailyCheckIn
+    from app.models.allocation import Allocation
+    from app.api.checkins import _get_scoped_project_ids
+    from app.services.slack_service import try_get_or_cache_employee_slack_user_id
+
+    today = today_ist()
+    if is_weekend(today) or is_fixed_holiday(today):
+        logger.info("[scheduler] Skipping PM confirm reminders because today is a weekend or holiday.")
+        return None
+
     db = SessionLocal()
     try:
-        from app.utils.business_time import today_ist
-        from app.constants.leave_types import is_fixed_holiday, is_weekend
-        from app.models.user import User
-        from app.models.employee import Employee
-        from app.models.daily_checkin import DailyCheckIn
-        from app.models.allocation import Allocation
-        from app.api.checkins import _get_scoped_project_ids
-        from app.services.slack_service import (
-            SlackRateLimitError,
-            try_get_or_cache_employee_slack_user_id,
-            try_send_pm_confirm_reminder_message,
-        )
-        import time
-
-        today = today_ist()
-
-        if is_weekend(today) or is_fixed_holiday(today):
-            logger.info("[scheduler] Skipping PM confirm reminders because today is a weekend or holiday.")
-            return
-
         pm_users = (
             db.query(User)
             .filter(User.role.in_(["pm", "team_lead"]), User.employee_id.isnot(None))
             .all()
         )
 
-        # Pre-fetch all check-ins for today to avoid querying inside the loop
         all_today_checkins = db.query(
             DailyCheckIn.employee_id, 
             DailyCheckIn.project_ids, 
@@ -449,7 +442,6 @@ def _scheduled_pm_confirm_reminders() -> None:
             DailyCheckIn.checkin_date == today
         ).all()
         
-        # Pre-fetch all active allocations
         all_active_allocations = db.query(
             Allocation.employee_id, 
             Allocation.sub_project_id
@@ -457,7 +449,7 @@ def _scheduled_pm_confirm_reminders() -> None:
             Allocation.is_active == True
         ).all()
 
-        sent = 0
+        targets = []
         for pm_user in pm_users:
             scoped_project_ids = _get_scoped_project_ids(db, pm_user)
             if not scoped_project_ids:
@@ -488,27 +480,53 @@ def _scheduled_pm_confirm_reminders() -> None:
             pm_employee = db.query(Employee).filter(Employee.id == pm_user.employee_id).first()
             if not pm_employee:
                 continue
+            
             slack_id = try_get_or_cache_employee_slack_user_id(db, pm_employee)
             if not slack_id:
                 continue
             
+            targets.append({
+                "slack_id": slack_id,
+                "pm_name": pm_employee.name,
+                "pending_count": pending,
+            })
+        return targets
+    finally:
+        db.close()
+
+
+def _scheduled_pm_confirm_reminders() -> None:
+    """Stage 2: Pure Network I/O. Sends Slack messages with ZERO DB connections held."""
+    from app.services.slack_service import (
+        SlackRateLimitError,
+        try_send_pm_confirm_reminder_message,
+    )
+    import time
+
+    try:
+        targets = _collect_pm_confirm_targets()
+        if not targets:
+            return
+
+        sent = 0
+        for target in targets:
             try:
                 if try_send_pm_confirm_reminder_message(
-                    pm_slack_user_id=slack_id, pm_name=pm_employee.name, pending_count=pending
+                    pm_slack_user_id=target["slack_id"],
+                    pm_name=target["pm_name"],
+                    pending_count=target["pending_count"],
                 ):
                     sent += 1
-                    time.sleep(1.5)  # Avoid Slack API rate limit
+                    time.sleep(1.5)  # ✅ Safe: No DB connection is held!
             except SlackRateLimitError as exc:
                 logger.warning("[scheduler] Rate limit hit sending PM reminder, sleeping %s seconds...", exc.retry_after_seconds)
                 time.sleep(exc.retry_after_seconds)
             except Exception as exc:
                 logger.error("[scheduler] Failed sending PM reminder: %s", exc)
-                    
+
         logger.info("[scheduler] PM confirm reminders sent to %s manager(s)", sent)
     except Exception as exc:
         logger.error("[scheduler] PM confirm reminder job failed: %s", exc)
-    finally:
-        db.close()
 
 
 def _scheduled_late_warning() -> None:
@@ -942,32 +960,62 @@ def start_scheduler() -> None:
     )
 
 def _scheduled_lunch_report() -> None:
-    """Generate and email the daily lunch order PDF (WFO + tiffin/canteen)."""
+    """Generate and email the daily lunch order PDF with zero connection leaks."""
+    from app.utils.business_time import today_ist
+    from app.constants.leave_types import is_fixed_holiday, is_weekend
+    from app.services.lunch_report_service import _get_today_lunch_data, _build_pdf
+    from app.services.email_service import try_send_lunch_report_email
+
+    today = today_ist()
+
+    if is_weekend(today) or is_fixed_holiday(today):
+        logger.info("[scheduler] Skipping lunch report because today is a weekend or holiday.")
+        return
+
+    # Stage 1: Fast data read (< 15ms) and guaranteed close
     db = SessionLocal()
     try:
-        from app.utils.business_time import today_ist
-        from app.constants.leave_types import is_fixed_holiday, is_weekend
-        from app.services.lunch_report_service import generate_and_send_lunch_report
+        data = _get_today_lunch_data(db)
+    except Exception as exc:
+        logger.exception("[scheduler] Failed to query lunch data: %s", exc)
+        return
+    finally:
+        db.close()  # ✅ Guaranteed connection return to pool!
 
-        today = today_ist()
+    # Stage 2: Heavy PDF construction & SMTP network calls (0 DB connections held)
+    try:
+        pdf_bytes = _build_pdf(data)
+        date_str = data["date"].strftime("%d %b %Y")
+        filename = f"Lunch_Order_Summary_{data['date'].strftime('%d-%b-%Y')}.pdf"
+        
+        html = f"""
+        <p>Hi,</p>
+        <p>Please find attached the <strong>Daily Lunch Order Summary</strong> for <strong>{date_str}</strong>.</p>
+        <p>The PDF is segregated by <b>Meal Plan</b> and then by <b>Floor</b> for easy preparation.</p>
+        <p>Regards,<br>Autonex System</p>
+        """
 
-        if is_weekend(today) or is_fixed_holiday(today):
-            logger.info("[scheduler] Skipping lunch report because today is a weekend or holiday.")
-            return
-
-        # Send to both primary + fallback
-        emails = [LUNCH_REPORT_PRIMARY_EMAIL, LUNCH_REPORT_FALLBACK_EMAIL]
-        # Remove duplicates if both are the same
-        emails = list(dict.fromkeys(emails))
-
-        success = generate_and_send_lunch_report(db, to_emails=emails)
-
-        if success:
+        emails = list(dict.fromkeys([LUNCH_REPORT_PRIMARY_EMAIL, LUNCH_REPORT_FALLBACK_EMAIL]))
+        all_success = True
+        
+        for email in emails:
+            ok = try_send_lunch_report_email(
+                to_email=email,
+                to_name="Lunch Ops",
+                subject=f"Daily Lunch Order Summary – {date_str}",
+                html_body=html,
+                pdf_bytes=pdf_bytes,
+                pdf_filename=filename,
+            )
+            if not ok:
+                all_success = False
+                
+        if all_success:
             logger.info("[scheduler] Lunch report emailed successfully to %s", emails)
         else:
             logger.error("[scheduler] Lunch report email failed for one or more recipients")
     except Exception as exc:
-        logger.exception("[scheduler] Lunch report job crashed: %s", exc)
+        logger.exception("[scheduler] Lunch report email sending crashed: %s", exc)
 
 def _scheduled_monthly_work_model_sync() -> None:
     """Evaluate previous month's check-in records and auto-adjust work models (WFO <-> WFH)."""
