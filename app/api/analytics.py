@@ -338,21 +338,25 @@ def is_autonex_email(email: str | None) -> bool:
         return False
     e = email.strip().lower()
     
-    # Must be an encord.ai email
-    if not e.endswith("@encord.ai"):
-        return False
-        
-    # 1. Allow our vendor (Theta)
-    if e.endswith("_theta@encord.ai"):
-        return True
-        
-    # 2. Block other vendors who use an underscore before the domain
-    # Example: annotator12_kappa@encord.ai will be blocked
-    if "_" in e.split("@")[0]: 
-        return False
-        
-    # 3. Allow direct employees
-    return True
+    # Old logic commented out as per PM request to ONLY allow Theta:
+    # # Must be an encord.ai email
+    # if not e.endswith("@encord.ai"):
+    #     return False
+    #     
+    # # 1. Allow our vendor (Theta)
+    # if e.endswith("_theta@encord.ai"):
+    #     return True
+    #     
+    # # 2. Block other vendors who use an underscore before the domain
+    # # Example: annotator12_kappa@encord.ai will be blocked
+    # if "_" in e.split("@")[0]: 
+    #     return False
+    #     
+    # # 3. Allow direct employees
+    # return True
+
+    # strictly allow ONLY theta vendor
+    return e.endswith("_theta@encord.ai")
 
 
 # Annotator / reviewer HEAD-COUNTS are classified by the Encord workflow stage the
@@ -624,7 +628,7 @@ def project_analytics(
     
     for emp_name, emp_email_fallback, emp_encord_id in allocated_employees:
         email_to_use = emp_encord_id or emp_email_fallback
-        if email_to_use and _norm_encord(email_to_use) not in existing_emails_normalized:
+        if email_to_use and is_autonex_email(email_to_use) and _norm_encord(email_to_use) not in existing_emails_normalized:
             annotators.append({
                 "user_email": email_to_use,
                 "employee_name": emp_name,

@@ -152,6 +152,7 @@ class PaginatedTeamCheckIns(BaseModel):
     kpi_floor_17: int = 0
     kpi_order_tiffin: int = 0
     kpi_canteen: int = 0
+    kpi_lunch_none: int = 0
     kpi_mood_great: int = 0
     kpi_mood_okay: int = 0
     kpi_mood_low: int = 0
