@@ -4,7 +4,7 @@ from typing import List, Optional, Union
 
 WORK_MODE_CHOICES = ["WFO", "WFH"]
 MOOD_CHOICES = ["great", "okay", "low", "stressed"]
-OFFICE_FLOOR_CHOICES = ["7", "9", "17"]
+OFFICE_FLOOR_CHOICES = ["7", "9", "15", "17"]
 LUNCH_PREFERENCE_CHOICES = ["order_tiffin", "canteen", "none"]
 TIFFIN_TYPE_CHOICES = ["full_meal", "no_rice", "dal_and_rice"]
 
@@ -149,6 +149,7 @@ class PaginatedTeamCheckIns(BaseModel):
     kpi_checked_out: int = 0
     kpi_floor_7: int = 0
     kpi_floor_9: int = 0
+    kpi_floor_15: int = 0
     kpi_floor_17: int = 0
     kpi_order_tiffin: int = 0
     kpi_canteen: int = 0

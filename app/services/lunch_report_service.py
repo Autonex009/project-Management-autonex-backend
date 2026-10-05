@@ -31,7 +31,7 @@ MEAL_LABELS = {
     "no_rice": "No Rice",
     "dal_and_rice": "Dal & Rice",
 }
-FLOOR_ORDER = ["7", "9", "17"]
+FLOOR_ORDER = ["7", "9", "15", "17"]
 
 
 def _get_today_lunch_data(db: Session) -> Dict:

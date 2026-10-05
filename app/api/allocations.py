@@ -65,11 +65,15 @@ def sync_project_allocations(db, project_id: int):
 
     project.allocated_employees = len(allocs)
 
+    emp_ids = [a.employee_id for a in allocs if a.employee_id]
+    emp_map = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()} if emp_ids else {}
+
     lead_count = 0
     pm_ids = set()
 
     for a in allocs:
-        if a.role_tags and "Team Lead" in a.role_tags:
+        emp = emp_map.get(a.employee_id)
+        if (a.role_tags and "Team Lead" in a.role_tags) or _is_team_lead(emp):
             lead_count += 1
         elif project_scope.escalates_to_admin(db, a.employee_id):
             pm_ids.add(a.employee_id)
@@ -690,6 +694,8 @@ def _allocation_to_dict(
         "employee_name": employee.name if employee else None,
         "project_name": sub_project.name if sub_project else None,
         "sub_project_name": sub_project.name if sub_project else None,
+        "client": sub_project.client if sub_project else None,
+        "project_type": sub_project.project_type if sub_project else None,
     }
 
 

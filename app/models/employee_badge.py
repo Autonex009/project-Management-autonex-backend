@@ -3,7 +3,6 @@ from sqlalchemy import (
     Integer,
     String,
     Date,
-    Text,
     TIMESTAMP,
     JSON,
     ForeignKey,

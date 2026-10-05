@@ -1,13 +1,18 @@
+from datetime import timezone
+
 from sqlalchemy import Column, Integer, Date, Text, TIMESTAMP, UniqueConstraint, Index
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 from app.db.database import Base
-from datetime import timezone
+
 
 class UTCDateTime(TypeDecorator):
     impl = TIMESTAMP
     cache_ok = True
+
+    def process_bind_param(self, value, dialect):
+        return value
 
     def process_result_value(self, value, dialect):
         if value is not None:
@@ -15,6 +20,7 @@ class UTCDateTime(TypeDecorator):
                 return value.replace(tzinfo=timezone.utc)
             return value.astimezone(timezone.utc)
         return value
+
 
 class DailyCheckIn(Base):
     __tablename__ = "daily_checkins"
@@ -32,7 +38,7 @@ class DailyCheckIn(Base):
     mood = Column(Text, nullable=True)  # great, okay, low, stressed
 
     # NEW FIELDS - Only relevant when work_mode is WFO
-    office_floor = Column(Text, nullable=True)  # "7", "9", "17"
+    office_floor = Column(Text, nullable=True)  # "7", "9", "15", "17"
     lunch_preference = Column(Text, nullable=True)  # "order_tiffin", "canteen", "none"
     tiffin_type = Column(Text, nullable=True)  # "full_meal", "no_rice", "dal_and_rice" (only if lunch_preference is "order_tiffin")
 
