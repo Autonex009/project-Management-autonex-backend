@@ -324,7 +324,6 @@ def list_evals(
     
     # Restrict team leads to only their manageable employees
     if current_user.role == "team_lead" and not employee_id:
-        from app.services import project_scope
         manageable_ids = project_scope.get_manageable_employee_ids(db, current_user)
         if manageable_ids is not None:
             if not manageable_ids:
@@ -637,25 +636,24 @@ def create_eval(
     current_period = f"{now_ist.year:04d}-{now_ist.month:02d}"
 
     if current_user.role != "admin":
-        # Temporary exception for Sept 2026: Open only on Oct 2nd, 3rd, and 4th
-        is_sept_exception = (
-            payload.period == "2026-09"
-            and now_ist.month == 10
-            and 2 <= now_ist.day <= 4
-        )
+        # Temporary exception for Sept 2026: (disabled)
+        # is_sept_exception = (
+        #     payload.period == "2026-09"
+        #     and now_ist.month == 10
+        #     and 2 <= now_ist.day <= 5
+        # )
 
-        if not is_sept_exception:
-            # NEW LOCK: 20th to 24th of the current month
-            if now_ist.day < 20 or now_ist.day > 24:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Performance evaluations can only be submitted between the 20th and 24th of the month.",
-                )
-            if payload.period != current_period:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Self-evaluations can only be submitted for the active month ({current_period}).",
-                )
+        # NEW LOCK: 20th to 24th of the current month
+        if now_ist.day < 20 or now_ist.day > 24:
+            raise HTTPException(
+                status_code=403,
+                detail="Performance evaluations can only be submitted between the 20th and 24th of the month.",
+            )
+        if payload.period != current_period:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Self-evaluations can only be submitted for the active month ({current_period}).",
+            )
 
     # Deliberately NOT has_team_read: submitting an evaluation *for* someone else is a
     # manager's action. A team lead falls through to the self-check below, so it can still

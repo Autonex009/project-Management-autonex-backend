@@ -85,6 +85,11 @@ class DailySheet(Base):
         onupdate=func.now()
     )
 
+    @property
+    def remaining_tasks(self):
+        """Fallback: if remaining_tasks is not tracked separately, use total_tasks."""
+        return self.total_tasks
+
 # Backward compatibility aliases
 SubProject = DailySheet
 Project = DailySheet

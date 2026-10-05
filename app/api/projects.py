@@ -312,6 +312,12 @@ def enrich_project_response(db: Session, project: Project) -> dict:
         Allocation.is_active == True
     ).all()
 
+    emp_ids = [a.employee_id for a in allocs if a.employee_id and not (a.active_end_date and a.active_end_date < today)]
+    desig_map = {
+        e.id: str(e.designation or "").lower().strip()
+        for e in db.query(Employee.id, Employee.designation).filter(Employee.id.in_(emp_ids)).all()
+    } if emp_ids else {}
+
     lead_count = 0
     pm_count = 0
 
@@ -319,7 +325,8 @@ def enrich_project_response(db: Session, project: Project) -> dict:
         if alloc.active_end_date and alloc.active_end_date < today:
             continue
 
-        if alloc.role_tags and TEAM_LEAD_ROLE_TAG in alloc.role_tags:
+        desig = desig_map.get(alloc.employee_id, "")
+        if (alloc.role_tags and TEAM_LEAD_ROLE_TAG in alloc.role_tags) or desig in ("team lead", "team_lead", "lead", "tl"):
             lead_count += 1
         elif project_scope.escalates_to_admin(db, alloc.employee_id):
             pm_count += 1
@@ -421,10 +428,11 @@ def enrich_projects_bulk(db: Session, projects: list[Project]) -> list[dict]:
             if not alloc.employee_id:
                 continue
             allocated_employee_ids.append(alloc.employee_id)
-            if alloc.role_tags and TEAM_LEAD_ROLE_TAG in alloc.role_tags:
+            desig = emp_designations.get(alloc.employee_id, "")
+            if (alloc.role_tags and TEAM_LEAD_ROLE_TAG in alloc.role_tags) or desig in ("team lead", "team_lead", "lead", "tl"):
                 lead_count += 1
                 team_lead_ids.append(alloc.employee_id)
-            elif emp_designations.get(alloc.employee_id) in (
+            elif desig in (
                 "program manager",
                 "project manager",
                 "hr",
@@ -465,9 +473,10 @@ def enrich_projects_bulk(db: Session, projects: list[Project]) -> list[dict]:
         elif req_manpower > 0 and active_allocated_count >= req_manpower:
             capacity = {"status": "balanced", "recommendation": None}
         else:
+            rem_tasks = getattr(project, "remaining_tasks", None)
             task_count = (
-                project.remaining_tasks
-                if project.remaining_tasks is not None
+                rem_tasks
+                if rem_tasks is not None
                 else project.total_tasks
             )
             required_hours = float(task_count or 0) * float(
@@ -669,7 +678,8 @@ def bulk_compute_capacity(db: Session, projects: list[Project]) -> dict[int, str
         elif req_manpower > 0 and active_count >= req_manpower:
             cap = "balanced"
         else:
-            tc = p.remaining_tasks if p.remaining_tasks is not None else p.total_tasks
+            rem_tasks = getattr(p, "remaining_tasks", None)
+            tc = rem_tasks if rem_tasks is not None else p.total_tasks
             req_hrs = float(tc or 0) * float(p.estimated_time_per_task or 0)
             if req_hrs > 0 and p.end_date and days > 0:
                 total_cap = active_count * 8 * days
