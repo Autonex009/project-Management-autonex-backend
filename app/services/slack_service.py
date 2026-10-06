@@ -245,7 +245,7 @@ def try_send_leave_applied_message(**kwargs) -> bool:
 
 
 def get_leave_balances_text(db, employee) -> str:
-    from app.constants.leave_types import is_intern_or_contractor
+    from app.constants.leave_types import is_intern_or_contractor, normalize_leave_type
     from app.models.leave import Leave
     from datetime import date, timedelta
     
