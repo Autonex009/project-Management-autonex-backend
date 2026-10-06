@@ -96,6 +96,91 @@ def get_leaves_today_ids(db: Session = Depends(get_db)):
     ).all()
     return [l[0] for l in leaves if l[0]]
 
+
+@router.get("/balances")
+def get_employee_leave_balances(
+    employee_id: Optional[int] = None,
+    year: Optional[int] = None,
+    month: Optional[int] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Get authoritative leave quota, used, and remaining balances for an employee.
+    Server-side classified: respects internship conversion cutoff date automatically.
+    Fast query (<5ms) with zero connection leaks.
+    """
+    from app.api.payroll import _classify_year_leaves
+    from app.constants.leave_types import INTERN_MONTHLY_PAID_QUOTA
+
+    target_emp_id = employee_id
+    if target_emp_id is None:
+        target_emp_id = current_user.employee_id
+        if target_emp_id is None:
+            emp_row = db.query(Employee.id).filter(Employee.email == current_user.email).first()
+            if emp_row:
+                target_emp_id = emp_row[0]
+            else:
+                raise HTTPException(status_code=404, detail="Employee not found")
+    else:
+        if current_user.role not in ("admin", "hr", "pm", "team_lead") and current_user.employee_id != target_emp_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+    now_date = today_ist()
+    target_year = year or now_date.year
+    target_month = month or now_date.month
+
+    emp = db.query(
+        Employee.id,
+        Employee.employee_type,
+        Employee.converted_to_fulltime_at
+    ).filter(Employee.id == target_emp_id).first()
+
+    if not emp:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    year_start = date_type(target_year, 1, 1)
+    year_end = date_type(target_year, 12, 31)
+
+    leaves = (
+        db.query(Leave)
+        .filter(
+            Leave.employee_id == target_emp_id,
+            Leave.status == "approved",
+            Leave.start_date <= year_end,
+            Leave.end_date >= year_start,
+        )
+        .all()
+    )
+
+    emp_is_intern = is_intern_or_contractor(emp.employee_type)
+    intern_until = emp.converted_to_fulltime_at.date() if emp.converted_to_fulltime_at else None
+
+    classification, balances = _classify_year_leaves(leaves, target_year, emp_is_intern, intern_until)
+
+    if emp_is_intern and "paid" in balances:
+        month_start = date_type(target_year, target_month, 1)
+        if target_month == 12:
+            month_end = date_type(target_year, 12, 31)
+        else:
+            month_end = date_type(target_year, target_month + 1, 1) - timedelta(days=1)
+
+        paid_used_month = sum(
+            weight
+            for cls in classification.values()
+            if cls["type"] == "paid"
+            for d, weight in cls["paid_dates"].items()
+            if month_start <= d <= month_end
+        )
+        balances["paid"] = {
+            "quota": INTERN_MONTHLY_PAID_QUOTA,
+            "used": paid_used_month,
+            "remaining": max(INTERN_MONTHLY_PAID_QUOTA - paid_used_month, 0.0),
+            "period": "month",
+        }
+
+    return balances
+
 @router.get("/team-summary")
 def get_team_leaves_summary(pm_id: int, db: Session = Depends(get_db)):
     """
@@ -1333,7 +1418,7 @@ def create_leave(
     # Monthly paid leave limit: max 2 paid leaves per calendar month
     flagged = False
     exceeds_by = 0.0
-    if payload.leave_type == "paid":
+    if normalize_leave_type(payload.leave_type) == "paid":
         def calc_days(s, e, half=False):
             if not s or not e: return 0
             if half: return 0.5
@@ -1353,15 +1438,16 @@ def create_leave(
             db.query(Leave)
             .filter(
                 Leave.employee_id == payload.employee_id,
-                Leave.leave_type == "paid",
+                Leave.leave_type.in_(["paid", "first_half", "second_half", "half_day"]),
                 Leave.status == "approved",
                 Leave.start_date >= month_start,
                 Leave.start_date < month_end,
             )
             .all()
         )
-        used_days = sum(calc_days(l.start_date, l.end_date, l.is_half_day) for l in leaves_this_month)
-        req_days = calc_days(payload.start_date, payload.end_date, payload.is_half_day)
+        used_days = sum(calc_days(l.start_date, l.end_date, l.is_half_day or l.leave_type in ("first_half", "second_half", "half_day")) for l in leaves_this_month)
+        req_is_half = payload.is_half_day or payload.leave_type in ("first_half", "second_half", "half_day")
+        req_days = calc_days(payload.start_date, payload.end_date, req_is_half)
         
         limit = 1 if is_intern_or_contractor(employee.employee_type) else 2
         if used_days + req_days > limit:

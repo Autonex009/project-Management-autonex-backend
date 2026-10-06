@@ -152,13 +152,17 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
         paid_dates, unpaid_dates = {}, {}
         
         # Bypass branch for sheet-synced placeholder leaves with NULL dates
+        is_half = (
+            getattr(leave, "is_half_day", False)
+            or getattr(leave, "leave_type", "") in ("first_half", "second_half", "half_day")
+        )
         if leave.start_date is None or leave.end_date is None:
-            duration = 0.5 if getattr(leave, "is_half_day", False) else 1.0
+            duration = 0.5 if is_half else 1.0
             used[ltype] = used.get(ltype, 0.0) + duration
             classification[leave.id] = {"paid_dates": {}, "unpaid_dates": {}, "type": ltype}
             continue
 
-        weight = 0.5 if getattr(leave, "is_half_day", False) else 1.0
+        weight = 0.5 if is_half else 1.0
         for wd in _working_dates(leave.start_date, leave.end_date, year):
             use_monthly = ltype == "paid" and (intern or (intern_until is not None and wd < intern_until))
             if use_monthly:
@@ -568,7 +572,7 @@ def preview_payroll(
                 "end_date": leave.end_date.isoformat(),
                 "days_in_month": days_in_month,
                 "auto_unpaid_days": sum(cls["unpaid_dates"][d] for d in month_unpaid),
-                "is_half_day": getattr(leave, "is_half_day", False),
+                "is_half_day": getattr(leave, "is_half_day", False) or leave.leave_type in ("first_half", "second_half", "half_day"),
                 "dates": date_entries,
                 "reason": leave.reason or "",
             })

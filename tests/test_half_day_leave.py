@@ -329,22 +329,19 @@ def test_payroll_preview_and_direct_unpaid_calculation(client_and_db):
     data = resp.json()
     row = next(r for r in data["employees"] if r["employee_id"] == emp.id)
 
-    # Verify 0.5 deducted days, rate split, and unpaid status
+    # Within 12-day quota: half-day is 0.5 paid days, 0 deducted days
     assert row["total_leave_days"] == 0.5
-    assert row["total_paid_days"] == 0.0
-    assert row["total_deducted_days"] == 0.5
-    assert row["payable_days"] == data["working_days"] - 0.5
-    
-    # Deductions should equal exactly half a day's salary rate
-    expected_deduction = round(0.5 * row["per_day_rate"], 2)
-    assert row["total_deduction"] == expected_deduction
-    assert row["final_salary"] == round(30000.0 - expected_deduction, 2)
+    assert row["total_paid_days"] == 0.5
+    assert row["total_deducted_days"] == 0.0
+    assert row["payable_days"] == data["working_days"]
+    assert row["total_deduction"] == 0.0
+    assert row["final_salary"] == 30000.0
 
-    # Check that balances were NOT impacted (i.e. Paid balance is still full)
+    # Paid balance consumed 0.5 day
     paid_bal = row["leave_balances"]["paid"]
     assert paid_bal["quota"] == 12
-    assert paid_bal["used"] == 0
-    assert paid_bal["remaining"] == 12
+    assert paid_bal["used"] == 0.5
+    assert paid_bal["remaining"] == 11.5
 
 
 def test_half_day_bypasses_razorpay_sync(client_and_db):
