@@ -261,7 +261,7 @@ def get_leave_balances_text(db, employee) -> str:
     def calc_days(l: Leave):
         if not getattr(l, "start_date", None) or not getattr(l, "end_date", None):
             return 0
-        if getattr(l, "is_half_day", False) or l.leave_type in ("first_half", "second_half"):
+        if getattr(l, "is_half_day", False) or l.leave_type in ("first_half", "second_half", "half_day"):
             return 0.5
         d = 0
         curr = l.start_date
@@ -276,14 +276,21 @@ def get_leave_balances_text(db, employee) -> str:
     used_floater = 0
     used_paid = 0
 
+    intern_until = employee.converted_to_fulltime_at.date() if getattr(employee, "converted_to_fulltime_at", None) else None
+
     for l in leaves:
         if not getattr(l, "start_date", None):
             continue
         if l.start_date.year != current_year:
             continue
         
+        # Promotion cutoff: leaves taken prior to full-time promotion were covered
+        # by the monthly intern quota and must not consume the annual full-time quota.
+        if not is_contractor and intern_until and l.start_date < intern_until:
+            continue
+
         days = calc_days(l)
-        l_type = l.leave_type or ""
+        l_type = normalize_leave_type(l.leave_type)
         
         if l_type == "casual_sick":
             used_cl += days

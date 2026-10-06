@@ -96,6 +96,8 @@ HIRING_SYNC_INTERVAL_HOURS = int(os.getenv("HIRING_SYNC_INTERVAL_HOURS", "12"))
 # Checkin Lunch
 LUNCH_REPORT_HOUR = int(os.getenv("LUNCH_REPORT_HOUR", "11"))
 LUNCH_REPORT_MINUTE = int(os.getenv("LUNCH_REPORT_MINUTE", "0"))
+LUNCH_REPORT_SECOND_HOUR = int(os.getenv("LUNCH_REPORT_SECOND_HOUR", "12"))
+LUNCH_REPORT_SECOND_MINUTE = int(os.getenv("LUNCH_REPORT_SECOND_MINUTE", "0"))
 LUNCH_REPORT_PRIMARY_EMAIL = os.getenv("LUNCH_REPORT_PRIMARY_EMAIL", "jadhavashish061@gmail.com")
 LUNCH_REPORT_FALLBACK_EMAIL = os.getenv("LUNCH_REPORT_FALLBACK_EMAIL", "kisanjena40@gmail.com")
 
@@ -915,7 +917,7 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
-        # Daily Lunch Order PDF report – weekdays at 11:00 AM IST
+        # Daily Lunch Order PDF report (Slot 1) – weekdays at 11:00 AM IST
     _scheduler.add_job(
         _scheduled_lunch_report,
         trigger="cron",
@@ -923,6 +925,19 @@ def start_scheduler() -> None:
         hour=LUNCH_REPORT_HOUR,
         minute=LUNCH_REPORT_MINUTE,
         id="daily_lunch_report",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Daily Lunch Order PDF report (Slot 2) – weekdays at 12:00 PM (Noon) IST
+    _scheduler.add_job(
+        _scheduled_lunch_report,
+        trigger="cron",
+        day_of_week="mon-fri",
+        hour=LUNCH_REPORT_SECOND_HOUR,
+        minute=LUNCH_REPORT_SECOND_MINUTE,
+        id="daily_lunch_report_noon",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

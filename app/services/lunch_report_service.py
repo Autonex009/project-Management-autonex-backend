@@ -3,11 +3,12 @@ Daily Lunch Order Report
 - Generates a clean PDF (meal-plan segregated + floor grouped)
 - Sends it at 11 AM IST
 """
-from datetime import datetime
+import os
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from collections import defaultdict
 from io import BytesIO
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -34,8 +35,8 @@ MEAL_LABELS = {
 FLOOR_ORDER = ["7", "9", "15", "17"]
 
 
-def _get_today_lunch_data(db: Session) -> Dict:
-    today = datetime.now(IST).date()
+def _get_today_lunch_data(db: Session, target_date: Optional[date] = None) -> Dict:
+    today = target_date or datetime.now(IST).date()
 
     rows = (
         db.query(DailyCheckIn, Employee.name)
@@ -245,15 +246,18 @@ def _build_pdf(data: Dict) -> bytes:
 def generate_and_send_lunch_report(
     db: Session,
     to_emails: list[str] | None = None,
+    target_date: Optional[date] = None,
 ) -> bool:
     """
     Main entry point.
     Sends the lunch report PDF to all given emails.
     """
     if not to_emails:
-        to_emails = ["kisanjena40@gmail.com"]  
+        primary = os.getenv("LUNCH_REPORT_PRIMARY_EMAIL", "jadhavashish061@gmail.com")
+        fallback = os.getenv("LUNCH_REPORT_FALLBACK_EMAIL", "kisanjena40@gmail.com")
+        to_emails = list(dict.fromkeys([primary, fallback]))
 
-    data = _get_today_lunch_data(db)
+    data = _get_today_lunch_data(db, target_date=target_date)
     pdf_bytes = _build_pdf(data)
 
     date_str = data["date"].strftime("%d-%b-%Y")

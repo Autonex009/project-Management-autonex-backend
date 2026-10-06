@@ -18,6 +18,9 @@ LEGACY_LEAVE_TYPE_ALIASES = {
     "sick": "casual_sick",
     "personal": "floater",
     "emergency": "floater",
+    "half_day": "paid",
+    "first_half": "paid",
+    "second_half": "paid",
 }
 
 RAZORPAY_LEAVE_TYPE_IDS = {
@@ -152,5 +155,8 @@ def normalize_leave_type(leave_type: str) -> str:
 
 
 def get_leave_type_label(leave_type: str) -> str:
+    raw = (leave_type or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if raw in LEAVE_TYPE_LABELS:
+        return LEAVE_TYPE_LABELS[raw]
     normalized = normalize_leave_type(leave_type)
     return LEAVE_TYPE_LABELS.get(normalized, normalized.replace("_", " ").title())
