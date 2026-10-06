@@ -77,12 +77,18 @@ def get_leave_balance(employee_id: int, db: Session) -> dict:
 
     # Count used days per type
     used = {"paid": 0, "casual_sick": 0, "floater": 0}
+    intern_until = employee.converted_to_fulltime_at.date() if getattr(employee, "converted_to_fulltime_at", None) else None
+
     for leave in leaves:
         lt = normalize_leave_type(leave.leave_type)
         if lt in used:
-            days = _count_working_days(leave.start_date, leave.end_date)
-            if leave.is_half_day:
-                days = 0.5
+            if not employee_is_intern and intern_until and leave.start_date < intern_until:
+                continue
+            is_half = (
+                getattr(leave, "is_half_day", False)
+                or getattr(leave, "leave_type", "") in ("first_half", "second_half", "half_day")
+            )
+            days = 0.5 if is_half else _count_working_days(leave.start_date, leave.end_date)
             used[lt] += days
 
     # Build balance
@@ -100,7 +106,7 @@ def get_leave_balance(employee_id: int, db: Session) -> dict:
                 and lv.start_date.month == current_month
             ]
             monthly_used = sum(
-                0.5 if lv.is_half_day else _count_working_days(lv.start_date, lv.end_date)
+                0.5 if (getattr(lv, "is_half_day", False) or getattr(lv, "leave_type", "") in ("first_half", "second_half", "half_day")) else _count_working_days(lv.start_date, lv.end_date)
                 for lv in monthly_leaves
             )
             balance[leave_type] = {
