@@ -1449,7 +1449,7 @@ def create_leave(
         req_is_half = payload.is_half_day or payload.leave_type in ("first_half", "second_half", "half_day")
         req_days = calc_days(payload.start_date, payload.end_date, req_is_half)
         
-        limit = 1 if is_intern_or_contractor(employee.employee_type) else 2
+        limit = 1 if is_intern_or_contractor(employee.employee_type) else 5
         if used_days + req_days > limit:
             flagged = True
             # if they already exceeded before this request, we only count this request's days OR the total excess
@@ -1758,7 +1758,7 @@ def approve_leave(
     if leave.flagged and not (body.remark and body.remark.strip()):
         raise HTTPException(
             status_code=422,
-            detail="This leave exceeds the monthly paid leave limit (2/month). A justification remark is required to approve it.",
+            detail="This leave exceeds the monthly paid leave limit. A justification remark is required to approve it.",
         )
 
     employee = db.query(Employee).filter(Employee.id == leave.employee_id).first()
@@ -2171,7 +2171,7 @@ def _revalidate_pending_leaves_background(employee_id: int, db: Session):
         employee = db.query(Employee).filter(Employee.id == employee_id).first()
         if not employee: return
         
-        limit = 1 if is_intern_or_contractor(employee.employee_type) else 2
+        limit = 1 if is_intern_or_contractor(employee.employee_type) else 5
         
         # Get all pending paid leaves
         pending_leaves = db.query(Leave).filter(

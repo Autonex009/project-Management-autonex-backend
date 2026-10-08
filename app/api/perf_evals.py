@@ -636,14 +636,7 @@ def create_eval(
     current_period = f"{now_ist.year:04d}-{now_ist.month:02d}"
 
     if current_user.role != "admin":
-        # Temporary exception for Sept 2026: (disabled)
-        # is_sept_exception = (
-        #     payload.period == "2026-09"
-        #     and now_ist.month == 10
-        #     and 2 <= now_ist.day <= 5
-        # )
-
-        # NEW LOCK: 20th to 24th of the current month
+        # Standard lock: 20th to 24th of the current month
         if now_ist.day < 20 or now_ist.day > 24:
             raise HTTPException(
                 status_code=403,

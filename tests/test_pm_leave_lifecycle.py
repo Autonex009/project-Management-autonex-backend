@@ -181,23 +181,24 @@ def test_pm_leave_routes_to_admin_and_full_lifecycle(client_and_db):
 
 
 def test_pm_paid_leave_over_monthly_limit_is_flagged(client_and_db):
-    """Same flagging rule as employees: the 3rd paid leave in a calendar month
-    is flagged (max 2/month). 'Unpaid' is not a selectable type — exhausted
+    """Same flagging rule as employees: the 6th paid leave in a calendar month
+    is flagged (max 5/month). 'Unpaid' is not a selectable type — exhausted
     paid quota is auto-converted to unpaid by payroll, identical to employees."""
     client, db = client_and_db
     ids = _seed(db)
     pm_emp_id = ids["pm_emp"].id
     admin_user_id = ids["admin_user"].id
 
-    # Three single-day paid leaves on distinct weekdays in the same month
+    # Six single-day paid leaves on non-consecutive weekdays in the same month
+    # (using days=2 to bypass the 'max 5 consecutive leaves' safeguard)
     base = _next_weekday(date.today().replace(day=1) + timedelta(days=40))
     days = []
     d = base
-    while len(days) < 3:
+    while len(days) < 6:
         d = _next_weekday(d)
         if d.month == base.month:
             days.append(d)
-        d += timedelta(days=1)
+        d += timedelta(days=2)
 
     flags = []
     for day in days:
@@ -215,8 +216,8 @@ def test_pm_paid_leave_over_monthly_limit_is_flagged(client_and_db):
         # Approve the request so it counts towards the limit for subsequent requests
         client.patch(f"/api/leaves/{data['leave_id']}/approve", params={"approved_by": admin_user_id})
 
-    assert flags[0] is False and flags[1] is False
-    assert flags[2] is True, "3rd paid leave in a month must be flagged for PMs too"
+    assert not any(flags[:5])
+    assert flags[5] is True, "6th paid leave in a month must be flagged for PMs too"
 
 
 def test_pm_wfh_routes_to_admin_and_can_be_rejected(client_and_db):
