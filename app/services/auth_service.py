@@ -140,6 +140,11 @@ def get_current_user(
     if user is None or not user.is_active:
         raise credentials_exception
 
+    view_role = request.headers.get("X-Role-View")
+    if user.role == "hr" and view_role == "pm":
+        from sqlalchemy.orm.attributes import set_committed_value
+        set_committed_value(user, 'role', 'pm')
+
     return user
 
 # Roles that read the whole team's records rather than only their own.

@@ -28,7 +28,7 @@ from app.models.user import User
 from app.models.leave import Leave
 from app.models.wfh import WFHRequest
 
-router = APIRouter(prefix="/api/analytics", tags=["Analytics"], dependencies=[Depends(require_role("admin", "pm"))])
+router = APIRouter(prefix="/api/analytics", tags=["Analytics"], dependencies=[Depends(require_role("admin", "pm", "hr"))])
 
 @router.get("/pm/{pm_id}/team-summary")
 def get_pm_team_summary(pm_id: int, db: Session = Depends(get_db)):
@@ -283,7 +283,7 @@ def _get_pm_associated_sub_project_ids(db: Session, current_user: User) -> Optio
     - Or sub-project has no project-level PMs, but belongs to a parent MainProject
       where they are a program manager (program_manager_ids or program_manager_id).
     """
-    if current_user.role == "admin":
+    if current_user.role in ("admin", "hr"):
         return None
 
     emp_id = current_user.employee_id
