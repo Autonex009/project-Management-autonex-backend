@@ -2234,7 +2234,7 @@ def send_pm_confirm_reminder_message(*, pm_slack_user_id: str, pm_name: str, pen
                             "type": "button",
                             "text": {"type": "plain_text", "text": "Review Team"},
                             "style": "primary",
-                            "url": (os.getenv("FRONTEND_URL") or "http://localhost:5173").strip().rstrip("/") + "/pm/team-checkins",
+                            "url": (os.getenv("FRONTEND_URL")).strip().rstrip("/") + "/pm/team-checkins",
                         }
                     ],
                 },
