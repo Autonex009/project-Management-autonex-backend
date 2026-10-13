@@ -109,6 +109,11 @@ INTERNSHIP_ALERT_MINUTE = int(os.getenv("INTERNSHIP_ALERT_MINUTE", "0"))
 MONTHLY_WORK_MODEL_HOUR = int(os.getenv("MONTHLY_WORK_MODEL_HOUR", "0"))
 MONTHLY_WORK_MODEL_MINUTE = int(os.getenv("MONTHLY_WORK_MODEL_MINUTE", "15"))
 
+# Daily Annotation Project Report — every day at 10:00 AM IST (Mon-Sun)
+DAILY_PROJECT_REPORT_HOUR = int(os.getenv("DAILY_PROJECT_REPORT_HOUR", "10"))
+DAILY_PROJECT_REPORT_MINUTE = int(os.getenv("DAILY_PROJECT_REPORT_MINUTE", "0"))
+DAILY_PROJECT_REPORT_CHANNEL_ID = os.getenv("DAILY_PROJECT_REPORT_CHANNEL_ID", "C0BQX541CNT")
+
 
 def _scheduled_hiring_sync() -> None:
     db = SessionLocal()
@@ -981,11 +986,32 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
+    # Daily Project Annotation Report – every day at 10:00 AM IST (Mon-Sun)
+    _scheduler.add_job(
+        _scheduled_daily_project_report,
+        trigger="cron",
+        day_of_week="mon-sun",
+        hour=DAILY_PROJECT_REPORT_HOUR,
+        minute=DAILY_PROJECT_REPORT_MINUTE,
+        id="daily_project_annotation_report",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     logger.info(
         "[scheduler] Started — Encord sync every %s min; hiring sync %s",
         ENCORD_SYNC_MINUTE,
         "ENABLED (every 12h)" if os.getenv("ENABLE_HIRING_SYNC") else "disabled",
     )
+
+def _scheduled_daily_project_report() -> None:
+    """Send daily annotation report for yesterday to PM channel (or test channel C0BQX541CNT)."""
+    from app.services.daily_project_report_service import send_daily_annotation_report
+    try:
+        send_daily_annotation_report(channel_id=DAILY_PROJECT_REPORT_CHANNEL_ID)
+    except Exception as exc:
+        logger.error("[scheduler] Daily project annotation report job failed: %s", exc)
 
 def _scheduled_lunch_report() -> None:
     """Generate and email the daily lunch order PDF with zero connection leaks."""

@@ -105,8 +105,9 @@ def _windows(start: datetime, end: datetime):
 
 
 def _default_window() -> tuple[datetime, datetime]:
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    return today - timedelta(days=1), today
+    now = datetime.now()
+    start = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, now
 
 
 def mapped_projects(db: Session) -> list[DailySheet]:

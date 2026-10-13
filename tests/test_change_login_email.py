@@ -194,3 +194,44 @@ def test_admin_can_still_set_any_address_via_the_generic_update(ctx):
     assert resp.status_code == 200
     db.expire_all()
     assert db.query(Employee).get(employee.id).email == "contractor@partner.com"
+
+
+def test_admin_convert_employee_to_fulltime_creates_notification(ctx):
+    from app.models.notification import Notification
+
+    client, db, employee, as_admin = ctx
+    as_admin()
+
+    # Set employee initially as Intern
+    employee.employee_type = "Intern"
+    db.commit()
+
+    resp = client.put(f"/api/employees/{employee.id}", json={"employee_type": "Full-time"})
+    assert resp.status_code == 200
+
+    db.expire_all()
+    updated_emp = db.query(Employee).get(employee.id)
+    assert updated_emp.employee_type == "Full-time"
+    assert updated_emp.previous_employee_type == "Intern"
+    assert updated_emp.converted_to_fulltime_at is not None
+
+    user = db.query(User).filter(User.employee_id == employee.id).first()
+    assert user.employment_type == "Full-time"
+
+    notif = db.query(Notification).filter(Notification.user_id == user.id).first()
+    assert notif is not None
+    assert notif.type == "employee_converted"
+    assert "Full-time" in notif.title
+
+
+def test_convert_to_fulltime_endpoint(ctx):
+    client, db, employee, as_admin = ctx
+    as_admin()
+
+    employee.employee_type = "Intern"
+    db.commit()
+
+    resp = client.post(f"/api/employees/{employee.id}/convert-to-fulltime", json={"converted_by": 999})
+    assert resp.status_code == 200
+
+

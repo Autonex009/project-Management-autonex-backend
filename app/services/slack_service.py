@@ -1388,6 +1388,80 @@ def notify_employee_auto_allocated(
     raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
 
 
+def notify_employee_promoted_fulltime(
+    *,
+    employee_slack_user_id: str,
+    employee_name: str,
+    designation: str | None = None,
+) -> bool:
+    channel_id = open_direct_message_channel(employee_slack_user_id)
+    role_info = f" as *{designation}*" if designation else ""
+    response = _slack_request(
+        "/chat.postMessage",
+        {
+            "channel": channel_id,
+            "text": f"🎉 Congratulations {employee_name}! You have been promoted to Full-time{role_info}.",
+            "blocks": [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "🎉 Congratulations on your Promotion!",
+                        "emoji": True,
+                    },
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"Hello *{employee_name}*,\n\n"
+                            f"Your employment status has been officially updated to *Full-time*{role_info}.\n"
+                            "Full-time leave entitlements, floater leaves, and benefits now apply to your account."
+                        ),
+                    },
+                },
+                {
+                    "type": "section",
+                    "fields": [
+                        {"type": "mrkdwn", "text": "*Employment Type*\nFull-time"},
+                        {"type": "mrkdwn", "text": f"*Designation*\n{designation or 'Employee'}"},
+                        {"type": "mrkdwn", "text": "*Effective Date*\nImmediate"},
+                        {"type": "mrkdwn", "text": "*Benefits*\nAnnual Quotas Active"},
+                    ],
+                },
+            ],
+        },
+    )
+    if response.get("ok"):
+        return True
+    raise RuntimeError(f"Slack message failed: {response.get('error') or 'unknown_error'}")
+
+
+def try_notify_employee_promoted_fulltime(
+    *,
+    employee_slack_user_id: str | None,
+    employee_name: str,
+    designation: str | None = None,
+) -> bool:
+    if not employee_slack_user_id:
+        return False
+    try:
+        return notify_employee_promoted_fulltime(
+            employee_slack_user_id=employee_slack_user_id,
+            employee_name=employee_name,
+            designation=designation,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not send Full-time promotion Slack notification to %s (%s): %s",
+            employee_name,
+            employee_slack_user_id,
+            exc,
+        )
+        return False
+
+
 def send_allocation_notifications_to_leaders(
     db,
     allocation,
