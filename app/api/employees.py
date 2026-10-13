@@ -65,6 +65,7 @@ EMPLOYEE_FIELD_LABELS = {
     "encord_id": "Encord ID",
     "razorpay_email": "Razorpay email",
     "slack_user_id": "Slack user ID",
+    "converted_to_fulltime_at": "Full-time start date",
     "mentor_id": "Mentor",
 }
 
@@ -72,6 +73,7 @@ EMPLOYEE_FIELD_LABELS = {
 from app.services.slack_service import (
     try_get_or_cache_employee_slack_user_id,
     try_lookup_user_avatar_by_email,
+    try_notify_employee_promoted_fulltime,
 )
 
 # Avatars live in Supabase Storage, never on disk. The host filesystem is
@@ -214,6 +216,9 @@ def create_employee(
     # Salary is encrypted at rest — never store the plaintext column.
     plain_salary = data.pop("base_salary", None)
     employee = Employee(**data)
+    if employee.employee_type == "Full-time" and not employee.converted_to_fulltime_at:
+        from datetime import timezone
+        employee.converted_to_fulltime_at = datetime.now(timezone.utc).replace(tzinfo=None)
     if plain_salary is not None:
         employee.base_salary_enc = encrypt_salary(plain_salary)
     db.add(employee)
@@ -580,91 +585,67 @@ def list_employees_paginated(
         
         daily_sheets = db.query(DailySheet).filter(DailySheet.id.in_(ds_ids)).all()
         ds_by_id = {ds.id: ds for ds in daily_sheets}
-        
-        mp_ids = list(set([ds.main_project_id for ds in daily_sheets if ds.main_project_id]))
-        main_projects = db.query(MainProject).filter(MainProject.id.in_(mp_ids)).all()
-        mp_by_id = {mp.id: mp for mp in main_projects}
-        
-        hsp_ids = list(set([ds.sub_project_id for ds in daily_sheets if ds.sub_project_id]))
-        hierarchy_sub_projects = db.query(HierarchySubProject).filter(HierarchySubProject.id.in_(hsp_ids)).all()
-        hsp_by_id = {hsp.id: hsp for hsp in hierarchy_sub_projects}
-        
-        manager_emp_ids = set()
-        for mp in main_projects:
-            if getattr(mp, "program_manager_ids", None):
-                for pm_id in mp.program_manager_ids:
-                    try:
-                        manager_emp_ids.add(int(pm_id))
-                    except (TypeError, ValueError):
-                        pass
-            elif getattr(mp, "program_manager_id", None):
-                manager_emp_ids.add(mp.program_manager_id)
-        for hsp in hierarchy_sub_projects:
-            if getattr(hsp, "pm_id", None):
-                manager_emp_ids.add(hsp.pm_id)
+        from app.services.project_scope import project_pm_ids, project_lead_ids
+
+        # Resolve managers/leads per daily sheet:
+        # If PM is there -> show all PMs, no leads. If no PM -> show all leads.
+        ds_pm_ids = {}
+        ds_lead_ids = {}
+        all_resolved_mgr_ids = set()
         for ds in daily_sheets:
-            if getattr(ds, "assigned_employee_ids", None):
-                for pm_id in ds.assigned_employee_ids:
-                    try:
-                        manager_emp_ids.add(int(pm_id))
-                    except (TypeError, ValueError):
-                        pass
-                
-        managers = db.query(Employee).filter(Employee.id.in_(list(manager_emp_ids))).all()
-        manager_by_id = {m.id: m for m in managers}
-        
+            pm_ids = project_pm_ids(db, ds)
+            lead_ids = project_lead_ids(db, ds)
+            ds_pm_ids[ds.id] = pm_ids
+            ds_lead_ids[ds.id] = lead_ids
+            all_resolved_mgr_ids.update(pm_ids)
+            all_resolved_mgr_ids.update(lead_ids)
+
+        if all_resolved_mgr_ids:
+            mgr_employees = db.query(Employee).filter(Employee.id.in_(list(all_resolved_mgr_ids))).all()
+            mgr_by_id = {m.id: m.name for m in mgr_employees}
+        else:
+            mgr_by_id = {}
+
+        emp_pms = {e.id: set() for e in items}
+        emp_leads = {e.id: set() for e in items}
+        emp_projects = {e.id: [] for e in items}
+
         for alloc in allocations:
             ds = ds_by_id.get(alloc.sub_project_id)
             if not ds: continue
             
             proj_name = ds.name
-            pm_names = []
-            
-            # 1. Project-level assignment wins (Daily Sheet)
-            if getattr(ds, "assigned_employee_ids", None):
-                for pm_id in ds.assigned_employee_ids:
-                    try:
-                        m = manager_by_id.get(int(pm_id))
-                        if m: pm_names.append(m.name)
-                    except (TypeError, ValueError):
-                        pass
-                        
-            # 2. Main Project PM
-            if not pm_names and ds.main_project_id:
-                mp = mp_by_id.get(ds.main_project_id)
-                if mp:
-                    if getattr(mp, "program_manager_ids", None):
-                        for pm_id in mp.program_manager_ids:
-                            try:
-                                m = manager_by_id.get(int(pm_id))
-                                if m: pm_names.append(m.name)
-                            except (TypeError, ValueError):
-                                pass
-                    elif getattr(mp, "program_manager_id", None):
-                        m = manager_by_id.get(mp.program_manager_id)
-                        if m: pm_names.append(m.name)
-            
-            # 3. Intermediate Sub Project PM
-            if not pm_names and ds.sub_project_id:
-                hsp = hsp_by_id.get(ds.sub_project_id)
-                if hsp and getattr(hsp, "pm_id", None):
-                    m = manager_by_id.get(hsp.pm_id)
-                    if m: pm_names.append(m.name)
-                    
-            if not pm_names:
-                pm_names = ["Unassigned"]
-                
-            e_dict = emp_dict[alloc.employee_id]
-            if "assigned_projects" not in e_dict or not e_dict["assigned_projects"]:
-                e_dict["assigned_projects"] = []
-            if proj_name not in e_dict["assigned_projects"]:
-                e_dict["assigned_projects"].append(proj_name)
-                
-            if "managers" not in e_dict or not e_dict["managers"]:
+            if proj_name not in emp_projects[alloc.employee_id]:
+                emp_projects[alloc.employee_id].append(proj_name)
+
+            p_ids = ds_pm_ids.get(ds.id, set())
+            l_ids = ds_lead_ids.get(ds.id, set())
+
+            for pid in p_ids:
+                if pid in mgr_by_id:
+                    emp_pms[alloc.employee_id].add(mgr_by_id[pid])
+            for lid in l_ids:
+                if lid in mgr_by_id:
+                    emp_leads[alloc.employee_id].add(mgr_by_id[lid])
+
+        for e in items:
+            eid = e.id
+            e_dict = emp_dict[eid]
+            e_dict["assigned_projects"] = emp_projects.get(eid, [])
+
+            pms_for_emp = emp_pms.get(eid, set())
+            leads_for_emp = emp_leads.get(eid, set())
+
+            # Rule: if pms is there then only then show all pm no leads.
+            # If no pm or pms then show leads.
+            if pms_for_emp:
+                e_dict["managers"] = sorted(list(pms_for_emp))
+            elif leads_for_emp:
+                e_dict["managers"] = sorted(list(leads_for_emp))
+            elif e_dict["assigned_projects"]:
+                e_dict["managers"] = ["Unassigned"]
+            else:
                 e_dict["managers"] = []
-            for pm_name in pm_names:
-                if pm_name not in e_dict["managers"]:
-                    e_dict["managers"].append(pm_name)
 
         active_admins = db.query(Employee).filter(Employee.designation.ilike('Admin'), Employee.status == 'active').all()
         admin_names = [a.name for a in active_admins]
@@ -1004,7 +985,8 @@ def update_employee(
         admin_only_fields = {
             "email",
             "employee_type", "designation", "working_hours_per_day",
-            "weekly_availability", "productivity_baseline", "status", "base_salary"
+            "weekly_availability", "productivity_baseline", "status", "base_salary",
+            "converted_to_fulltime_at"
         }
         requested_fields = set(payload.dict(exclude_unset=True).keys())
         blocked = requested_fields.intersection(admin_only_fields)
@@ -1021,6 +1003,35 @@ def update_employee(
         )
     
     update_data = payload.dict(exclude_unset=True)
+
+    # Handle implicit promotions/demotions via employee_type change
+    if "employee_type" in update_data:
+        raw_new_type = (update_data["employee_type"] or "").strip()
+        old_type = (employee.employee_type or "").strip()
+        
+        # Robust case-insensitive Full-time detection and canonicalization
+        is_new_fulltime = raw_new_type.lower() in ("full-time", "full time", "fulltime")
+        is_old_fulltime = old_type.lower() in ("full-time", "full time", "fulltime")
+
+        if is_new_fulltime:
+            update_data["employee_type"] = "Full-time"
+            new_type = "Full-time"
+        else:
+            new_type = raw_new_type
+
+        if old_type.lower() != new_type.lower():
+            if is_new_fulltime and not is_old_fulltime:
+                update_data["converted_to_fulltime_at"] = (
+                    update_data.get("converted_to_fulltime_at")
+                    or datetime.now(timezone.utc).replace(tzinfo=None)
+                )
+                update_data["previous_employee_type"] = old_type
+                update_data["converted_by"] = current_user.id
+            elif is_old_fulltime and not is_new_fulltime:
+                update_data["converted_to_fulltime_at"] = None
+                update_data["previous_employee_type"] = None
+                update_data["converted_by"] = None
+
     # Salary is encrypted at rest — divert it to the encrypted column and keep
     # the plaintext column NULL.
     salary_changed = "base_salary" in update_data
@@ -1030,15 +1041,14 @@ def update_employee(
 
     # Snapshot before the writes land, so each diff has a real "from" side.
     before = audit_service.snapshot(employee, update_data.keys())
-    old_role = None
-    linked_user_for_role = db.query(User).filter(User.employee_id == employee.id).first()
-    if linked_user_for_role:
-        old_role = linked_user_for_role.role
+
+    # Pre-fetch linked user once (eliminates redundant second query)
+    linked_user = db.query(User).filter(User.employee_id == employee.id).first()
+    old_role = linked_user.role if linked_user else None
 
     for key, value in update_data.items():
         setattr(employee, key, value)
 
-    linked_user = db.query(User).filter(User.employee_id == employee.id).first()
     if linked_user:
         linked_user.email = employee.email
         linked_user.name = employee.name
@@ -1047,6 +1057,42 @@ def update_employee(
         elif linked_user.role not in ("admin", "hr"):
             linked_user.role = get_user_role_from_designation(employee.designation)
         linked_user.skills = employee.skills or []
+
+        # Sync employment_type to User login profile
+        if "employee_type" in update_data:
+            linked_user.employment_type = update_data["employee_type"]
+            
+            # Send notification if upgraded to Full-time
+            if update_data["employee_type"] == "Full-time" and update_data.get("converted_to_fulltime_at") is not None:
+                db.add(Notification(
+                    user_id=linked_user.id,
+                    title="Converted to Full-time",
+                    message=(
+                        f"Your employment type has been updated to Full-time"
+                        f"{f' ({employee.designation})' if employee.designation else ''}. "
+                        "Full-time leave entitlements now apply."
+                    ),
+                    type="employee_converted",
+                ))
+                # Dispatch Slack DM to promoted employee
+                try:
+                    slack_uid = employee.slack_user_id or try_get_or_cache_employee_slack_user_id(db, employee)
+                    try_notify_employee_promoted_fulltime(
+                        employee_slack_user_id=slack_uid,
+                        employee_name=employee.name,
+                        designation=employee.designation,
+                    )
+                except Exception as _exc:
+                    logger.warning("[update_employee] Could not send promotion Slack message: %s", _exc)
+
+    # Keep corresponding salary record in sync with employment_type
+    if "employee_type" in update_data:
+        try:
+            salary_record = db.query(Salary).filter(Salary.full_name == employee.name).first()
+            if salary_record:
+                salary_record.employment_type = update_data["employee_type"]
+        except Exception as exc:
+            logger.warning("[update_employee] Could not sync Salary employment_type: %s", exc)
 
     details = audit_service.diff_all(before, employee, EMPLOYEE_FIELD_LABELS)
     # A designation change silently rewrites the login role, which is a permissions
@@ -1332,6 +1378,21 @@ def convert_to_fulltime(
     except Exception as _exc:
         logging.getLogger(__name__).warning(
             "Auto-generation of fulltime_offer_letter failed for employee %s: %s",
+            employee.id,
+            _exc,
+        )
+
+    # ── Dispatch Slack DM to promoted employee ─────────────────────────────────
+    try:
+        slack_uid = employee.slack_user_id or try_get_or_cache_employee_slack_user_id(db, employee)
+        try_notify_employee_promoted_fulltime(
+            employee_slack_user_id=slack_uid,
+            employee_name=employee.name,
+            designation=employee.designation,
+        )
+    except Exception as _exc:
+        logging.getLogger(__name__).warning(
+            "Sending full-time promotion Slack notification failed for employee %s: %s",
             employee.id,
             _exc,
         )

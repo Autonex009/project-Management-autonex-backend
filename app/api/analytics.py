@@ -608,7 +608,7 @@ def project_analytics(
             "employee_name": name_by_email.get(u),   # real name, or None if unlinked (UI falls back to user_email)
             "role": user_role.get(u),
             "total_hours": _hours(total),
-            "daily": [{"date": d.isoformat(), "hours": _hours(s)} for d, s in sorted(days.items())],
+            "daily": [{"date": d.isoformat(), "hours": _hours(s), "seconds": s} for d, s in sorted(days.items())],
         })
         
     # Append any active allocated team members who logged 0 hours
