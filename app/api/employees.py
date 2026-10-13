@@ -585,91 +585,67 @@ def list_employees_paginated(
         
         daily_sheets = db.query(DailySheet).filter(DailySheet.id.in_(ds_ids)).all()
         ds_by_id = {ds.id: ds for ds in daily_sheets}
-        
-        mp_ids = list(set([ds.main_project_id for ds in daily_sheets if ds.main_project_id]))
-        main_projects = db.query(MainProject).filter(MainProject.id.in_(mp_ids)).all()
-        mp_by_id = {mp.id: mp for mp in main_projects}
-        
-        hsp_ids = list(set([ds.sub_project_id for ds in daily_sheets if ds.sub_project_id]))
-        hierarchy_sub_projects = db.query(HierarchySubProject).filter(HierarchySubProject.id.in_(hsp_ids)).all()
-        hsp_by_id = {hsp.id: hsp for hsp in hierarchy_sub_projects}
-        
-        manager_emp_ids = set()
-        for mp in main_projects:
-            if getattr(mp, "program_manager_ids", None):
-                for pm_id in mp.program_manager_ids:
-                    try:
-                        manager_emp_ids.add(int(pm_id))
-                    except (TypeError, ValueError):
-                        pass
-            elif getattr(mp, "program_manager_id", None):
-                manager_emp_ids.add(mp.program_manager_id)
-        for hsp in hierarchy_sub_projects:
-            if getattr(hsp, "pm_id", None):
-                manager_emp_ids.add(hsp.pm_id)
+        from app.services.project_scope import project_pm_ids, project_lead_ids
+
+        # Resolve managers/leads per daily sheet:
+        # If PM is there -> show all PMs, no leads. If no PM -> show all leads.
+        ds_pm_ids = {}
+        ds_lead_ids = {}
+        all_resolved_mgr_ids = set()
         for ds in daily_sheets:
-            if getattr(ds, "assigned_employee_ids", None):
-                for pm_id in ds.assigned_employee_ids:
-                    try:
-                        manager_emp_ids.add(int(pm_id))
-                    except (TypeError, ValueError):
-                        pass
-                
-        managers = db.query(Employee).filter(Employee.id.in_(list(manager_emp_ids))).all()
-        manager_by_id = {m.id: m for m in managers}
-        
+            pm_ids = project_pm_ids(db, ds)
+            lead_ids = project_lead_ids(db, ds)
+            ds_pm_ids[ds.id] = pm_ids
+            ds_lead_ids[ds.id] = lead_ids
+            all_resolved_mgr_ids.update(pm_ids)
+            all_resolved_mgr_ids.update(lead_ids)
+
+        if all_resolved_mgr_ids:
+            mgr_employees = db.query(Employee).filter(Employee.id.in_(list(all_resolved_mgr_ids))).all()
+            mgr_by_id = {m.id: m.name for m in mgr_employees}
+        else:
+            mgr_by_id = {}
+
+        emp_pms = {e.id: set() for e in items}
+        emp_leads = {e.id: set() for e in items}
+        emp_projects = {e.id: [] for e in items}
+
         for alloc in allocations:
             ds = ds_by_id.get(alloc.sub_project_id)
             if not ds: continue
             
             proj_name = ds.name
-            pm_names = []
-            
-            # 1. Project-level assignment wins (Daily Sheet)
-            if getattr(ds, "assigned_employee_ids", None):
-                for pm_id in ds.assigned_employee_ids:
-                    try:
-                        m = manager_by_id.get(int(pm_id))
-                        if m: pm_names.append(m.name)
-                    except (TypeError, ValueError):
-                        pass
-                        
-            # 2. Main Project PM
-            if not pm_names and ds.main_project_id:
-                mp = mp_by_id.get(ds.main_project_id)
-                if mp:
-                    if getattr(mp, "program_manager_ids", None):
-                        for pm_id in mp.program_manager_ids:
-                            try:
-                                m = manager_by_id.get(int(pm_id))
-                                if m: pm_names.append(m.name)
-                            except (TypeError, ValueError):
-                                pass
-                    elif getattr(mp, "program_manager_id", None):
-                        m = manager_by_id.get(mp.program_manager_id)
-                        if m: pm_names.append(m.name)
-            
-            # 3. Intermediate Sub Project PM
-            if not pm_names and ds.sub_project_id:
-                hsp = hsp_by_id.get(ds.sub_project_id)
-                if hsp and getattr(hsp, "pm_id", None):
-                    m = manager_by_id.get(hsp.pm_id)
-                    if m: pm_names.append(m.name)
-                    
-            if not pm_names:
-                pm_names = ["Unassigned"]
-                
-            e_dict = emp_dict[alloc.employee_id]
-            if "assigned_projects" not in e_dict or not e_dict["assigned_projects"]:
-                e_dict["assigned_projects"] = []
-            if proj_name not in e_dict["assigned_projects"]:
-                e_dict["assigned_projects"].append(proj_name)
-                
-            if "managers" not in e_dict or not e_dict["managers"]:
+            if proj_name not in emp_projects[alloc.employee_id]:
+                emp_projects[alloc.employee_id].append(proj_name)
+
+            p_ids = ds_pm_ids.get(ds.id, set())
+            l_ids = ds_lead_ids.get(ds.id, set())
+
+            for pid in p_ids:
+                if pid in mgr_by_id:
+                    emp_pms[alloc.employee_id].add(mgr_by_id[pid])
+            for lid in l_ids:
+                if lid in mgr_by_id:
+                    emp_leads[alloc.employee_id].add(mgr_by_id[lid])
+
+        for e in items:
+            eid = e.id
+            e_dict = emp_dict[eid]
+            e_dict["assigned_projects"] = emp_projects.get(eid, [])
+
+            pms_for_emp = emp_pms.get(eid, set())
+            leads_for_emp = emp_leads.get(eid, set())
+
+            # Rule: if pms is there then only then show all pm no leads.
+            # If no pm or pms then show leads.
+            if pms_for_emp:
+                e_dict["managers"] = sorted(list(pms_for_emp))
+            elif leads_for_emp:
+                e_dict["managers"] = sorted(list(leads_for_emp))
+            elif e_dict["assigned_projects"]:
+                e_dict["managers"] = ["Unassigned"]
+            else:
                 e_dict["managers"] = []
-            for pm_name in pm_names:
-                if pm_name not in e_dict["managers"]:
-                    e_dict["managers"].append(pm_name)
 
         active_admins = db.query(Employee).filter(Employee.designation.ilike('Admin'), Employee.status == 'active').all()
         admin_names = [a.name for a in active_admins]
@@ -1320,9 +1296,6 @@ def convert_to_fulltime(
         raise HTTPException(status_code=404, detail="Employee not found")
 
     if not is_intern_or_contractor(employee.employee_type):
-        # Idempotency safeguard: if already Full-time (e.g. rapid double-click or retry), return cleanly
-        if employee.employee_type == "Full-time":
-            return employee
         raise HTTPException(
             status_code=400,
             detail=f"Only interns or contractors can be converted to full-time (current type: {employee.employee_type}).",
