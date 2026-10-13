@@ -21,7 +21,7 @@ class User(Base):
     role = Column(String(20), nullable=False, default="employee")
     
     # Link to employee record (for pm/employee users)
-    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
+    employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True, index=True)
     
     # Skills stored as JSON array (used during signup)
     skills = Column(JSON, nullable=True)

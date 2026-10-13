@@ -55,6 +55,7 @@ class EmployeeBase(BaseModel):
     encord_id: Optional[str] = None
     avatar_url: Optional[str] = None
     employee_type: str
+    converted_to_fulltime_at: Optional[datetime] = None
     
     # Designation for role-based filtering
     designation: Optional[str] = "Annotator"
@@ -77,6 +78,32 @@ class EmployeeBase(BaseModel):
     def validate_encord_id(cls, value: Optional[str]) -> Optional[str]:
         return normalize_encord_id(value)
 
+    @field_validator("converted_to_fulltime_at", mode="before")
+    @classmethod
+    def validate_converted_to_fulltime_at(cls, value):
+        if not value:
+            return None
+        if isinstance(value, str):
+            val_str = value.strip()
+            if not val_str:
+                return None
+            try:
+                dt = datetime.fromisoformat(val_str)
+                if dt.tzinfo is not None:
+                    from datetime import timezone
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                return dt
+            except Exception:
+                pass
+        return value
+
+    @field_validator("slack_user_id", mode="before")
+    @classmethod
+    def validate_slack_user_id(cls, value):
+        if not value or not str(value).strip():
+            return None
+        return str(value).strip()
+
 
 class EmployeeCreate(EmployeeBase):
     # Write-only: accepted on input, encrypted at rest, and never echoed back
@@ -94,6 +121,7 @@ class EmployeeUpdate(BaseModel):
     encord_id: Optional[str] = None
     avatar_url: Optional[str] = None
     employee_type: Optional[str] = None
+    converted_to_fulltime_at: Optional[datetime] = None
     designation: Optional[str] = None
     work_model: Optional[str] = None
     
@@ -114,6 +142,32 @@ class EmployeeUpdate(BaseModel):
     @classmethod
     def validate_encord_id(cls, value: Optional[str]) -> Optional[str]:
         return normalize_encord_id(value)
+
+    @field_validator("converted_to_fulltime_at", mode="before")
+    @classmethod
+    def validate_converted_to_fulltime_at(cls, value):
+        if not value:
+            return None
+        if isinstance(value, str):
+            val_str = value.strip()
+            if not val_str:
+                return None
+            try:
+                dt = datetime.fromisoformat(val_str)
+                if dt.tzinfo is not None:
+                    from datetime import timezone
+                    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+                return dt
+            except Exception:
+                pass
+        return value
+
+    @field_validator("slack_user_id", mode="before")
+    @classmethod
+    def validate_slack_user_id(cls, value):
+        if not value or not str(value).strip():
+            return None
+        return str(value).strip()
 
 
 class EmployeeResponse(EmployeeBase):

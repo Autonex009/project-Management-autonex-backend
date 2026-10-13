@@ -181,9 +181,8 @@ def test_pm_leave_routes_to_admin_and_full_lifecycle(client_and_db):
 
 
 def test_pm_paid_leave_over_monthly_limit_is_flagged(client_and_db):
-    """Same flagging rule as employees: the 6th paid leave in a calendar month
-    is flagged (max 5/month). 'Unpaid' is not a selectable type — exhausted
-    paid quota is auto-converted to unpaid by payroll, identical to employees."""
+    """Full-time employees and PMs have no monthly limit for paid leaves,
+    so leaves are not flagged."""
     client, db = client_and_db
     ids = _seed(db)
     pm_emp_id = ids["pm_emp"].id
@@ -216,8 +215,7 @@ def test_pm_paid_leave_over_monthly_limit_is_flagged(client_and_db):
         # Approve the request so it counts towards the limit for subsequent requests
         client.patch(f"/api/leaves/{data['leave_id']}/approve", params={"approved_by": admin_user_id})
 
-    assert not any(flags[:5])
-    assert flags[5] is True, "6th paid leave in a month must be flagged for PMs too"
+    assert not any(flags), "Full-time PM leaves should not be flagged (no monthly limit)"
 
 
 def test_pm_wfh_routes_to_admin_and_can_be_rejected(client_and_db):
