@@ -44,7 +44,7 @@ class Employee(Base):
     base_salary = Column(Float, nullable=True)
     base_salary_enc = Column(Text, nullable=True)
 
-    status = Column(Text, default="active")  # active, inactive, on-leave
+    status = Column(Text, default="active", index=True)  # active, inactive, on-leave
     mentor_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
 
 

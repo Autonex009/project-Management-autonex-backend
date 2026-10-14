@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Query
+from fastapi import APIRouter, Depends, HTTPException, Request, Query, BackgroundTasks
 from app.services.auth_service import get_current_user, require_role
 from app.services import audit_service, project_scope
 from sqlalchemy.orm import Session
@@ -532,6 +532,7 @@ def enrich_projects_bulk(db: Session, projects: list[Project]) -> list[dict]:
 def create_project(
     payload: ProjectCreate,
     http_request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -611,6 +612,16 @@ def create_project(
 
     db.commit()
     db.refresh(project)
+
+    # Non-blocking background backfill: allocate any active pipeline candidates waiting for training
+    is_training = (
+        (project.project_type or "").lower() == "training"
+        or "week 1 training" in (project.name or "").lower()
+    )
+    if is_training and project.project_status != "archived":
+        from app.api.onboarding_pipeline import background_backfill_training_allocations
+        background_tasks.add_task(background_backfill_training_allocations, project.id)
+
     return enrich_project_response(db, project)
 
 
@@ -933,6 +944,7 @@ def update_project(
     project_id: int,
     payload: ProjectUpdate,
     http_request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1043,6 +1055,13 @@ def update_project(
                 Allocation.is_active == True
             ).count()
         )
+        is_training = (
+            (project.project_type or "").lower() == "training"
+            or "week 1 training" in (project.name or "").lower()
+        )
+        if is_training:
+            from app.api.onboarding_pipeline import clear_training_sheet_cache
+            clear_training_sheet_cache()
 
     details = audit_service.diff_all(
         before,
@@ -1097,6 +1116,15 @@ def update_project(
 
     db.commit()
     db.refresh(project)
+
+    # Non-blocking background backfill: allocate any active pipeline candidates waiting for training
+    is_training = (
+        (project.project_type or "").lower() == "training"
+        or "week 1 training" in (project.name or "").lower()
+    )
+    if is_training and project.project_status != "archived":
+        from app.api.onboarding_pipeline import background_backfill_training_allocations
+        background_tasks.add_task(background_backfill_training_allocations, project.id)
 
     return enrich_project_response(db, project)
 
@@ -1155,6 +1183,31 @@ def delete_project(
         ),
         request=http_request,
     )
+
+    # Handle training project deletion: cancel active pipelines and clear cache
+    is_training = (
+        (project.project_type or "").lower() == "training"
+        or "week 1 training" in (project.name or "").lower()
+    )
+    if is_training:
+        from app.api.onboarding_pipeline import clear_training_sheet_cache
+        from app.models.onboarding_pipeline import OnboardingPipeline
+        clear_training_sheet_cache()
+
+        trainee_allocs = db.query(Allocation.employee_id).filter(
+            Allocation.sub_project_id == project_id,
+            Allocation.is_active == True,
+        ).all()
+        emp_ids = [t[0] for t in trainee_allocs if t[0]]
+        if emp_ids:
+            user_ids = [
+                u[0] for u in db.query(User.id).filter(User.employee_id.in_(emp_ids)).all()
+            ]
+            if user_ids:
+                db.query(OnboardingPipeline).filter(
+                    OnboardingPipeline.candidate_id.in_(user_ids),
+                    OnboardingPipeline.status.in_(["pending_confirmation", "in_progress", "day_5_pending"]),
+                ).update({"status": "cancelled"}, synchronize_session=False)
 
     # Delete related allocations + performance evaluations first (FK / orphan cleanup)
     db.query(Allocation).filter(Allocation.sub_project_id == project_id).delete()

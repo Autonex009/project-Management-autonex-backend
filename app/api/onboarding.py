@@ -8,7 +8,7 @@ from datetime import datetime, date
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, load_only
 from sqlalchemy import func, or_
 from pydantic import BaseModel
 from app.utils.business_time import today_ist
@@ -69,16 +69,27 @@ def _is_pm_or_admin(user: User, employee: Employee) -> bool:
 
 
 def get_onboarding_candidates(db: Session) -> List[User]:
-    """Retrieve all annotation staff: designation contains Annotator/Reviewer, OR the linked
-    employee has an annotation skill — but skill-only matches exclude PMs/Admins."""
-    rows = db.query(User, Employee).join(
-        Employee, User.employee_id == Employee.id
-    ).all()
+    """Retrieve all ACTIVE annotation staff: designation contains Annotator/Reviewer, OR the linked
+    employee has an annotation skill — excludes PMs/Admins and archived/inactive employees."""
+    rows = (
+        db.query(User)
+        .options(load_only(User.id, User.name, User.email, User.employee_id, User.created_at))
+        .join(Employee, User.employee_id == Employee.id)
+        .filter(
+            Employee.status == "active",
+            User.is_active == True,
+            User.role.notin_(["admin", "pm", "hr"]),
+        )
+        .add_columns(Employee.designation, Employee.skills)
+        .all()
+    )
     candidates = []
-    for user, employee in rows:
-        designation = (employee.designation or "").lower()
-        is_annotator_designation = "annotator" in designation or "reviewer" in designation
-        skill_based = _has_annotation_skill(employee.skills) and not _is_pm_or_admin(user, employee)
+    for user, designation, skills in rows:
+        desig_lower = (designation or "").lower()
+        is_annotator_designation = "annotator" in desig_lower or "reviewer" in desig_lower
+        skill_based = _has_annotation_skill(skills) and not (
+            "program manager" in desig_lower or "project manager" in desig_lower or "admin" in desig_lower
+        )
         if is_annotator_designation or skill_based:
             candidates.append(user)
     return candidates
@@ -88,10 +99,15 @@ def _actively_allocated_employee_ids(db: Session) -> set:
     """Employee ids that have at least one allocation active as of today
     (allocation window includes today; null start/end counts as open-ended/active)."""
     today = today_ist()
-    allocations = db.query(Allocation.employee_id).filter(
-        or_(Allocation.active_start_date.is_(None), Allocation.active_start_date <= today),
-        or_(Allocation.active_end_date.is_(None), Allocation.active_end_date >= today),
-    ).all()
+    allocations = (
+        db.query(Allocation.employee_id)
+        .filter(
+            Allocation.is_active == True,
+            or_(Allocation.active_start_date.is_(None), Allocation.active_start_date <= today),
+            or_(Allocation.active_end_date.is_(None), Allocation.active_end_date >= today),
+        )
+        .all()
+    )
     return {row[0] for row in allocations}
 
 
@@ -844,13 +860,19 @@ def get_analytics_dashboard(
     )
 
     recent = []
-    for c in candidates[:5]:
-        employee = db.query(Employee).filter(Employee.id == c.employee_id).first()
+    first_5 = candidates[:5]
+    emp_ids = [c.employee_id for c in first_5 if c.employee_id]
+    emp_desig_map = {
+        row[0]: row[1]
+        for row in db.query(Employee.id, Employee.designation).filter(Employee.id.in_(emp_ids)).all()
+    } if emp_ids else {}
+
+    for c in first_5:
         recent.append({
             "id": c.id,
             "name": c.name,
             "email": c.email,
-            "department": employee.designation if employee else "Annotator",
+            "department": emp_desig_map.get(c.employee_id) or "Annotator",
             "createdAt": c.created_at,
         })
 
