@@ -384,10 +384,7 @@ def _range_dates(
         start = _parse_date(date_from, _month_start(today))
         end = _parse_date(date_to, today)
         return start, end
-    if key == "1":
-        yesterday = today - timedelta(days=1)
-        return yesterday, yesterday
-    days = {"7": 7, "30": 30}.get(key, 7)
+    days = {"1": 1, "7": 7, "30": 30}.get(key, 7)
     return today - timedelta(days=days - 1), today
 
 

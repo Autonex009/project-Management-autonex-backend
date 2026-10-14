@@ -986,18 +986,25 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
-    # Daily Project Annotation Report – every day at 10:00 AM IST (Mon-Sun)
-    _scheduler.add_job(
-        _scheduled_daily_project_report,
-        trigger="cron",
-        day_of_week="mon-sun",
-        hour=DAILY_PROJECT_REPORT_HOUR,
-        minute=DAILY_PROJECT_REPORT_MINUTE,
-        id="daily_project_annotation_report",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
+    # TEMPORARILY DISABLED: Daily Project Annotation Report at 10:00 AM IST (Mon-Sun)
+    # Commented out to eliminate the 10:00 AM morning scheduler collision and threadpool saturation.
+    try:
+        _scheduler.remove_job("daily_project_annotation_report")
+    except Exception:
+        pass
+
+    # _scheduler.add_job(
+    #     _scheduled_daily_project_report,
+    #     trigger="cron",
+    #     day_of_week="mon-sun",
+    #     hour=DAILY_PROJECT_REPORT_HOUR,
+    #     minute=DAILY_PROJECT_REPORT_MINUTE,
+    #     id="daily_project_annotation_report",
+    #     replace_existing=True,
+    #     max_instances=1,
+    #     coalesce=True,
+    # )
+
 
     logger.info(
         "[scheduler] Started — Encord sync every %s min; hiring sync %s",
