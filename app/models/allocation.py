@@ -12,7 +12,10 @@ class Allocation(Base):
     Links to DailySheet (daily_sheets table) via sub_project_id for backward compat.
     """
     __tablename__ = "allocations"
-    __table_args__ = (Index('ix_allocations_sub_project_active', 'sub_project_id', 'is_active'),)
+    __table_args__ = (
+        Index('ix_allocations_sub_project_active', 'sub_project_id', 'is_active'),
+        Index('ix_allocations_employee_active', 'employee_id', 'is_active'),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     employee_id = Column(Integer, nullable=False)

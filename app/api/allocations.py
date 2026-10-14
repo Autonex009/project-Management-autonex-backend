@@ -12,6 +12,7 @@ from app.models.project import SubProject, Project  # SubProject with Project al
 from app.models.employee import Employee
 from app.models.parent_project import MainProject
 from app.models.sub_project import SubProject as HierarchySubProject
+from app.models.onboarding_pipeline import OnboardingPipeline
 from datetime import date as date_cls
 from app.models.leave import Leave
 from app.models.wfh import WFHRequest
@@ -770,7 +771,27 @@ def create_allocation(
         alloc_end=data.active_end_date,
     )
 
-    project = db.query(Project).filter(Project.id == data.sub_project_id).first()
+    # GUARD (Pillar 5): Block direct allocation of active onboarding trainees to non-training projects
+    candidate_user_id = db.query(User.id).filter(User.employee_id == data.employee_id).scalar()
+    if candidate_user_id:
+        active_pipeline_status = db.query(OnboardingPipeline.status).filter(
+            OnboardingPipeline.candidate_id == candidate_user_id,
+            OnboardingPipeline.status.in_(["pending_confirmation", "in_progress", "day_5_pending"]),
+        ).scalar()
+        is_training = project and (
+            (project.project_type or "").lower() == "training"
+            or "week 1 training" in (project.name or "").lower()
+        )
+        if active_pipeline_status and not is_training:
+            emp_name = db.query(Employee.name).filter(Employee.id == data.employee_id).scalar() or "Employee"
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot allocate {emp_name}: This candidate is currently in the 5-day Onboarding Training "
+                    f"(status: {active_pipeline_status}). To allocate them to a production project, "
+                    "they must first complete training or be explicitly removed from the Training project."
+                ),
+            )
 
     allocation = Allocation(**data.model_dump())
     db.add(allocation)
@@ -965,6 +986,54 @@ def update_allocation(
             action="move allocations onto this project",
         )
 
+        # GUARD (Pillar 5): Block moving an active onboarding trainee to a non-training project
+        candidate_user_id = db.query(User.id).filter(User.employee_id == allocation.employee_id).scalar()
+        if candidate_user_id:
+            active_pipeline_status = db.query(OnboardingPipeline.status).filter(
+                OnboardingPipeline.candidate_id == candidate_user_id,
+                OnboardingPipeline.status.in_(["pending_confirmation", "in_progress", "day_5_pending"]),
+            ).scalar()
+            is_dest_training = new_project and (
+                (new_project.project_type or "").lower() == "training"
+                or "week 1 training" in (new_project.name or "").lower()
+            )
+            if active_pipeline_status and not is_dest_training:
+                emp_name = db.query(Employee.name).filter(Employee.id == allocation.employee_id).scalar() or "Employee"
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Cannot move {emp_name}: This candidate is currently in the 5-day Onboarding Training "
+                        f"(status: {active_pipeline_status}). To allocate them to a production project, "
+                        "they must first complete training or be explicitly removed from the Training project."
+                    ),
+                )
+
+    # GUARD (Pillar 5): Block re-activating an allocation on a non-training project for active onboarding trainees
+    if data.is_active is True and allocation.is_active is False:
+        target_pid = data.sub_project_id or allocation.sub_project_id
+        target_proj = db.query(Project).filter(Project.id == target_pid).first()
+        is_target_training = target_proj and (
+            (target_proj.project_type or "").lower() == "training"
+            or "week 1 training" in (target_proj.name or "").lower()
+        )
+        if not is_target_training:
+            candidate_user_id = db.query(User.id).filter(User.employee_id == allocation.employee_id).scalar()
+            if candidate_user_id:
+                active_pipeline_status = db.query(OnboardingPipeline.status).filter(
+                    OnboardingPipeline.candidate_id == candidate_user_id,
+                    OnboardingPipeline.status.in_(["pending_confirmation", "in_progress", "day_5_pending"]),
+                ).scalar()
+                if active_pipeline_status:
+                    emp_name = db.query(Employee.name).filter(Employee.id == allocation.employee_id).scalar() or "Employee"
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Cannot activate allocation for {emp_name}: This candidate is currently in the 5-day Onboarding Training "
+                            f"(status: {active_pipeline_status}). To allocate them to a production project, "
+                            "they must first complete training or be explicitly removed from the Training project."
+                        ),
+                    )
+
     # Validate time distribution if being updated
     new_hours = data.total_daily_hours or allocation.total_daily_hours or 8
     new_distribution = data.time_distribution if data.time_distribution is not None else allocation.time_distribution
@@ -1074,6 +1143,27 @@ def update_allocation(
         ),
         request=http_request,
     )
+
+    # If deactivating an allocation on a Training project, cancel active onboarding pipeline
+    if before_values.get("is_active") is True and allocation.is_active is False:
+        proj = db.query(Project).filter(Project.id == allocation.sub_project_id).first()
+        is_training = proj and (
+            (proj.project_type or "").lower() == "training"
+            or "week 1 training" in (proj.name or "").lower()
+        )
+        if is_training:
+            candidate_user_id = db.query(User.id).filter(User.employee_id == allocation.employee_id).scalar()
+            if candidate_user_id:
+                active_pipe = db.query(OnboardingPipeline).filter(
+                    OnboardingPipeline.candidate_id == candidate_user_id,
+                    OnboardingPipeline.status.in_(["pending_confirmation", "in_progress", "day_5_pending"]),
+                ).first()
+                if active_pipe:
+                    active_pipe.status = "cancelled"
+                    logger.info(
+                        "Cancelled onboarding pipeline #%s for candidate #%s upon deactivation from training.",
+                        active_pipe.id, candidate_user_id
+                    )
 
     db.commit()
     db.refresh(allocation)
@@ -1242,6 +1332,25 @@ def delete_allocation(
         ),
         request=http_request,
     )
+
+    # Check if removing an allocation from a Training project
+    is_training = project and (
+        (project.project_type or "").lower() == "training"
+        or "week 1 training" in (project.name or "").lower()
+    )
+    if is_training:
+        candidate_user_id = db.query(User.id).filter(User.employee_id == allocation.employee_id).scalar()
+        if candidate_user_id:
+            active_pipe = db.query(OnboardingPipeline).filter(
+                OnboardingPipeline.candidate_id == candidate_user_id,
+                OnboardingPipeline.status.in_(["pending_confirmation", "in_progress", "day_5_pending"]),
+            ).first()
+            if active_pipe:
+                active_pipe.status = "cancelled"
+                logger.info(
+                    "Cancelled onboarding pipeline #%s for candidate #%s upon removal from training.",
+                    active_pipe.id, candidate_user_id
+                )
 
     db.delete(allocation)
     db.flush()

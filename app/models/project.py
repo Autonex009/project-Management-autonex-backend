@@ -3,7 +3,7 @@ DailySheet model (formerly SubProject).
 Represents daily sheets / batches with tasks, time targets, and employee assignments.
 Hierarchy: MainProject → SubProject → DailySheet → Allocations
 """
-from sqlalchemy import Column, Integer, String, Date, Float, Text, TIMESTAMP, JSON, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, Date, Float, Text, TIMESTAMP, JSON, Boolean, ForeignKey, Index
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 
@@ -12,6 +12,9 @@ from app.db.database import Base
 
 class DailySheet(Base):
     __tablename__ = "daily_sheets"
+    __table_args__ = (
+        Index('ix_daily_sheets_type_status', 'project_type', 'project_status'),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     
