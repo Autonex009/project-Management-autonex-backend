@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, Request, Query, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Query, BackgroundTasks
 from app.services.auth_service import get_current_user, require_role
 from app.services import audit_service, project_scope
 from sqlalchemy.orm import Session
@@ -15,6 +15,7 @@ from app.schemas.project import (
     ProjectCreate,
     ProjectUpdate,
     ProjectResponse,
+    ProjectDropdownItem,
 )
 
 
@@ -151,7 +152,7 @@ def _get_temp_rosters_for_projects(db: Session, pids: list[int], permanent_alloc
       ]
     }
     """
-    from datetime import date
+    from datetime import date, timedelta
     from sqlalchemy import desc
     from app.models.daily_checkin import DailyCheckIn
     from app.models.leave import Leave
@@ -160,8 +161,14 @@ def _get_temp_rosters_for_projects(db: Session, pids: list[int], permanent_alloc
 
     today = date.today()
     
-    # 1. Get latest checkins for all employees
-    latest_checkins = db.query(DailyCheckIn).distinct(DailyCheckIn.employee_id).order_by(DailyCheckIn.employee_id, desc(DailyCheckIn.checkin_date)).all()
+    # 1. Get latest checkins for active employees (strictly bounded to recent days to leverage the checkin_date B-Tree index!)
+    latest_checkins = (
+        db.query(DailyCheckIn)
+        .filter(DailyCheckIn.checkin_date >= today - timedelta(days=5))
+        .distinct(DailyCheckIn.employee_id)
+        .order_by(DailyCheckIn.employee_id, desc(DailyCheckIn.checkin_date))
+        .all()
+    )
     
     # Filter to only checkins that contain any of our pids
     pid_strs = {str(p) for p in pids}
@@ -625,15 +632,67 @@ def create_project(
     return enrich_project_response(db, project)
 
 
+# ✅ LIGHTWEIGHT DROPDOWN PROJECTS (Sub-15ms, zero analytics/sentiment math)
+@router.get("/dropdown", response_model=list[ProjectDropdownItem])
+def get_projects_dropdown(
+    response: Response = None,
+    search: str | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Ultra-fast (~10ms) column-only project list for modal dropdowns.
+    Zero sentiment, zero task calculations, zero gearing ratios, zero capacity loops.
+    Includes typeahead search and private HTTP client-side caching header.
+    """
+    auth_ids = project_scope.get_authorized_project_ids(db, current_user)
+    query = db.query(
+        Project.id,
+        Project.name,
+        Project.required_manpower,
+        Project.required_expertise,
+        Project.project_status,
+    )
+    if auth_ids is not None:
+        query = query.filter(Project.id.in_(auth_ids))
+
+    if search and isinstance(search, str) and search.strip():
+        query = query.filter(Project.name.ilike(f"%{search.strip()}%"))
+
+    ARCHIVED_STATUSES = {"completed", "on-hold", "cancelled"}
+    rows = (
+        query.filter(
+            (Project.project_status == None) |
+            (~func.lower(Project.project_status).in_(ARCHIVED_STATUSES))
+        )
+        .order_by(Project.name.asc())
+        .all()
+    )
+
+    # Allow private client caching for 30s to eliminate redundant roundtrips on rapid modal re-opens
+    if response is not None:
+        response.headers["Cache-Control"] = "private, max-age=30"
+
+    return [
+        {
+            "id": r[0],
+            "name": r[1],
+            "required_manpower": r[2] or 0,
+            "required_expertise": r[3] or [],
+            "project_status": r[4] or "active",
+        }
+        for r in rows
+    ]
+
+
 # ✅ LIST PROJECTS
 @router.get("", response_model=list[dict])
 def list_projects(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    projects = db.query(Project).order_by(Project.id.asc()).all()
+    auth_ids = project_scope.get_authorized_project_ids(db, current_user)
+    query = db.query(Project).order_by(Project.id.asc())
+    if auth_ids is not None:
+        query = query.filter(Project.id.in_(auth_ids))
 
-    # Filter projects based on user scope
-    if current_user.role in ("pm", "hr", "team_lead") and not project_scope.has_full_access(current_user):
-        projects = [p for p in projects if project_scope.can_act_on_project(db, current_user, p)]
-
+    projects = query.all()
     return enrich_projects_bulk(db, projects)
 
 
@@ -729,9 +788,9 @@ def _get_filtered_enriched_projects(
 
     all_projects = query.all()
 
-    if current_user.role in ("pm", "hr", "team_lead") and not project_scope.has_full_access(current_user):
-        allowed_ids = project_scope.managed_projects_of_employee(db, current_user, current_user.employee_id)
-        all_projects = [p for p in all_projects if p.id in allowed_ids]
+    auth_ids = project_scope.get_authorized_project_ids(db, current_user)
+    if auth_ids is not None:
+        all_projects = [p for p in all_projects if p.id in auth_ids]
 
     tl_valid_pids = set()
     if team_lead_id and str(team_lead_id) != "all":

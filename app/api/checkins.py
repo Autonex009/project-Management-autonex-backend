@@ -696,8 +696,12 @@ def confirm_team_today(
     if not scoped_project_ids:
         return ConfirmResult(confirmed=0)
 
-    allocs = db.query(Allocation).filter(Allocation.sub_project_id.in_(scoped_project_ids), Allocation.is_active == True).all()
-    roster_emp_ids = {a.employee_id for a in allocs if a.employee_id}
+    roster_emp_ids = {
+        r[0] for r in db.query(Allocation.employee_id).filter(
+            Allocation.sub_project_id.in_(scoped_project_ids),
+            Allocation.is_active == True
+        ).distinct().all() if r[0]
+    }
     
     query = db.query(DailyCheckIn).filter(
         DailyCheckIn.checkin_date == today,
@@ -709,12 +713,36 @@ def confirm_team_today(
         
     all_today_checkins = query.all()
     
+    from app.services import project_scope
+    actor_id = current_user.employee_id
+    actor_designation = project_scope._subject_designation(db, actor_id) if actor_id else ""
+    is_team_lead = (current_user.role == "team_lead") or (actor_designation in project_scope.PM_ONLY_SUBJECT_DESIGNATIONS)
+
+    target_emp_ids = {
+        c.employee_id for c in all_today_checkins
+        if (c.employee_id in roster_emp_ids or set(c.project_ids or []).intersection(scoped_project_ids))
+    }
+    target_desigs = project_scope._designations(db, target_emp_ids) if is_team_lead and target_emp_ids else {}
+
+    if is_team_lead and req and req.employee_ids is not None:
+        for eid in req.employee_ids:
+            desig = target_desigs.get(eid, "")
+            if desig in project_scope.ADMIN_ONLY_SUBJECT_DESIGNATIONS or desig in project_scope.PM_ONLY_SUBJECT_DESIGNATIONS:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Team Leads cannot confirm check-ins for PMs or peer Leads",
+                )
+
     to_confirm = []
     now = _get_ist_now()
     
     for c in all_today_checkins:
         c_pids = set(c.project_ids or [])
         if c.employee_id in roster_emp_ids or c_pids.intersection(scoped_project_ids):
+            if is_team_lead:
+                desig = target_desigs.get(c.employee_id, "")
+                if desig in project_scope.ADMIN_ONLY_SUBJECT_DESIGNATIONS or desig in project_scope.PM_ONLY_SUBJECT_DESIGNATIONS:
+                    continue
             c.pm_confirmed_at = now
             c.pm_confirmed_by = current_user.id
             to_confirm.append(c)

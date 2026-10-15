@@ -135,3 +135,14 @@ class ProjectResponse(ProjectBase):
 
     class Config:
         from_attributes = True
+
+
+class ProjectDropdownItem(BaseModel):
+    id: int
+    name: str
+    required_manpower: int = 0
+    required_expertise: List[str] = []
+    project_status: str = "active"
+
+    class Config:
+        from_attributes = True
