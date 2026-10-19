@@ -102,6 +102,104 @@ def verify_and_delete_refresh_token(token: str, db: Session) -> Optional[int]:
 # def is_token_blacklisted(token: str) -> bool:
 #     return token in _blacklisted_tokens
 
+import json
+import threading
+from app.services.project_cache import InMemoryTTLCache, get_redis_client
+
+# 5-minute RAM TTL cache for authenticated users to protect the 8-slot DB pool
+_user_auth_cache = InMemoryTTLCache(ttl_seconds=300.0, max_size=2000)
+_user_fetch_lock = threading.Lock()
+
+
+def _cache_user_in_redis(user: User) -> None:
+    """Store authenticated user in L2 Redis (15-min TTL matching JWT expiry)."""
+    redis_client = get_redis_client()
+    if not redis_client:
+        return
+    try:
+        payload = {
+            "id": user.id,
+            "email": user.email,
+            "name": user.name,
+            "role": user.role,
+            "employee_id": user.employee_id,
+            "skills": user.skills,
+            "is_active": user.is_active,
+            "must_change_password": getattr(user, "must_change_password", False),
+            "employment_type": getattr(user, "employment_type", None),
+            "work_description": getattr(user, "work_description", None),
+            "password_hash": getattr(user, "password_hash", ""),
+        }
+        redis_client.set(f"auth:user:{user.id}", json.dumps(payload), ex=900)
+    except Exception:
+        pass
+
+
+def _get_user_from_redis(user_id: int) -> Optional[User]:
+    """Retrieve user from L2 Redis."""
+    redis_client = get_redis_client()
+    if not redis_client:
+        return None
+    try:
+        raw = redis_client.get(f"auth:user:{user_id}")
+        if raw:
+            d = json.loads(raw)
+            return User(
+                id=d["id"],
+                email=d["email"],
+                name=d["name"],
+                role=d["role"],
+                employee_id=d.get("employee_id"),
+                skills=d.get("skills"),
+                is_active=d.get("is_active", True),
+                must_change_password=d.get("must_change_password", False),
+                employment_type=d.get("employment_type"),
+                work_description=d.get("work_description"),
+                password_hash=d.get("password_hash", ""),
+            )
+    except Exception:
+        pass
+    return None
+
+
+def cache_authenticated_user(user: User) -> None:
+    """Pre-warm L1 RAM and L2 Redis when user logs in so initial page loads are instantaneous."""
+    _user_auth_cache.set(user.id, _clone_user(user))
+    _cache_user_in_redis(user)
+
+
+def invalidate_user_auth_cache(user_id: Optional[int] = None) -> None:
+    """Invalidate cached auth user in RAM and Redis."""
+    _user_auth_cache.invalidate(user_id)
+    redis_client = get_redis_client()
+    if redis_client:
+        try:
+            if user_id is not None:
+                redis_client.delete(f"auth:user:{user_id}")
+            else:
+                for k in redis_client.scan_iter("auth:user:*"):
+                    redis_client.delete(k)
+        except Exception:
+            pass
+
+
+def _clone_user(u: User) -> User:
+    """Create a clean detached User copy to prevent cross-request mutation."""
+    return User(
+        id=u.id,
+        email=u.email,
+        password_hash=getattr(u, "password_hash", ""),
+        name=u.name,
+        role=u.role,
+        employee_id=u.employee_id,
+        skills=u.skills,
+        is_active=u.is_active,
+        must_change_password=getattr(u, "must_change_password", False),
+        employment_type=getattr(u, "employment_type", None),
+        work_description=getattr(u, "work_description", None),
+    )
+
+
 # ── Dependencies ────────────────────────────────────────────────────
 def get_current_user(
     request: Request,
@@ -111,6 +209,8 @@ def get_current_user(
     """
     FastAPI dependency – extracts the current user from the JWT.
     Use in route signatures: user: User = Depends(get_current_user)
+    Uses Dual-Tier L1 RAM (<0.001ms) + L2 Redis (~0.8ms) with single-flight mutex
+    to prevent connection pool starvation during simultaneous dashboard loads.
     """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -136,9 +236,30 @@ def get_current_user(
     except (JWTError, ValueError):
         raise credentials_exception
 
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None or not user.is_active:
-        raise credentials_exception
+    # 1. Tier 1: Check L1 RAM (< 0.001 ms)
+    cached_user = _user_auth_cache.get(user_id)
+    if cached_user is not None:
+        user = _clone_user(cached_user)
+    else:
+        # 2. Tier 2: Check L2 Redis (~0.8 ms)
+        redis_user = _get_user_from_redis(user_id)
+        if redis_user is not None and redis_user.is_active:
+            _user_auth_cache.set(user_id, _clone_user(redis_user))
+            user = _clone_user(redis_user)
+        else:
+            # 3. Tier 3: PostgreSQL Database Fallback (Protected by Single-Flight Mutex)
+            with _user_fetch_lock:
+                # Double-check if another concurrent thread already resolved it
+                double_check = _user_auth_cache.get(user_id)
+                if double_check is not None:
+                    user = _clone_user(double_check)
+                else:
+                    user_record = db.query(User).filter(User.id == user_id).first()
+                    if user_record is None or not user_record.is_active:
+                        raise credentials_exception
+                    _user_auth_cache.set(user_id, _clone_user(user_record))
+                    _cache_user_in_redis(user_record)
+                    user = _clone_user(user_record)
 
     view_role = request.headers.get("X-Role-View")
     if user.role == "hr" and view_role == "pm":
