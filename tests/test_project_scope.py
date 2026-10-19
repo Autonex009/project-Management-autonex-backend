@@ -136,7 +136,8 @@ def test_project_level_pm_wins_over_organisation(db):
 
 
 def test_organisation_pm_inherited_when_project_names_none(db):
-    assert project_scope.project_pm_ids(db, project(db, 3)) == {ORG_PM_EMP}
+    """Under skilss.md Law 7, a project naming no PM must NOT inherit ghost PMs from parent MainProject."""
+    assert project_scope.project_pm_ids(db, project(db, 3)) == set()
 
 
 def test_no_pm_anywhere_resolves_empty_not_error(db):
@@ -145,14 +146,15 @@ def test_no_pm_anywhere_resolves_empty_not_error(db):
 
 
 def test_legacy_single_pm_column_is_honoured(db):
-    """Older organisations carry program_manager_id rather than the JSON list."""
+    """Under skilss.md Law 7, daily_sheets.assigned_employee_ids is the sole source of truth;
+    unassigned sheets do not inherit MainProject program_manager_id as ghost PMs."""
     org = MainProject(id=901, name="Legacy Org", program_manager_id=777)
     sheet = DailySheet(id=5, name="P", main_project_id=901, assigned_employee_ids=[],
                        client="c", project_type="Full", total_tasks=1,
                        estimated_time_per_task=1.0, start_date=date(2026, 1, 1))
     db.add_all([org, sheet])
     db.commit()
-    assert project_scope.project_pm_ids(db, sheet) == {777}
+    assert project_scope.project_pm_ids(db, sheet) == set()
 
 
 def test_unusable_ids_are_dropped_not_raised(db):
