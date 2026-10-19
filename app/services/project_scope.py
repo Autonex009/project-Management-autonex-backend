@@ -246,17 +246,17 @@ class InMemoryTTLCache:
         self._lock = threading.Lock()
 
     def get(self, key: int) -> Optional[set[int]]:
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             if key in self._cache:
                 timestamp, value = self._cache[key]
                 if now - timestamp < self.ttl:
-                    return value
+                    return set(value)
                 del self._cache[key]
         return None
 
     def set(self, key: int, value: set[int]):
-        now = time.time()
+        now = time.monotonic()
         with self._lock:
             # Self-prune expired keys if cache reaches max_size to prevent memory leak
             if len(self._cache) >= self.max_size:
@@ -265,7 +265,7 @@ class InMemoryTTLCache:
                     del self._cache[k]
                 if len(self._cache) >= self.max_size:
                     self._cache.pop(next(iter(self._cache)), None)
-            self._cache[key] = (now, value)
+            self._cache[key] = (now, set(value))
 
     def invalidate(self, key: Optional[int] = None):
         with self._lock:
@@ -283,7 +283,7 @@ def invalidate_project_scope_cache(actor_id: Optional[int] = None) -> None:
     project_scope_cache.invalidate(actor_id)
 
 
-def get_authorized_project_ids(db: Session, user: Optional[User]) -> Optional[set[int]]:
+def get_authorized_project_ids(db: Optional[Session] = None, user: Optional[User] = None) -> Optional[set[int]]:
     """Returns the set of DailySheet (Project) IDs authorized for user.
     - If user has full access (admin, hr): returns None (meaning DO NOT filter by ID).
     - If user is PM or Team Lead: returns set of project IDs they are authorized to manage or lead.
@@ -300,37 +300,48 @@ def get_authorized_project_ids(db: Session, user: Optional[User]) -> Optional[se
     # 1. Fast Cache Check (0.001 ms)
     cached = project_scope_cache.get(actor_id)
     if cached is not None:
-        return cached
+        return set(cached)
 
-    # 2. Daily sheets where user has active allocation as PM or Team Lead
-    user_allocs = db.query(Allocation.sub_project_id, Allocation.role_tags).filter(
-        Allocation.employee_id == actor_id,
-        Allocation.is_active == True,
-    ).all()
+    need_close = False
+    session = db
+    if session is None:
+        from app.db.database import SessionLocal
+        session = SessionLocal()
+        need_close = True
 
-    emp = db.query(Employee.designation).filter(Employee.id == actor_id).first()
-    is_mgr_or_tl = emp and _normalise(emp[0]) in (TEAM_LEAD_TAGS | ADMIN_ONLY_SUBJECT_DESIGNATIONS)
+    try:
+        # 2. Daily sheets where user has active allocation as PM or Team Lead
+        user_allocs = session.query(Allocation.sub_project_id, Allocation.role_tags).filter(
+            Allocation.employee_id == actor_id,
+            Allocation.is_active == True,
+        ).all()
 
-    authorized_ids = set()
-    for pid, role_tags in user_allocs:
-        if not pid:
-            continue
-        tagged = any(
-            _normalise(tag) in (TEAM_LEAD_TAGS | {"pm", "project manager", "program manager"})
-            for tag in (role_tags or [])
-        )
-        if tagged or is_mgr_or_tl:
-            authorized_ids.add(pid)
+        emp = session.query(Employee.designation).filter(Employee.id == actor_id).first()
+        is_mgr_or_tl = emp and _normalise(emp[0]) in (TEAM_LEAD_TAGS | ADMIN_ONLY_SUBJECT_DESIGNATIONS)
 
-    # 3. Daily sheets where user is directly in assigned_employee_ids
-    projects = db.query(DailySheet.id, DailySheet.assigned_employee_ids).all()
-    for p_id, assigned_ids in projects:
-        if actor_id in _as_int_set(assigned_ids):
-            authorized_ids.add(p_id)
+        authorized_ids = set()
+        for pid, role_tags in user_allocs:
+            if not pid:
+                continue
+            tagged = any(
+                _normalise(tag) in (TEAM_LEAD_TAGS | {"pm", "project manager", "program manager"})
+                for tag in (role_tags or [])
+            )
+            if tagged or is_mgr_or_tl:
+                authorized_ids.add(pid)
 
-    # 4. Populate In-Memory Cache
-    project_scope_cache.set(actor_id, authorized_ids)
-    return authorized_ids
+        # 3. Daily sheets where user is directly in assigned_employee_ids
+        projects = session.query(DailySheet.id, DailySheet.assigned_employee_ids).all()
+        for p_id, assigned_ids in projects:
+            if actor_id in _as_int_set(assigned_ids):
+                authorized_ids.add(p_id)
+
+        # 4. Populate In-Memory Cache
+        project_scope_cache.set(actor_id, authorized_ids)
+        return set(authorized_ids)
+    finally:
+        if need_close and session is not None:
+            session.close()
 
 
 def employee_project_ids(db: Session, employee_id: int) -> set[int]:
@@ -403,15 +414,17 @@ import time
 
 _MANAGEABLE_CACHE: dict[tuple[int, str, bool], tuple[float, set[int]]] = {}
 _MANAGEABLE_CACHE_TTL = 30.0  # 30-second TTL to absorb burst requests and protect connection pool
+_MANAGEABLE_CACHE_LOCK = threading.Lock()
 
 def invalidate_manageable_cache(actor_id: Optional[int] = None) -> None:
     """Invalidate cached manageable employee IDs globally or for a specific employee."""
-    if actor_id is None:
-        _MANAGEABLE_CACHE.clear()
-    else:
-        to_del = [k for k in _MANAGEABLE_CACHE if k[0] == actor_id]
-        for k in to_del:
-            _MANAGEABLE_CACHE.pop(k, None)
+    with _MANAGEABLE_CACHE_LOCK:
+        if actor_id is None:
+            _MANAGEABLE_CACHE.clear()
+        else:
+            to_del = [k for k in _MANAGEABLE_CACHE if k[0] == actor_id]
+            for k in to_del:
+                _MANAGEABLE_CACHE.pop(k, None)
 
 
 def get_manageable_employee_ids(
@@ -438,10 +451,11 @@ def get_manageable_employee_ids(
     actor_role = (user.role or "").strip().lower() if user else ""
     cache_key = (actor_id, actor_role, exclude_self)
     now = time.monotonic()
-    if cache_key in _MANAGEABLE_CACHE:
-        cached_at, cached_set = _MANAGEABLE_CACHE[cache_key]
-        if now - cached_at < _MANAGEABLE_CACHE_TTL:
-            return set(cached_set)
+    with _MANAGEABLE_CACHE_LOCK:
+        if cache_key in _MANAGEABLE_CACHE:
+            cached_at, cached_set = _MANAGEABLE_CACHE[cache_key]
+            if now - cached_at < _MANAGEABLE_CACHE_TTL:
+                return set(cached_set)
 
     # Determine caller's tier (skip DB designation query if user.role is already authoritative)
     actor_designation = ""
@@ -554,7 +568,14 @@ def get_manageable_employee_ids(
             # Non-managerial employee cannot manage others
             pass
                 
-    _MANAGEABLE_CACHE[cache_key] = (now, set(emp_ids))
+    with _MANAGEABLE_CACHE_LOCK:
+        if len(_MANAGEABLE_CACHE) >= 1000:
+            expired = [k for k, (ts, _) in _MANAGEABLE_CACHE.items() if now - ts >= _MANAGEABLE_CACHE_TTL]
+            for k in expired:
+                _MANAGEABLE_CACHE.pop(k, None)
+            if len(_MANAGEABLE_CACHE) >= 1000:
+                _MANAGEABLE_CACHE.pop(next(iter(_MANAGEABLE_CACHE)), None)
+        _MANAGEABLE_CACHE[cache_key] = (now, set(emp_ids))
     return emp_ids
 
 def can_manage_employee(db: Session, user: Optional[User], employee_id: Optional[int]) -> bool:

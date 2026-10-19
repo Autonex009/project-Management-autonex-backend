@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from typing import List, Optional
 from pydantic import BaseModel
 from app.services.project_scope import _as_int_set
+from app.services.project_cache import invalidate_my_projects_cache
 
 from app.db.database import get_db, SessionLocal
 from app.models.allocation import Allocation
@@ -75,11 +76,12 @@ def sync_project_allocations(db, project_id: int):
     lead_count = 0
     pm_ids = set()
 
+    # Fast in-memory resolution (eliminates N network round-trips to Supabase)
     for a in allocs:
         emp = emp_map.get(a.employee_id)
         if (a.role_tags and "Team Lead" in a.role_tags) or _is_team_lead(emp):
             lead_count += 1
-        elif project_scope.escalates_to_admin(db, a.employee_id):
+        elif emp and emp.designation and project_scope._normalise(emp.designation) in project_scope.ADMIN_ONLY_SUBJECT_DESIGNATIONS:
             pm_ids.add(a.employee_id)
 
     project.team_lead_count = lead_count
@@ -353,6 +355,105 @@ def get_allocations_page(
     )
 
 
+def _fetch_single_project_row(db: Session, project: Project) -> ProjectAllocationRow:
+    """Helper to build ProjectAllocationRow for a single project without full page scan.
+    Uses fast GIN-indexed check-in query strictly scoped to this project (~150ms vs 885ms).
+    """
+    from app.models.daily_checkin import DailyCheckIn
+    from datetime import date as date_cls
+    today = date_cls.today()
+    project_id = project.id
+
+    alloc_rows = (
+        db.query(Allocation, Employee)
+        .join(Employee, Employee.id == Allocation.employee_id)
+        .filter(Allocation.sub_project_id == project_id, Allocation.is_active == True)
+        .all()
+    )
+    allocs = [a for a, _ in alloc_rows]
+    employee_map = {emp.id: emp for _, emp in alloc_rows}
+
+    for eid in _as_int_set(project.assigned_employee_ids):
+        if eid not in employee_map:
+            emp = db.query(Employee).filter(Employee.id == eid).first()
+            if emp:
+                employee_map[emp.id] = emp
+
+    # Fast indexed check-in lookup for this single project on today's date
+    temp_checkins = (
+        db.query(DailyCheckIn)
+        .filter(
+            DailyCheckIn.checkin_date == today,
+            DailyCheckIn.project_ids.contains([project_id]),
+        )
+        .all()
+    )
+    perm_eids = {a.employee_id for a in allocs}
+    temp_eids = [c.employee_id for c in temp_checkins if c.employee_id not in perm_eids]
+    temp_roster = []
+    if temp_eids:
+        t_emps = db.query(Employee.name).filter(Employee.id.in_(temp_eids)).all()
+        temp_roster = [{"name": name, "work_location": "WFO", "is_stale": False} for (name,) in t_emps]
+
+    temp_info = {"temp_count": len(temp_roster), "temp_roster": temp_roster, "permanent_locations": {}}
+    return _build_project_allocation_row(project, allocs, employee_map, temp_info)
+
+
+def _background_send_bulk_allocation_notifications(
+    allocation_ids: list[int],
+    project_id: int,
+    actor_employee_id: int | None,
+):
+    """Safely runs in background to send Slack alerts to employees and PM/Leads for bulk allocation."""
+    with SessionLocal() as bg_db:
+        project = bg_db.query(Project).filter(Project.id == project_id).first()
+        if not project:
+            return
+        actual_count = bg_db.query(Allocation).filter(
+            Allocation.sub_project_id == project_id,
+            Allocation.is_active == True,
+        ).count()
+        allocs = bg_db.query(Allocation).filter(Allocation.id.in_(allocation_ids)).all()
+        for alloc in allocs:
+            try:
+                _send_employee_allocation_notification(bg_db, alloc, project, actual_count)
+            except Exception as e:
+                logger.warning("Failed to send employee bulk allocation notification: %s", e)
+            try:
+                send_allocation_notifications_to_leaders(
+                    bg_db,
+                    alloc,
+                    project,
+                    source="Manual Allocation",
+                    actor_employee_id=actor_employee_id,
+                )
+            except Exception as e:
+                logger.warning("Failed to send PM/Lead bulk allocation notification: %s", e)
+
+
+def _background_send_bulk_unallocation_notifications(
+    alloc_infos: list[dict],
+    project_id: int,
+    actor_employee_id: int | None,
+    actor_user_role: str | None,
+    actor_name: str | None,
+):
+    """Safely runs in background to send Slack alerts for bulk unallocations."""
+    with SessionLocal() as bg_db:
+        for alloc_info in alloc_infos:
+            try:
+                send_unallocation_notifications(
+                    db=bg_db,
+                    alloc_info=alloc_info,
+                    project_id=project_id,
+                    actor_user_role=actor_user_role,
+                    actor_employee_id=actor_employee_id,
+                    actor_name=actor_name,
+                )
+            except Exception as e:
+                logger.warning("Failed to send bulk unallocation notification: %s", e)
+
+
 @router.get("/project/{project_id}/row", response_model=ProjectAllocationRow)
 def get_project_allocation_row(
     project_id: int,
@@ -370,35 +471,20 @@ def get_project_allocation_row(
         db, current_user, project, action="view this project's allocation row"
     )
 
-    alloc_rows = (
-        db.query(Allocation, Employee)
-        .join(Employee, Employee.id == Allocation.employee_id)
-        .filter(Allocation.sub_project_id == project_id, Allocation.is_active == True)
-        .all()
-    )
-    allocs = [a for a, _ in alloc_rows]
-    employee_map = {emp.id: emp for _, emp in alloc_rows}
-
-    for eid in _as_int_set(project.assigned_employee_ids):
-        if eid not in employee_map:
-            emp = db.query(Employee).filter(Employee.id == eid).first()
-            if emp:
-                employee_map[emp.id] = emp
-
-    from app.api.projects import _get_temp_rosters_for_projects
-    temp_data = _get_temp_rosters_for_projects(db, [project_id], {project_id: allocs})
-    temp_info = temp_data.get(project_id, {"temp_count": 0, "temp_roster": [], "permanent_locations": {}})
-
-    return _build_project_allocation_row(project, allocs, employee_map, temp_info)
+    return _fetch_single_project_row(db, project)
 
 
 @router.post("/bulk")
 def bulk_create_allocations(
     payload: BulkAllocationCreateRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm", "team_lead")),
 ):
-    """Bulk create allocations for multiple employees in 1 single atomic transaction."""
+    """Bulk create allocations for multiple employees in 1 single atomic transaction.
+    Returns the updated ProjectAllocationRow directly to enable Zero-Network Cache Surgery.
+    Dispatches Slack notifications in background task.
+    """
     project = db.query(Project).filter(Project.id == payload.project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -431,7 +517,7 @@ def bulk_create_allocations(
             sub_project_id=payload.project_id,
             employee_id=eid,
             role_tags=clean_role_tags,
-            daily_hours=payload.daily_hours or 8.0,
+            total_daily_hours=int(payload.daily_hours) if payload.daily_hours is not None else 8,
             is_active=True,
         )
         db.add(new_alloc)
@@ -440,23 +526,51 @@ def bulk_create_allocations(
     db.flush()
     sync_project_allocations(db, payload.project_id)
     project_scope.invalidate_project_scope_cache()
+    invalidate_my_projects_cache()
     db.commit()
+
+    created_ids = [a.id for a in created_allocations]
+    actor_emp_id = current_user.employee_id if current_user else None
+
+    # Enqueue Slack notifications in background task
+    if created_ids:
+        if background_tasks is not None:
+            background_tasks.add_task(
+                _background_send_bulk_allocation_notifications,
+                created_ids,
+                payload.project_id,
+                actor_emp_id,
+            )
+        else:
+            _background_send_bulk_allocation_notifications(
+                created_ids,
+                payload.project_id,
+                actor_emp_id,
+            )
+
+    # Build updated row for Zero-Network Cache Surgery
+    updated_row = _fetch_single_project_row(db, project)
 
     return {
         "project_id": payload.project_id,
         "created_count": len(created_allocations),
         "skipped_count": skipped_count,
-        "allocation_ids": [a.id for a in created_allocations],
+        "allocation_ids": created_ids,
+        "row": updated_row,
     }
 
 
 @router.post("/bulk-delete")
 def bulk_delete_allocations(
     payload: BulkAllocationDeleteRequest,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm", "team_lead")),
 ):
-    """Bulk deactivate multiple allocations on a project in 1 atomic transaction."""
+    """Bulk deactivate multiple allocations on a project in 1 atomic transaction.
+    Returns the updated ProjectAllocationRow directly to enable Zero-Network Cache Surgery.
+    Dispatches Slack unallocation alerts in background task.
+    """
     project = db.query(Project).filter(Project.id == payload.project_id).first()
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -474,18 +588,57 @@ def bulk_delete_allocations(
         Allocation.is_active == True,
     ).all()
 
+    alloc_infos = [
+        {
+            "id": a.id,
+            "employee_id": a.employee_id,
+            "sub_project_id": a.sub_project_id,
+            "role_tags": a.role_tags,
+            "total_daily_hours": a.total_daily_hours,
+        }
+        for a in allocs
+    ]
+
     for a in allocs:
         a.is_active = False
 
     db.flush()
     sync_project_allocations(db, payload.project_id)
     project_scope.invalidate_project_scope_cache()
+    invalidate_my_projects_cache()
     db.commit()
+
+    actor_emp_id = current_user.employee_id if current_user else None
+    actor_role = current_user.role if current_user else "admin"
+    actor_name = current_user.name if current_user else "Manager"
+
+    if alloc_infos:
+        if background_tasks is not None:
+            background_tasks.add_task(
+                _background_send_bulk_unallocation_notifications,
+                alloc_infos,
+                payload.project_id,
+                actor_emp_id,
+                actor_role,
+                actor_name,
+            )
+        else:
+            _background_send_bulk_unallocation_notifications(
+                alloc_infos,
+                payload.project_id,
+                actor_emp_id,
+                actor_role,
+                actor_name,
+            )
+
+    # Build updated row for Zero-Network Cache Surgery
+    updated_row = _fetch_single_project_row(db, project)
 
     return {
         "project_id": payload.project_id,
         "deleted_count": len(allocs),
         "deleted_allocation_ids": [a.id for a in allocs],
+        "row": updated_row,
     }
 
 
@@ -977,6 +1130,7 @@ def create_allocation(
 
     db.commit()
     project_scope.invalidate_project_scope_cache()
+    invalidate_my_projects_cache(allocation.employee_id)
     db.refresh(allocation)
 
     try:
@@ -1305,6 +1459,8 @@ def update_allocation(
 
     db.commit()
     db.refresh(allocation)
+    project_scope.invalidate_project_scope_cache()
+    invalidate_my_projects_cache(allocation.employee_id)
 
     # If allocation was moved to a new project:
     # 1. Unallocation notification for old project
@@ -1531,5 +1687,6 @@ def delete_allocation(
         pass
 
     project_scope.invalidate_project_scope_cache()
+    invalidate_my_projects_cache(alloc_info.get("employee_id"))
     return {"message": "Allocation removed", "project_id": sub_project_id, "allocation_id": allocation_id}
 
