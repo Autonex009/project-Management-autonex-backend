@@ -52,6 +52,8 @@ class GuidelineResponse(BaseModel):
     file_name: Optional[str] = None
     file_url: Optional[str] = None
     uploaded_by: Optional[int] = None
+    organization_name: Optional[str] = None
+    project_name: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -77,30 +79,6 @@ def get_guidelines_page(
     )
 
 
-@router.get("", response_model=List[GuidelineResponse])
-def list_guidelines(
-    main_project_id: Optional[int] = None,
-    sub_project_id: Optional[int] = None,
-    uploaded_by: Optional[int] = None,
-    db: Session = Depends(get_db),
-):
-    query = db.query(Guideline)
-    if main_project_id:
-        query = query.filter(Guideline.main_project_id == main_project_id)
-    if sub_project_id:
-        query = query.filter(Guideline.sub_project_id == sub_project_id)
-    if uploaded_by:
-        query = query.filter(Guideline.uploaded_by == uploaded_by)
-    return query.order_by(Guideline.created_at.desc()).all()
-
-
-@router.get("/{guideline_id}", response_model=GuidelineResponse)
-def get_guideline(guideline_id: int, db: Session = Depends(get_db)):
-    guideline = db.query(Guideline).filter(Guideline.id == guideline_id).first()
-    if not guideline:
-        raise HTTPException(status_code=404, detail="Guideline not found")
-    return guideline
-
 @router.get("/for-me", response_model=List[GuidelineResponse])
 def list_guidelines_for_me(
     db: Session = Depends(get_db),
@@ -108,44 +86,158 @@ def list_guidelines_for_me(
 ):
     """Guidelines for projects the logged-in employee is allocated to.
     Avoids the client downloading every guideline + every project just to filter.
+    Must stay registered before /{guideline_id} — otherwise FastAPI tries to
+    parse 'for-me' as guideline_id: int and returns 422 Unprocessable Entity.
     """
     from app.models.allocation import Allocation
-    from app.models.project import DailySheet
-
-    if not current_user.employee_id:
-        return []
-
-    alloc_rows = (
-        db.query(Allocation.sub_project_id)
-        .filter(
-            Allocation.employee_id == current_user.employee_id,
-            Allocation.is_active == True,
-            Allocation.sub_project_id.isnot(None),
-        )
-        .distinct()
-        .all()
-    )
-    sub_project_ids = {r[0] for r in alloc_rows if r[0]}
-    if not sub_project_ids:
-        return []
-
-    # Main-project ids for those daily sheets (org-level guidelines)
-    main_rows = (
-        db.query(DailySheet.main_project_id)
-        .filter(DailySheet.id.in_(sub_project_ids))
-        .all()
-    )
-    main_project_ids = {r[0] for r in main_rows if r[0]}
-
+    from app.models.parent_project import MainProject
+    from app.models.project import DailySheet, Project
     from sqlalchemy import or_
 
-    query = db.query(Guideline).filter(
-        or_(
-            Guideline.sub_project_id.in_(sub_project_ids),
-            Guideline.main_project_id.in_(main_project_ids) if main_project_ids else False,
+    sub_project_ids = set()
+    main_project_ids = set()
+
+    if current_user.employee_id:
+        alloc_rows = (
+            db.query(Allocation.sub_project_id)
+            .filter(
+                Allocation.employee_id == current_user.employee_id,
+                Allocation.is_active == True,
+                Allocation.sub_project_id.isnot(None),
+            )
+            .distinct()
+            .all()
         )
+        sub_project_ids = {r[0] for r in alloc_rows if r[0]}
+
+        if sub_project_ids:
+            # Main-project ids for those daily sheets (org-level guidelines)
+            main_rows = (
+                db.query(DailySheet.main_project_id)
+                .filter(DailySheet.id.in_(sub_project_ids))
+                .all()
+            )
+            main_project_ids = {r[0] for r in main_rows if r[0]}
+
+    filters = [
+        (Guideline.main_project_id.is_(None)) & (Guideline.sub_project_id.is_(None))
+    ]
+    if sub_project_ids:
+        filters.append(Guideline.sub_project_id.in_(sub_project_ids))
+    if main_project_ids:
+        filters.append(Guideline.main_project_id.in_(main_project_ids))
+
+    query = (
+        db.query(
+            Guideline,
+            MainProject.name.label("organization_name"),
+            Project.name.label("project_name"),
+        )
+        .outerjoin(MainProject, Guideline.main_project_id == MainProject.id)
+        .outerjoin(Project, Guideline.sub_project_id == Project.id)
+        .filter(or_(*filters))
+        .order_by(Guideline.created_at.desc())
     )
-    return query.order_by(Guideline.created_at.desc()).all()
+
+    rows = query.all()
+    return [
+        GuidelineResponse(
+            id=g.id,
+            main_project_id=g.main_project_id,
+            sub_project_id=g.sub_project_id,
+            title=g.title,
+            content=g.content,
+            file_name=g.file_name,
+            file_url=g.file_url,
+            uploaded_by=g.uploaded_by,
+            organization_name=org_name,
+            project_name=proj_name,
+            created_at=g.created_at,
+            updated_at=g.updated_at,
+        )
+        for g, org_name, proj_name in rows
+    ]
+
+
+@router.get("", response_model=List[GuidelineResponse])
+def list_guidelines(
+    main_project_id: Optional[int] = None,
+    sub_project_id: Optional[int] = None,
+    uploaded_by: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    from app.models.parent_project import MainProject
+    from app.models.project import Project
+
+    query = (
+        db.query(
+            Guideline,
+            MainProject.name.label("organization_name"),
+            Project.name.label("project_name"),
+        )
+        .outerjoin(MainProject, Guideline.main_project_id == MainProject.id)
+        .outerjoin(Project, Guideline.sub_project_id == Project.id)
+    )
+    if main_project_id:
+        query = query.filter(Guideline.main_project_id == main_project_id)
+    if sub_project_id:
+        query = query.filter(Guideline.sub_project_id == sub_project_id)
+    if uploaded_by:
+        query = query.filter(Guideline.uploaded_by == uploaded_by)
+
+    rows = query.order_by(Guideline.created_at.desc()).all()
+    return [
+        GuidelineResponse(
+            id=g.id,
+            main_project_id=g.main_project_id,
+            sub_project_id=g.sub_project_id,
+            title=g.title,
+            content=g.content,
+            file_name=g.file_name,
+            file_url=g.file_url,
+            uploaded_by=g.uploaded_by,
+            organization_name=org_name,
+            project_name=proj_name,
+            created_at=g.created_at,
+            updated_at=g.updated_at,
+        )
+        for g, org_name, proj_name in rows
+    ]
+
+
+@router.get("/{guideline_id}", response_model=GuidelineResponse)
+def get_guideline(guideline_id: int, db: Session = Depends(get_db)):
+    from app.models.parent_project import MainProject
+    from app.models.project import Project
+
+    row = (
+        db.query(
+            Guideline,
+            MainProject.name.label("organization_name"),
+            Project.name.label("project_name"),
+        )
+        .outerjoin(MainProject, Guideline.main_project_id == MainProject.id)
+        .outerjoin(Project, Guideline.sub_project_id == Project.id)
+        .filter(Guideline.id == guideline_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Guideline not found")
+    g, org_name, proj_name = row
+    return GuidelineResponse(
+        id=g.id,
+        main_project_id=g.main_project_id,
+        sub_project_id=g.sub_project_id,
+        title=g.title,
+        content=g.content,
+        file_name=g.file_name,
+        file_url=g.file_url,
+        uploaded_by=g.uploaded_by,
+        organization_name=org_name,
+        project_name=proj_name,
+        created_at=g.created_at,
+        updated_at=g.updated_at,
+    )
 
 @router.post("", response_model=GuidelineResponse)
 def create_guideline(

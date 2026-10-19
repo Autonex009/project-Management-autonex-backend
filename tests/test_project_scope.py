@@ -136,7 +136,8 @@ def test_project_level_pm_wins_over_organisation(db):
 
 
 def test_organisation_pm_inherited_when_project_names_none(db):
-    assert project_scope.project_pm_ids(db, project(db, 3)) == {ORG_PM_EMP}
+    """Under skilss.md Law 7, a project naming no PM must NOT inherit ghost PMs from parent MainProject."""
+    assert project_scope.project_pm_ids(db, project(db, 3)) == set()
 
 
 def test_no_pm_anywhere_resolves_empty_not_error(db):
@@ -145,14 +146,15 @@ def test_no_pm_anywhere_resolves_empty_not_error(db):
 
 
 def test_legacy_single_pm_column_is_honoured(db):
-    """Older organisations carry program_manager_id rather than the JSON list."""
+    """Under skilss.md Law 7, daily_sheets.assigned_employee_ids is the sole source of truth;
+    unassigned sheets do not inherit MainProject program_manager_id as ghost PMs."""
     org = MainProject(id=901, name="Legacy Org", program_manager_id=777)
     sheet = DailySheet(id=5, name="P", main_project_id=901, assigned_employee_ids=[],
                        client="c", project_type="Full", total_tasks=1,
                        estimated_time_per_task=1.0, start_date=date(2026, 1, 1))
     db.add_all([org, sheet])
     db.commit()
-    assert project_scope.project_pm_ids(db, sheet) == {777}
+    assert project_scope.project_pm_ids(db, sheet) == set()
 
 
 def test_unusable_ids_are_dropped_not_raised(db):
@@ -578,3 +580,70 @@ def test_require_project_scope_allows_pm_and_lead_and_blocks_outsiders(db):
     with pytest.raises(HTTPException) as exc:
         project_scope.require_project_scope(db, user("pm", PM_A_EMP), project(db, 2))
     assert exc.value.status_code == 403
+
+
+# ── get_manageable_employee_ids hierarchy tests ──────────────────────────
+
+def test_pm_manageable_excludes_peer_pm_on_shared_project(db):
+    """PM A and PM B are both allocated/associated with Project A.
+    PM A must NOT see PM B in their manageable employees.
+    PM A MUST see Team Leads and workers on Project A.
+    """
+    pm_a_manageable = project_scope.get_manageable_employee_ids(db, user("pm", PM_A_EMP))
+    assert pm_a_manageable is not None
+    # Peer PM on the same project is strictly excluded
+    assert PM_B_EMP not in pm_a_manageable
+    # Team leads on project A are included
+    assert LEAD_EMP in pm_a_manageable
+    assert PEER_LEAD_EMP in pm_a_manageable
+    # Regular worker on project A is included
+    assert WORKER_EMP in pm_a_manageable
+    # PM A himself is included when exclude_self=False
+    assert PM_A_EMP in pm_a_manageable
+
+    # When exclude_self=True, PM A is excluded
+    pm_a_manageable_no_self = project_scope.get_manageable_employee_ids(db, user("pm", PM_A_EMP), exclude_self=True)
+    assert PM_A_EMP not in pm_a_manageable_no_self
+    assert PM_B_EMP not in pm_a_manageable_no_self
+    assert WORKER_EMP in pm_a_manageable_no_self
+
+
+def test_team_lead_manageable_excludes_pm_and_peer_leads(db):
+    """Team Lead LEAD_EMP on Project A:
+    - Must NOT see PM B (Program Manager)
+    - Must NOT see PEER_LEAD_EMP (peer Team Lead)
+    - Must see WORKER_EMP (regular worker)
+    - Must see themselves (LEAD_EMP) unless exclude_self=True
+    """
+    lead_manageable = project_scope.get_manageable_employee_ids(db, user("team_lead", LEAD_EMP))
+    assert lead_manageable is not None
+    assert PM_B_EMP not in lead_manageable
+    assert PEER_LEAD_EMP not in lead_manageable
+    assert WORKER_EMP in lead_manageable
+    assert LEAD_EMP in lead_manageable
+
+    # exclude_self=True
+    lead_manageable_no_self = project_scope.get_manageable_employee_ids(db, user("team_lead", LEAD_EMP), exclude_self=True)
+    assert LEAD_EMP not in lead_manageable_no_self
+    assert PEER_LEAD_EMP not in lead_manageable_no_self
+    assert WORKER_EMP in lead_manageable_no_self
+
+
+def test_admin_has_full_access_to_manageable(db):
+    """Admin / HR returns None from get_manageable_employee_ids indicating unfiltered access."""
+    admin_user = user("admin", 9999)
+    assert project_scope.get_manageable_employee_ids(db, admin_user) is None
+
+    hr_user = user("hr", 8888)
+    assert project_scope.get_manageable_employee_ids(db, hr_user) is None
+
+
+def test_worker_manageable_contains_only_self(db):
+    """A regular employee cannot manage anyone else."""
+    worker_user = user("employee", WORKER_EMP)
+    worker_manageable = project_scope.get_manageable_employee_ids(db, worker_user)
+    assert worker_manageable == {WORKER_EMP}
+
+    worker_manageable_no_self = project_scope.get_manageable_employee_ids(db, worker_user, exclude_self=True)
+    assert worker_manageable_no_self == set()
+

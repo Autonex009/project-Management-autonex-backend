@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from app.services.auth_service import get_current_user, require_role
 from app.services import project_scope
 from pydantic import BaseModel, field_validator
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -77,6 +78,9 @@ def list_reviews(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    page_num = page if isinstance(page, int) else int(getattr(page, "default", 1))
+    limit_num = limit if isinstance(limit, int) else int(getattr(limit, "default", 25))
+
     query = db.query(PerformanceReview)
     if employee_id:
         query = query.filter(PerformanceReview.employee_id == employee_id)
@@ -85,31 +89,39 @@ def list_reviews(
     if review_type:
         query = query.filter(PerformanceReview.review_type == review_type)
 
-    all_reviews = query.order_by(PerformanceReview.created_at.desc()).all()
-
-    # Same pattern as perf_eval.list_evals: admins/HR see everything; a PM only sees
-    # reviews for employees they actually manage. Without this, `employee_id` filter
-    # is optional and omitting it returned the whole company's reviews to any PM.
+    # Push hierarchy scoping directly into SQL:
+    # Admins/HR see everything; a PM only sees reviews for employees they actually manage or wrote themselves.
     if not project_scope.has_full_access(current_user):
-        manageable_cache: dict[int, bool] = {}
-        filtered_reviews = []
-        for review in all_reviews:
-            if review.employee_id not in manageable_cache:
-                manageable_cache[review.employee_id] = project_scope.can_manage_employee(
-                    db, current_user, review.employee_id
-                )
-            if manageable_cache[review.employee_id]:
-                filtered_reviews.append(review)
-        all_reviews = filtered_reviews
+        manageable_ids = project_scope.get_manageable_employee_ids(db, current_user)
+        privacy_conds = [PerformanceReview.reviewer_id == current_user.id]
+        if current_user.employee_id:
+            privacy_conds.append(PerformanceReview.employee_id == current_user.employee_id)
+        if manageable_ids:
+            privacy_conds.append(PerformanceReview.employee_id.in_(manageable_ids))
+        query = query.filter(or_(*privacy_conds))
 
-    total = len(all_reviews)
-    items = all_reviews[(page - 1) * limit : page * limit]
+    # Fast-path pagination
+    offset = (page_num - 1) * limit_num
+    fetch_limit = limit_num + 1 if page_num == 1 else limit_num
+    rows = query.order_by(PerformanceReview.created_at.desc())\
+                .offset(offset)\
+                .limit(fetch_limit).all()
+
+    if page_num == 1 and len(rows) <= limit_num:
+        total = len(rows)
+        items = rows
+    else:
+        if page_num == 1:
+            items = rows[:limit_num]
+        else:
+            items = rows
+        total = query.with_entities(func.count(PerformanceReview.id)).order_by(None).scalar() or 0
 
     return {
-        "items": [PerformanceReviewResponse.model_validate(item).model_dump() for item in items],
+        "items": [PerformanceReviewResponse.model_validate(item).model_dump(mode="json") for item in items],
         "total": total,
-        "page": page,
-        "limit": limit
+        "page": page_num,
+        "limit": limit_num
     }
 
 

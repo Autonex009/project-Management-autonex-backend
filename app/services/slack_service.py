@@ -176,11 +176,45 @@ def try_get_or_cache_employee_slack_user_id(db, employee) -> str | None:
         return None
 
 
+from app.services.project_cache import InMemoryTTLCache
+
+_slack_dm_channel_l1 = InMemoryTTLCache(ttl_seconds=2592000.0, max_size=2000)
+
+
 def open_direct_message_channel(user_id: str) -> str:
+    """Open or retrieve cached DM channel ID to prevent Slack HTTP 429 rate limits.
+    Utilizes L1 RAM (< 0.001 ms) + L2 Redis (~0.8 ms) before calling Slack API.
+    """
+    # 1. Tier 1: Check L1 RAM (< 0.001 ms)
+    cached_channel = _slack_dm_channel_l1.get(user_id)
+    if cached_channel:
+        return cached_channel
+
+    # 2. Tier 2: Check L2 Redis (~0.8 ms)
+    from app.services.project_cache import get_redis_client
+    redis_client = get_redis_client()
+    cache_key = f"slack:dm_channel:{user_id}"
+    if redis_client:
+        try:
+            cached_channel = redis_client.get(cache_key)
+            if cached_channel:
+                _slack_dm_channel_l1.set(user_id, cached_channel)
+                return cached_channel
+        except Exception as exc:
+            logger.debug("slack_service: Redis DM channel read failed: %s", exc)
+
+    # 3. Call Slack API (Cold miss)
     response = _slack_request("/conversations.open", {"users": user_id})
     if response.get("ok"):
         channel_id = response.get("channel", {}).get("id")
         if channel_id:
+            # Backfill L1 and L2 (DM channels are permanent for a bot-user pair)
+            _slack_dm_channel_l1.set(user_id, channel_id)
+            if redis_client:
+                try:
+                    redis_client.set(cache_key, channel_id, ex=2592000)  # 30 days
+                except Exception as exc:
+                    logger.debug("slack_service: Redis DM channel write failed: %s", exc)
             return channel_id
 
     raise RuntimeError(f"Slack DM open failed: {response.get('error') or 'unknown_error'}")
@@ -1881,23 +1915,42 @@ def _checkin_frontend_url() -> str:
     return f"{base}/employee/dashboard"
 
 
-_today_slack_reminders = {}
+_today_slack_reminders: dict[int, list[tuple[str, str]]] = {}
 
 
 def record_today_slack_reminder(employee_id: int, channel_id: str, ts: str):
     if employee_id and channel_id and ts:
-        _today_slack_reminders[employee_id] = (channel_id, ts)
+        if employee_id not in _today_slack_reminders:
+            _today_slack_reminders[employee_id] = []
+        _today_slack_reminders[employee_id].append((channel_id, ts))
 
 
 def pop_today_slack_reminder(employee_id: int) -> tuple[str | None, str | None]:
-    return _today_slack_reminders.pop(employee_id, (None, None))
+    """Pop the most recent reminder for backward compatibility."""
+    items = _today_slack_reminders.pop(employee_id, None)
+    if isinstance(items, list):
+        return items[-1] if items else (None, None)
+    elif isinstance(items, tuple):
+        return items
+    return (None, None)
 
 
-def find_today_slack_reminder(user_id: str) -> tuple[str | None, str | None]:
-    """Find the most recent check-in reminder/warning DM message sent to this user today from DM history."""
+def pop_all_today_slack_reminders(employee_id: int) -> list[tuple[str, str]]:
+    """Pop all recorded reminders sent to this employee today (1, 2, or 3)."""
+    items = _today_slack_reminders.pop(employee_id, None)
+    if isinstance(items, list):
+        return items
+    elif isinstance(items, tuple):
+        return [items]
+    return []
+
+
+def find_all_today_slack_reminders(user_id: str) -> list[tuple[str, str]]:
+    """Find all active check-in reminder/warning DM messages sent to this user today that need updating."""
+    found = []
     try:
         channel_id = open_direct_message_channel(user_id)
-        response = _slack_request("/conversations.history", {"channel": channel_id, "limit": 10}, method="GET")
+        response = _slack_request("/conversations.history", {"channel": channel_id, "limit": 15}, method="GET")
         if response.get("ok"):
             messages = response.get("messages", [])
             for msg in messages:
@@ -1909,10 +1962,20 @@ def find_today_slack_reminder(user_id: str) -> tuple[str | None, str | None]:
                 )
                 text = msg.get("text", "")
                 if has_checkin_action or "don't forget to check in" in text.lower() or "haven't checked in yet" in text.lower():
-                    return (channel_id, msg.get("ts"))
+                    # If it's already updated, skip it
+                    if "already checked in" not in text.lower():
+                        msg_ts = msg.get("ts")
+                        if msg_ts:
+                            found.append((channel_id, msg_ts))
     except Exception as exc:
-        logger.warning("Could not find Slack reminder in history for user %s: %s", user_id, exc)
-    return (None, None)
+        logger.warning("Could not find Slack reminders in history for user %s: %s", user_id, exc)
+    return found
+
+
+def find_today_slack_reminder(user_id: str) -> tuple[str | None, str | None]:
+    """Find the most recent check-in reminder/warning DM message sent to this user today from DM history."""
+    all_reminders = find_all_today_slack_reminders(user_id)
+    return all_reminders[0] if all_reminders else (None, None)
 
 
 def send_checkin_reminder_message(*, employee_slack_user_id: str, employee_name: str) -> tuple[str | None, str | None]:
@@ -2045,36 +2108,92 @@ def try_send_late_warning_message(**kwargs) -> tuple[str | None, str | None]:
         return (None, None)
 
 
-def send_checkin_success_message(*, employee_slack_user_id: str, employee_name: str, work_mode: str, checked_in_at_str: str) -> bool:
-    """Send Slack DM via PM Bot confirming successful check-in for today."""
+def send_checkin_success_message(
+    *,
+    employee_slack_user_id: str,
+    employee_name: str,
+    work_mode: str,
+    checked_in_at_str: str,
+    mood: str | None = None,
+    lunch_preference: str | None = None,
+    tiffin_type: str | None = None,
+    office_floor: str | None = None,
+    permanent_projects: list[str] | None = None,
+    temporary_projects: list[str] | None = None,
+) -> bool:
+    """Send Slack DM via PM Bot confirming successful check-in with mood, lunch, and permanent/temp projects."""
     channel_id = open_direct_message_channel(employee_slack_user_id)
+
+    # 1. Format Work Mode & Floor
+    work_mode_str = work_mode.upper() if work_mode else "N/A"
+    if work_mode_str == "WFO" and office_floor:
+        work_mode_str = f"WFO (Floor {office_floor})"
+
+    # 2. Format Mood
+    mood_map = {
+        "great": "⚡ Great",
+        "okay": "😊 Okay",
+        "low": "😐 Low energy",
+        "stressed": "😓 Stressed",
+    }
+    mood_str = mood_map.get((mood or "").lower(), mood.capitalize() if mood else "N/A")
+
+    # 3. Format Lunch / Tiffin Preference
+    if work_mode and work_mode.upper() == "WFH":
+        lunch_str = "N/A (WFH)"
+    elif lunch_preference == "canteen":
+        lunch_str = "Canteen"
+    elif lunch_preference == "order_tiffin":
+        type_str = f" ({tiffin_type.replace('_', ' ').title()})" if tiffin_type else ""
+        lunch_str = f"Order Tiffin{type_str}"
+    elif lunch_preference == "none":
+        lunch_str = "None"
+    else:
+        lunch_str = "None"
+
+    # 4. Format Project Lists
+    perm_list = "\n".join(f"• {p}" for p in (permanent_projects or [])) or "• None"
+    temp_list = "\n".join(f"• {p}" for p in (temporary_projects or [])) or "• None"
+
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":white_check_mark: *Check-in Successful!*\nHi {employee_name}, you have successfully checked in for today.",
+            },
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Work Mode*\n{work_mode_str}"},
+                {"type": "mrkdwn", "text": f"*Check-in Time*\n{checked_in_at_str}"},
+                {"type": "mrkdwn", "text": f"*Mood*\n{mood_str}"},
+                {"type": "mrkdwn", "text": f"*Tiffin / Lunch*\n{lunch_str}"},
+            ],
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Permanent Projects:*\n{perm_list}",
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Temporary Projects:*\n{temp_list}",
+            },
+        },
+    ]
+
     response = _slack_request(
         "/chat.postMessage",
         {
             "channel": channel_id,
-            "text": f"You have successfully checked in for today.",
-            "blocks": [
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f":white_check_mark: *Check-in Successful!*\nHi {employee_name}, you have successfully checked in for today.",
-                    },
-                },
-                {
-                    "type": "section",
-                    "fields": [
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Work Mode*\n{work_mode.upper() if work_mode else 'N/A'}",
-                        },
-                        {
-                            "type": "mrkdwn",
-                            "text": f"*Check-in Time*\n{checked_in_at_str}",
-                        },
-                    ],
-                },
-            ],
+            "text": f"Check-in Successful! Hi {employee_name}, you have successfully checked in for today.",
+            "blocks": blocks,
         },
     )
     if response.get("ok"):

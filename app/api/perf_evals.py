@@ -16,10 +16,12 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import and_, func, or_
+from sqlalchemy.orm import Session
 from app.services.auth_service import get_current_user, has_team_read, require_role
 from app.services import project_scope
+from app.services.perf_cache import perf_cache
 from pydantic import BaseModel, field_validator
-from sqlalchemy.orm import Session
 from app.models.user import User
 from app.models.employee import Employee
 from app.models.allocation import Allocation
@@ -285,6 +287,10 @@ class PerfEvalResponse(BaseModel):
     reviewed_by: Optional[int] = None
     created_at: datetime
     updated_at: datetime
+    # Enriched fields for high-performance direct rendering without frontend N+1 API calls:
+    employee_name: Optional[str] = None
+    employee_avatar_url: Optional[str] = None
+    project_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -305,6 +311,27 @@ def list_evals(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    page_num = page if isinstance(page, int) else int(getattr(page, "default", 1))
+    limit_num = limit if isinstance(limit, int) else int(getattr(limit, "default", 25))
+
+    # ── 1. Dual-Tier Cache Check (L1 RAM -> L2 Redis) ───────────────────
+    cache_key = None
+    if period:
+        cache_filters = {
+            "project_id": project_id,
+            "employee_id": employee_id,
+            "status": status,
+            "search": search,
+            "role_filter": role_filter,
+            "pm_id": pm_id,
+            "type": type,
+        }
+        cache_key = perf_cache.make_key(period, current_user.id, cache_filters, page_num, limit_num)
+        cached_result, hit_type = perf_cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
+
+    # ── 2. User Access & Permission Verification ────────────────────────
     if not has_team_read(current_user):
         if employee_id is None:
             employee_id = current_user.employee_id
@@ -320,15 +347,47 @@ def list_evals(
                 emp = db.query(Employee).filter(Employee.id == employee_id).first()
                 if not emp or emp.email != current_user.email:
                     raise HTTPException(status_code=403, detail="Access denied")
-    q = db.query(PerfEvaluation)
-    
-    # Restrict team leads to only their manageable employees
-    if current_user.role == "team_lead" and not employee_id:
+
+    # ── 3. Strict Column Projections (skilss.md Law 2) ──────────────────
+    # Select only the 15 required evaluation fields plus joined Employee and DailySheet names.
+    # Strips out 67 unused columns (PII, encrypted salaries, raw blobs) and eliminates frontend N+1 calls.
+    q = db.query(
+        PerfEvaluation.id,
+        PerfEvaluation.project_id,
+        PerfEvaluation.employee_id,
+        PerfEvaluation.period,
+        PerfEvaluation.parameter_values,
+        PerfEvaluation.overall_comment,
+        PerfEvaluation.employee_overall_rating,
+        PerfEvaluation.overall_rating,
+        PerfEvaluation.bonus_suggested,
+        PerfEvaluation.bonus_note,
+        PerfEvaluation.status,
+        PerfEvaluation.submitted_by,
+        PerfEvaluation.reviewed_by,
+        PerfEvaluation.created_at,
+        PerfEvaluation.updated_at,
+        Employee.name.label("employee_name"),
+        Employee.avatar_url.label("employee_avatar_url"),
+        DailySheet.name.label("project_name"),
+    ).outerjoin(
+        Employee, Employee.id == PerfEvaluation.employee_id
+    ).outerjoin(
+        DailySheet, DailySheet.id == PerfEvaluation.project_id
+    )
+
+    # ── 4. Push Hierarchy Read-Privacy Directly into SQL ────────────────
+    # Replaces the catastrophic in-memory N+1 loop with a single index-accelerated WHERE clause.
+    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
         manageable_ids = project_scope.get_manageable_employee_ids(db, current_user)
-        if manageable_ids is not None:
-            if not manageable_ids:
-                return {"items": [], "total": 0, "page": page, "limit": limit}
-            q = q.filter(PerfEvaluation.employee_id.in_(manageable_ids))
+        privacy_conds = [PerfEvaluation.reviewed_by == current_user.id]
+        if current_user.employee_id:
+            privacy_conds.append(PerfEvaluation.employee_id == current_user.employee_id)
+        if manageable_ids:
+            privacy_conds.append(PerfEvaluation.employee_id.in_(manageable_ids))
+        q = q.filter(or_(*privacy_conds))
+
+    # ── 5. Standard Filters ─────────────────────────────────────────────
     if project_id and str(project_id) != "all":
         p_ids = [int(p.strip()) for p in str(project_id).split(",") if p.strip().isdigit()]
         if len(p_ids) == 1:
@@ -346,8 +405,12 @@ def list_evals(
                 pm_sub_projects = _get_pm_sub_projects(daily_sheets, main_projects, pid, allocations)
                 all_pm_sub_project_ids.update([sp.id for sp in pm_sub_projects])
             if not all_pm_sub_project_ids:
-                return {"items": [], "total": 0, "page": page, "limit": limit}
+                empty_res = {"items": [], "total": 0, "page": page_num, "limit": limit_num}
+                if cache_key:
+                    perf_cache.set(cache_key, empty_res, is_immutable=True)
+                return empty_res
             q = q.filter(PerfEvaluation.project_id.in_(list(all_pm_sub_project_ids)))
+
     if employee_id:
         q = q.filter(PerfEvaluation.employee_id == employee_id)
     if period:
@@ -362,80 +425,70 @@ def list_evals(
     if type == "bonus":
         q = q.filter(PerfEvaluation.bonus_suggested == True)
 
-    if type in ["pm", "hr"] or search or role_filter:
-        q = q.outerjoin(Employee, Employee.id == PerfEvaluation.employee_id)
-        if type == "pm":
-            q = q.filter(PerfEvaluation.project_id == 0, Employee.designation.ilike("%manager%"))
-        elif type == "hr":
-            q = q.filter(PerfEvaluation.project_id == 0, Employee.designation.ilike("%hr%"))
-            
-        if search and search.strip():
-            q = q.filter(Employee.name.ilike(f"%{search.strip()}%"))
-        if role_filter and str(role_filter) != "all":
-            from sqlalchemy import or_, and_
-            roles = [r.strip().lower() for r in str(role_filter).split(",") if r.strip()]
-            role_conds = []
-            for r in roles:
-                if r == "admin":
-                    role_conds.append(Employee.designation.ilike("%admin%"))
-                elif r == "pm":
-                    role_conds.append(Employee.designation.ilike("%manager%"))
-                elif r == "team_lead":
-                    role_conds.append(Employee.designation.ilike("%lead%"))
-                elif r == "hr":
-                    role_conds.append(Employee.designation.ilike("%hr%"))
-                elif r == "annotator":
-                    role_conds.append(Employee.designation.ilike("%annotator%"))
-                elif r in ["full-time", "intern"]:
-                    cond = Employee.employee_type.ilike(r)
-                    if r == "full-time":
-                        cond = and_(cond, ~Employee.designation.ilike("%manager%"), ~Employee.designation.ilike("%hr%"), ~Employee.designation.ilike("%lead%"))
-                    role_conds.append(cond)
-                elif r == "contract":
-                    role_conds.append(Employee.employee_type.ilike("contract%"))
-            if role_conds:
-                q = q.filter(or_(*role_conds))
+    if type == "pm":
+        q = q.filter(PerfEvaluation.project_id == 0, Employee.designation.ilike("%manager%"))
+    elif type == "hr":
+        q = q.filter(PerfEvaluation.project_id == 0, Employee.designation.ilike("%hr%"))
 
-    
-    # Filter by read privacy first
-    if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
-        # We need to filter the query itself rather than fetching all and filtering in-memory
-        # But for simplicity, if we have to do it in-memory, we can't easily paginate the db query.
-        # Let's fetch all, filter, then paginate.
-        all_evals = q.order_by(PerfEvaluation.period.desc(), PerfEvaluation.created_at.desc()).all()
-        manageable_cache = {current_user.employee_id: True}
-        filtered_evals = []
-        for ev in all_evals:
-            # Already reviewed by this PM: a permanent historical fact, so it must stay
-            # visible even after the employee moves to a project this PM no longer runs —
-            # `can_manage_employee` only reflects *current* assignment and would otherwise
-            # make a PM's own past decision disappear out from under them.
-            if ev.reviewed_by == current_user.id:
-                filtered_evals.append(ev)
-                continue
-            if ev.employee_id not in manageable_cache:
-                manageable_cache[ev.employee_id] = project_scope.can_manage_employee(db, current_user, ev.employee_id)
-            if manageable_cache.get(ev.employee_id, False):
-                filtered_evals.append(ev)
-        
-        total = len(filtered_evals)
-        items = filtered_evals[(page - 1) * limit : page * limit]
+    if search and search.strip():
+        q = q.filter(Employee.name.ilike(f"%{search.strip()}%"))
+    if role_filter and str(role_filter) != "all":
+        roles = [r.strip().lower() for r in str(role_filter).split(",") if r.strip()]
+        role_conds = []
+        for r in roles:
+            if r == "admin":
+                role_conds.append(Employee.designation.ilike("%admin%"))
+            elif r == "pm":
+                role_conds.append(Employee.designation.ilike("%manager%"))
+            elif r == "team_lead":
+                role_conds.append(Employee.designation.ilike("%lead%"))
+            elif r == "hr":
+                role_conds.append(Employee.designation.ilike("%hr%"))
+            elif r == "annotator":
+                role_conds.append(Employee.designation.ilike("%annotator%"))
+            elif r in ["full-time", "intern"]:
+                cond = Employee.employee_type.ilike(r)
+                if r == "full-time":
+                    cond = and_(cond, ~Employee.designation.ilike("%manager%"), ~Employee.designation.ilike("%hr%"), ~Employee.designation.ilike("%lead%"))
+                role_conds.append(cond)
+            elif r == "contract":
+                role_conds.append(Employee.employee_type.ilike("contract%"))
+        if role_conds:
+            q = q.filter(or_(*role_conds))
+
+    # ── 6. High-Performance Pagination & Fetch ──────────────────────────
+    offset = (page_num - 1) * limit_num
+    fetch_limit = limit_num + 1 if page_num == 1 else limit_num
+    rows = q.order_by(PerfEvaluation.period.desc(), PerfEvaluation.created_at.desc())\
+            .offset(offset)\
+            .limit(fetch_limit).all()
+
+    # Fast-path total: If page 1 returns fewer rows than limit, skip count query entirely!
+    if page_num == 1 and len(rows) <= limit_num:
+        total = len(rows)
+        items = rows
     else:
-        total = q.count()
-        items = q.order_by(PerfEvaluation.period.desc(), PerfEvaluation.created_at.desc())\
-                 .offset((page - 1) * limit)\
-                 .limit(limit).all()
-                 
-    return {
-        "items": [PerfEvalResponse.model_validate(item).model_dump() for item in items],
+        if page_num == 1:
+            items = rows[:limit_num]
+        else:
+            items = rows
+        total = q.with_entities(func.count(PerfEvaluation.id)).order_by(None).scalar() or 0
+
+    response_data = {
+        "items": [PerfEvalResponse.model_validate(dict(item._mapping)).model_dump(mode="json") for item in items],
         "total": total,
-        "page": page,
-        "limit": limit
+        "page": page_num,
+        "limit": limit_num
     }
 
+    # ── 7. Backfill Dual-Tier Cache (L1 RAM + L2 Redis) ──────────────────
+    if cache_key:
+        is_immutable = bool(period and period < datetime.now().strftime("%Y-%m"))
+        perf_cache.set(cache_key, response_data, is_immutable=is_immutable)
+
+    return response_data
 
 
-from sqlalchemy import func
 
 @router.get("/admin-kpi", response_model=dict)
 def get_admin_perf_kpi(
@@ -447,6 +500,22 @@ def get_admin_perf_kpi(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "hr", "pm"))
 ):
+    # ── 1. Dual-Tier Cache Check (L1 RAM -> L2 Redis) ───────────────────
+    cache_key = None
+    if period:
+        cache_filters = {
+            "project_id": project_id,
+            "role_filter": role_filter,
+            "search": search,
+            "type": type,
+            "scope": "admin_kpi",
+        }
+        cache_key = perf_cache.make_key(period, current_user.id, cache_filters, 1, 1)
+        cached_result, _ = perf_cache.get(cache_key)
+        if cached_result is not None:
+            return cached_result
+
+    # ── 2. Base Query Construction ──────────────────────────────────────
     q = db.query(PerfEvaluation)
     if period:
         q = q.filter(PerfEvaluation.period == period)
@@ -457,8 +526,10 @@ def get_admin_perf_kpi(
         elif len(p_ids) > 1:
             q = q.filter(PerfEvaluation.project_id.in_(p_ids))
         
+    has_emp_join = False
     if type in ["pm", "hr"] or search or role_filter:
         q = q.outerjoin(Employee, Employee.id == PerfEvaluation.employee_id)
+        has_emp_join = True
         if type == "pm":
             q = q.filter(PerfEvaluation.project_id == 0, Employee.designation.ilike("%manager%"))
         elif type == "hr":
@@ -467,7 +538,6 @@ def get_admin_perf_kpi(
         if search and search.strip():
             q = q.filter(Employee.name.ilike(f"%{search.strip()}%"))
         if role_filter and str(role_filter) != "all":
-            from sqlalchemy import or_, and_
             roles = [r.strip().lower() for r in str(role_filter).split(",") if r.strip()]
             role_conds = []
             for r in roles:
@@ -491,38 +561,54 @@ def get_admin_perf_kpi(
             if role_conds:
                 q = q.filter(or_(*role_conds))
     
-    # KPIs for the admin dashboard
-    total = q.count()
-    
-    # Multi-project employees
-    multi_evals = q.with_entities(PerfEvaluation.employee_id, func.count(PerfEvaluation.id)).group_by(PerfEvaluation.employee_id).having(func.count(PerfEvaluation.id) > 1).all()
-    multi_eval_emp_ids = [row[0] for row in multi_evals]
-    multi_eval_counts = {row[0]: row[1] for row in multi_evals}
-    multi_eval_names = []
-    if multi_eval_emp_ids:
-        emp_names = db.query(Employee.id, Employee.name).filter(Employee.id.in_(multi_eval_emp_ids)).all()
-        multi_eval_names = [f"{name} ({multi_eval_counts[emp_id]})" for emp_id, name in emp_names]
+    # ── 3. Single Consolidated PostgreSQL Conditional Aggregation ───────
+    # Collapses 5 separate COUNT / AVG queries into 1 SQL round-trip
+    agg_row = q.with_entities(
+        func.count(PerfEvaluation.id).label("total"),
+        func.count(PerfEvaluation.id).filter(PerfEvaluation.status == "submitted").label("pending"),
+        func.count(PerfEvaluation.id).filter(PerfEvaluation.status == "reviewed").label("reviewed"),
+        func.count(PerfEvaluation.id).filter(PerfEvaluation.bonus_suggested == True).label("bonus"),
+        func.avg(PerfEvaluation.overall_rating).filter(PerfEvaluation.overall_rating.isnot(None)).label("avg_val")
+    ).one()
+
+    total = agg_row.total or 0
+    pending = agg_row.pending or 0
+    reviewed = agg_row.reviewed or 0
+    bonus = agg_row.bonus or 0
+    avg_val = float(agg_row.avg_val) if agg_row.avg_val is not None else None
+
+    # ── 4. Multi-Project and Multi-Bonus Employees (Group By + Single JOIN)
+    multi_eval_names: List[str] = []
+    multi_bonus_names: List[str] = []
+
+    if total > 0:
+        emp_join_q = q if has_emp_join else q.join(Employee, Employee.id == PerfEvaluation.employee_id)
         
-    pending = q.filter(PerfEvaluation.status == "submitted").count()
-    reviewed = q.filter(PerfEvaluation.status == "reviewed").count()
-    
-    # Bonus evaluations
-    q_bonus = q.filter(PerfEvaluation.bonus_suggested == True)
-    bonus = q_bonus.count()
-    
-    multi_bonus = q_bonus.with_entities(PerfEvaluation.employee_id, func.count(PerfEvaluation.id)).group_by(PerfEvaluation.employee_id).having(func.count(PerfEvaluation.id) > 1).all()
-    multi_bonus_emp_ids = [row[0] for row in multi_bonus]
-    multi_bonus_counts = {row[0]: row[1] for row in multi_bonus}
-    multi_bonus_names = []
-    if multi_bonus_emp_ids:
-        emp_names = db.query(Employee.id, Employee.name).filter(Employee.id.in_(multi_bonus_emp_ids)).all()
-        multi_bonus_names = [f"{name} ({multi_bonus_counts[emp_id]})" for emp_id, name in emp_names]
-    
-    # Avg rating
-    # overall_rating might be null, so we avg only non-nulls
-    avg_val = q.filter(PerfEvaluation.overall_rating.isnot(None)).with_entities(func.avg(PerfEvaluation.overall_rating)).scalar()
-    
-    return {
+        multi_eval_rows = emp_join_q.with_entities(
+            Employee.name,
+            func.count(PerfEvaluation.id)
+        ).group_by(
+            Employee.id, Employee.name
+        ).having(
+            func.count(PerfEvaluation.id) > 1
+        ).all()
+        multi_eval_names = [f"{name} ({cnt})" for name, cnt in multi_eval_rows]
+
+        # Multi-bonus query only needed if bonus count > 1
+        if bonus > 1:
+            multi_bonus_rows = emp_join_q.filter(
+                PerfEvaluation.bonus_suggested == True
+            ).with_entities(
+                Employee.name,
+                func.count(PerfEvaluation.id)
+            ).group_by(
+                Employee.id, Employee.name
+            ).having(
+                func.count(PerfEvaluation.id) > 1
+            ).all()
+            multi_bonus_names = [f"{name} ({cnt})" for name, cnt in multi_bonus_rows]
+
+    result = {
         "total": total,
         "multiEvalCount": len(multi_eval_names),
         "multiEvalNames": multi_eval_names,
@@ -532,8 +618,15 @@ def get_admin_perf_kpi(
         "bonusCount": bonus,
         "multiBonusCount": len(multi_bonus_names),
         "multiBonusNames": multi_bonus_names,
-        "avgRating": float(avg_val) if avg_val else None,
+        "avgRating": avg_val,
     }
+
+    # ── 5. Backfill Dual-Tier Cache (L1 RAM + L2 Redis) ──────────────────
+    if cache_key:
+        is_immutable = bool(period and period < datetime.now().strftime("%Y-%m"))
+        perf_cache.set(cache_key, result, is_immutable=is_immutable)
+
+    return result
 
 @router.get("/dashboard", response_model=dict)
 
@@ -692,6 +785,7 @@ def create_eval(
     db.add(ev)
     db.commit()
     db.refresh(ev)
+    perf_cache.invalidate_period(ev.period)
     try:
         _notify_on_submit(db, ev)
     except Exception:
@@ -742,6 +836,7 @@ def review_eval(
 
     db.commit()
     db.refresh(ev)
+    perf_cache.invalidate_period(ev.period)
     return ev
 
 
@@ -759,6 +854,8 @@ def delete_eval(
         db, current_user, ev.employee_id, action="delete an evaluation"
     )
 
+    period_to_invalidate = ev.period
     db.delete(ev)
     db.commit()
+    perf_cache.invalidate_period(period_to_invalidate)
     return {"message": "Evaluation deleted successfully"}
