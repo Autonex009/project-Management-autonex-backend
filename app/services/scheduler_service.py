@@ -1092,44 +1092,74 @@ def _scheduled_monthly_work_model_sync() -> None:
 
 
 def _scheduled_self_eval_reminder() -> None:
-    from app.models.employee import Employee
-    from app.services.slack_service import try_send_self_eval_reminder, SlackRateLimitError
+    """Monthly job on the 20th: Remind active employees who haven't submitted their self-evaluation."""
+    from datetime import datetime
     import time
-    
-    db = SessionLocal()
+    from app.models.employee import Employee
+    from app.models.perf_eval import PerfEvaluation
+    from app.services.slack_service import try_send_self_eval_reminder, SlackRateLimitError
+
+    current_period = datetime.now().strftime("%Y-%m")
     targets = []
+
+    # 1. Micro-scoped DB query (< 20ms connection hold time)
+    db = SessionLocal()
     try:
-        # Fetch active employees who have a slack_user_id
-        # Depending on how 'active' is defined, we assume slack_user_id is enough, 
-        # or we might need Employee.status != 'inactive' if that column exists.
-        employees = db.query(Employee).filter(
-            Employee.slack_user_id.isnot(None)
+        submitted_subquery = db.query(PerfEvaluation.employee_id).filter(
+            PerfEvaluation.period == current_period,
+            PerfEvaluation.status.in_(["submitted", "reviewed"])
+        )
+
+        employees = db.query(Employee.id, Employee.name, Employee.slack_user_id).filter(
+            Employee.status == "active",
+            Employee.slack_user_id.isnot(None),
+            ~Employee.id.in_(submitted_subquery)
         ).all()
-        # Collect info into dicts so we don't hold ORM objects across async sleep boundaries
-        targets = [{"slack_id": emp.slack_user_id, "name": emp.name} for emp in employees]
+
+        targets = [
+            {"id": emp.id, "name": emp.name, "slack_id": emp.slack_user_id}
+            for emp in employees
+        ]
     except Exception as exc:
         logger.exception("[scheduler] Failed to query employees for self-eval reminder: %s", exc)
         return
     finally:
-        db.close() # Return connection to pool!
+        db.close()  # Return connection to pool immediately!
 
     if not targets:
+        logger.info("[scheduler] Self-eval reminders: 0 pending employees for period %s.", current_period)
         return
 
-    sent = 0
+    # 2. Outbound Slack network I/O with ZERO active DB connections
+    sent, failed = 0, 0
+    logger.info(
+        "[scheduler] Starting self-eval reminders for %d pending employee(s) (period %s)...",
+        len(targets), current_period
+    )
+
     for target in targets:
         try:
             ts, channel_id = try_send_self_eval_reminder(target["slack_id"], target["name"])
             if ts and channel_id:
                 sent += 1
-                time.sleep(1.5)
+                time.sleep(1.2)  # Respect Slack rate limits (~1 msg/sec)
+            else:
+                failed += 1
         except SlackRateLimitError as exc:
-            logger.warning("[scheduler] Rate limit hit sending self-eval reminder to %s, sleeping %s seconds...", target["name"], exc.retry_after_seconds)
-            time.sleep(exc.retry_after_seconds)
+            retry_wait = exc.retry_after_seconds or 10
+            logger.warning(
+                "[scheduler] Slack 429 hit for %s. Sleeping %d seconds...",
+                target["name"], retry_wait
+            )
+            time.sleep(retry_wait)
         except Exception as exc:
+            failed += 1
             logger.error("[scheduler] Failed sending self-eval reminder to %s: %s", target["name"], exc)
-    
-    logger.info("[scheduler] Self-eval reminders sent to %d/%d active employees.", sent, len(targets))
+
+    logger.info(
+        "[scheduler] Self-eval reminder batch finished: %d sent, %d failed out of %d.",
+        sent, failed, len(targets)
+    )
 
 def shutdown_scheduler() -> None:
     # guard against double-shutdown if called more than once
