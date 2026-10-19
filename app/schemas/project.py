@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from typing import List, Optional
 from datetime import date, datetime
 
@@ -135,3 +135,84 @@ class ProjectResponse(ProjectBase):
 
     class Config:
         from_attributes = True
+
+
+class ProjectDropdownItem(BaseModel):
+    id: int
+    name: str
+    required_manpower: int = 0
+    required_expertise: List[str] = []
+    project_status: str = "active"
+
+    class Config:
+        from_attributes = True
+
+
+# --- Employee Portal "My Projects" Intelligence Schemas ---
+
+class ProjectLeaderInfo(BaseModel):
+    id: int
+    name: str
+    designation: Optional[str] = None
+    avatar_url: Optional[str] = None
+    role: str  # "Program Manager" | "Team Lead"
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ProjectCheckinStats(BaseModel):
+    total_days: int = 0
+    this_month_days: int = 0
+    last_checkin_date: Optional[str] = None  # "YYYY-MM-DD"
+    checked_in_today: bool = False
+
+
+class ProjectGuidelineSummary(BaseModel):
+    id: int
+    title: str
+    file_name: Optional[str] = None
+    file_url: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MyProjectItem(BaseModel):
+    id: int
+    name: str
+    client: Optional[str] = None
+    project_type: Optional[str] = None
+    priority: Optional[str] = "medium"
+    project_status: str = "active"
+
+    # Classification: True for formal allocation, False for detected check-in
+    is_permanent: bool = True
+
+    # Allocation Metadata (None if temporary / check-in only)
+    allocation_id: Optional[int] = None
+    role_tags: List[str] = []
+    total_daily_hours: Optional[float] = None
+    active_start_date: Optional[date] = None
+    active_end_date: Optional[date] = None
+
+    # Team Leadership
+    program_managers: List[ProjectLeaderInfo] = []
+    team_leads: List[ProjectLeaderInfo] = []
+
+    # Check-in Attendance Intelligence
+    checkin_stats: ProjectCheckinStats = Field(default_factory=ProjectCheckinStats)
+
+    # Guidelines & Resources
+    guidelines: List[ProjectGuidelineSummary] = []
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class MyProjectsResponse(BaseModel):
+    employee_id: int
+    total_projects: int
+    permanent_count: int
+    temporary_count: int
+    checked_in_today_any: bool
+    permanent_projects: List[MyProjectItem] = []
+    temporary_projects: List[MyProjectItem] = []
+

@@ -28,11 +28,9 @@ ALLOWED_SEVERITIES = {"low", "medium", "high"}
 
 
 def _ensure_note_read_access_for_employee(employee_id: int, current_user: User, db: Session) -> None:
-    if project_scope.has_full_access(current_user):
+    if has_team_read(current_user):
         return
     if current_user.employee_id == employee_id:
-        return
-    if current_user.role in ("pm", "team_lead") and project_scope.can_manage_employee(db, current_user, employee_id):
         return
     raise HTTPException(status_code=403, detail="Access denied")
 
@@ -78,9 +76,15 @@ def create_employee_note(
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    project_scope.require_employee_scope(
-        db, current_user, payload.employee_id, action="create notes"
-    )
+    if current_user.employee_id and current_user.employee_id == payload.employee_id:
+        raise HTTPException(status_code=400, detail="You cannot issue a note to yourself")
+
+    if current_user.role == "team_lead":
+        if project_scope.escalates_to_admin(db, payload.employee_id) or project_scope.escalates_to_pm(db, payload.employee_id):
+            raise HTTPException(status_code=403, detail="Team leads cannot issue notes to managers or peer team leads")
+    elif current_user.role == "pm":
+        if project_scope.escalates_to_admin(db, payload.employee_id):
+            raise HTTPException(status_code=403, detail="Project managers cannot issue notes to managers or HR/admin")
 
     note = EmployeeNote(
         employee_id=payload.employee_id,
@@ -129,29 +133,9 @@ def list_employee_notes(
 ):
     query = db.query(EmployeeNote)
 
-    if project_scope.has_full_access(current_user):
+    if has_team_read(current_user):
         if employee_id is not None:
             query = query.filter(EmployeeNote.employee_id == employee_id)
-    elif current_user.role in ("pm", "team_lead"):
-        if employee_id is not None:
-            _ensure_note_read_access_for_employee(employee_id, current_user, db)
-            query = query.filter(EmployeeNote.employee_id == employee_id)
-        else:
-            notes = query.order_by(EmployeeNote.issued_at.desc(), EmployeeNote.id.desc()).all()
-            manageable_cache = {current_user.employee_id: True}
-            filtered_notes = []
-            for n in notes:
-                if n.employee_id not in manageable_cache:
-                    manageable_cache[n.employee_id] = project_scope.can_manage_employee(db, current_user, n.employee_id)
-                if manageable_cache.get(n.employee_id, False):
-                    filtered_notes.append(n)
-            if type:
-                if type not in ALLOWED_TYPES:
-                    raise HTTPException(status_code=400, detail="Invalid type")
-                filtered_notes = [n for n in filtered_notes if n.type == type]
-            if status:
-                filtered_notes = [n for n in filtered_notes if n.status == status]
-            return [_enrich_note(db, n) for n in filtered_notes]
     else:
         if not current_user.employee_id:
             raise HTTPException(status_code=403, detail="Access denied")
@@ -225,10 +209,6 @@ def update_employee_note(
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
 
-    project_scope.require_employee_scope(
-        db, current_user, note.employee_id, action="update notes"
-    )
-
     if current_user.role not in ("admin", "hr") and note.issued_by != current_user.id:
         raise HTTPException(
             status_code=403,
@@ -292,10 +272,6 @@ def resolve_employee_note(
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
 
-    project_scope.require_employee_scope(
-        db, current_user, note.employee_id, action="resolve notes"
-    )
-
     if current_user.role not in ("admin", "hr") and note.issued_by != current_user.id:
         raise HTTPException(
             status_code=403,
@@ -346,10 +322,6 @@ def delete_employee_note(
     note = db.query(EmployeeNote).filter(EmployeeNote.id == note_id).first()
     if not note:
         raise HTTPException(status_code=404, detail="Note not found")
-
-    project_scope.require_employee_scope(
-        db, current_user, note.employee_id, action="delete notes"
-    )
 
     if current_user.role not in ("admin", "hr") and note.issued_by != current_user.id:
         raise HTTPException(

@@ -220,10 +220,8 @@ def _build_response(req: WFHRequest, db: Session = None, employee_name: str = No
 def _apply_wfh_privacy_query_filter(query, current_user: User, db: Session, exclude_self: bool = False):
     """Applies privacy rules directly to the SQLAlchemy query to prevent N+1."""
     if current_user.role in ("pm", "team_lead") and not project_scope.has_full_access(current_user):
-        manageable = project_scope.get_manageable_employee_ids(db, current_user)
+        manageable = project_scope.get_manageable_employee_ids(db, current_user, exclude_self=exclude_self)
         if manageable is not None:
-            if exclude_self and current_user.employee_id in manageable:
-                manageable.remove(current_user.employee_id)
             if not manageable:
                 from app.models.wfh import WFHRequest
                 return query.filter(WFHRequest.id == -1)

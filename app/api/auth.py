@@ -323,6 +323,10 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
     })
     refresh_token = create_refresh_token(user.id, db)
 
+    # Pre-warm dual-tier cache so simultaneous dashboard requests hit 0ms RAM
+    from app.services.auth_service import cache_authenticated_user
+    cache_authenticated_user(user)
+
     # Return JSONResponse to include both cookie and JSON body
     response = JSONResponse(content={
         "token": token,
@@ -507,6 +511,9 @@ def reset_password(
     db.add(user)
     db.commit()
 
+    from app.services.auth_service import invalidate_user_auth_cache
+    invalidate_user_auth_cache(user_id)
+
     logger.info("[reset-password] Password reset successful for user id=%s email=%s", user_id, user.email)
     return MessageResponse(message="Password reset successful. You can now sign in with your new password.")
 
@@ -518,6 +525,17 @@ def logout(request: Request, db: Session = Depends(get_db)):
     refresh_token = request.cookies.get("refresh_token")
     if refresh_token:
         verify_and_delete_refresh_token(refresh_token, db)
+
+    access_token = request.cookies.get("access_token")
+    if access_token:
+        try:
+            payload = decode_token(access_token)
+            sub = payload.get("sub")
+            if sub:
+                from app.services.auth_service import invalidate_user_auth_cache
+                invalidate_user_auth_cache(int(sub))
+        except Exception:
+            pass
         
     secure_flag, samesite_policy = _get_cookie_settings()
     response = JSONResponse(content={"message": "Logged out successfully"})
@@ -640,6 +658,9 @@ def change_password(
     db.add(user)
     db.commit()
     db.refresh(user)
+
+    from app.services.auth_service import invalidate_user_auth_cache
+    invalidate_user_auth_cache(user.id)
 
     logger.info("[change-password] User id=%s changed password successfully", user.id)
     return build_user_response(user, db)

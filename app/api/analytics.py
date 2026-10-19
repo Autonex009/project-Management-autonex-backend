@@ -1186,6 +1186,19 @@ def get_leaderboard(
         start = _month_start(today)
         end = today
 
+    # Redis Cache Check
+    import json
+    from app.services.project_cache import get_redis_client
+    cache_key = f"cache:leaderboard:{range}:{start.isoformat()}:{end.isoformat()}"
+    redis_client = get_redis_client()
+    if redis_client:
+        try:
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                return json.loads(cached_data)
+        except Exception:
+            pass
+
     time_rows = db.query(EncordDailyTimeSpent).filter(
         EncordDailyTimeSpent.metric_date >= start,
         EncordDailyTimeSpent.metric_date <= end,
@@ -1244,6 +1257,15 @@ def get_leaderboard(
             if ds.encord_project_hash and ds.name:
                 proj_name_by_hash[ds.encord_project_hash] = ds.name
 
+    # Pre-fetch all sheet assignments once to completely eliminate the N+1 loop query
+    emp_assigned_sheet = {}
+    assigned_sheets = db.query(DailySheet.name, DailySheet.assigned_employee_ids).filter(DailySheet.assigned_employee_ids.isnot(None)).all()
+    for s_name, a_ids in assigned_sheets:
+        if a_ids and isinstance(a_ids, list):
+            for eid in a_ids:
+                if eid not in emp_assigned_sheet:
+                    emp_assigned_sheet[eid] = s_name
+
     emails = [e for e in user_seconds.keys() if e]
     # Normalized on both sides, like _names_for — otherwise a whitespace-padded
     # encord_id costs the row its avatar and designation as well as its name.
@@ -1280,10 +1302,8 @@ def get_leaderboard(
                     break
 
         if not top_proj_name and emp_id:
-            # Fallback check if user assigned in daily sheets
-            assigned = db.query(DailySheet.name).filter(DailySheet.assigned_employee_ids.contains([emp_id])).first()
-            if assigned:
-                top_proj_name = assigned.name
+            # Look up from pre-fetched map in O(1) time
+            top_proj_name = emp_assigned_sheet.get(emp_id)
 
         leaderboard.append({
             "rank": rank,
@@ -1303,7 +1323,7 @@ def get_leaderboard(
 
     top_performer = leaderboard[0] if leaderboard else None
 
-    return {
+    result = {
         "range": {"from": start.isoformat(), "to": end.isoformat()},
         "team_summary": {
             "total_hours": _hours(total_team_seconds),
@@ -1315,4 +1335,46 @@ def get_leaderboard(
             } if top_performer else None,
         },
         "leaderboard": leaderboard,
+    }
+
+    if redis_client:
+        try:
+            redis_client.set(cache_key, json.dumps(result), ex=600)  # 10 Minutes TTL
+        except Exception:
+            pass
+
+    return result
+
+
+@me_router.get("/my-ranks")
+def get_my_ranks(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Ultra-lightweight endpoint returning only the logged-in user's daily, weekly, and monthly ranks."""
+    emp = None
+    if current_user.employee_id:
+        emp = db.query(Employee.encord_id, Employee.email).filter(Employee.id == current_user.employee_id).first()
+    if not emp and current_user.email:
+        emp = db.query(Employee.encord_id, Employee.email).filter(Employee.email == current_user.email).first()
+
+    my_id = (emp.encord_id or "").strip().lower() if emp and emp.encord_id else (current_user.email or "").strip().lower()
+
+    def _extract_rank(lb):
+        if not lb or not my_id:
+            return None
+        for item in lb.get("leaderboard", []):
+            if (item.get("user_email") or "").strip().lower() == my_id:
+                return item.get("rank")
+        return None
+
+    # Leverages the Redis-cached get_leaderboard calls (sub-millisecond when cached)
+    day_board = get_leaderboard(range="day", db=db, current_user=current_user)
+    week_board = get_leaderboard(range="week", db=db, current_user=current_user)
+    month_board = get_leaderboard(range="month", db=db, current_user=current_user)
+
+    return {
+        "daily_rank": _extract_rank(day_board),
+        "weekly_rank": _extract_rank(week_board),
+        "monthly_rank": _extract_rank(month_board),
     }
