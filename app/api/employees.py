@@ -409,18 +409,20 @@ def list_employees_paginated(
     if team_only:
         from app.models.allocation import Allocation
         from app.models.project import DailySheet
-        from app.services.project_scope import can_act_on_project, has_full_access
+        from app.services.project_scope import get_authorized_project_ids, has_full_access
         
         if not has_full_access(current_user):
-            all_projects = db.query(DailySheet).all()
-            scoped_project_ids = [p.id for p in all_projects if can_act_on_project(db, current_user, p)]
+            scoped_project_ids = get_authorized_project_ids(db, current_user)
             if scoped_project_ids:
-                allocated_employee_ids = db.query(Allocation.employee_id).filter(
-                    Allocation.sub_project_id.in_(scoped_project_ids),
-                    Allocation.is_active == True
-                ).distinct().all()
-                allocated_employee_ids = [r[0] for r in allocated_employee_ids if r[0]]
-                query = query.filter(Employee.id.in_(allocated_employee_ids))
+                alloc_subq = (
+                    db.query(Allocation.employee_id)
+                    .filter(
+                        Allocation.sub_project_id.in_(scoped_project_ids),
+                        Allocation.is_active == True
+                    )
+                    .subquery()
+                )
+                query = query.filter(Employee.id.in_(alloc_subq))
             else:
                 query = query.filter(Employee.id == -1)
     
@@ -577,34 +579,96 @@ def list_employees_paginated(
     if emp_ids:
         from app.models.allocation import Allocation
         from app.models.project import DailySheet
-        from app.models.parent_project import MainProject
-        from app.models.sub_project import SubProject as HierarchySubProject
         
-        allocations = db.query(Allocation).filter(Allocation.employee_id.in_(emp_ids), Allocation.is_active == True).all()
-        ds_ids = list(set([a.sub_project_id for a in allocations if a.sub_project_id]))
-        
-        daily_sheets = db.query(DailySheet).filter(DailySheet.id.in_(ds_ids)).all()
+        allocations = (
+            db.query(Allocation)
+            .filter(Allocation.employee_id.in_(emp_ids), Allocation.is_active == True)
+            .all()
+        )
+        ds_ids = list({a.sub_project_id for a in allocations if a.sub_project_id})
+        daily_sheets = (
+            db.query(DailySheet.id, DailySheet.name, DailySheet.assigned_employee_ids)
+            .filter(DailySheet.id.in_(ds_ids))
+            .all()
+            if ds_ids
+            else []
+        )
         ds_by_id = {ds.id: ds for ds in daily_sheets}
-        from app.services.project_scope import project_pm_ids, project_lead_ids
 
-        # Resolve managers/leads per daily sheet:
-        # If PM is there -> show all PMs, no leads. If no PM -> show all leads.
+        # Pre-fetch candidate employee IDs across all relevant daily sheets (Law 7 Compliant: No MainProject fallback!)
+        all_ds_ids = [ds.id for ds in daily_sheets]
+        project_alloc_rows = (
+            db.query(Allocation.sub_project_id, Allocation.employee_id, Allocation.role_tags)
+            .filter(Allocation.sub_project_id.in_(all_ds_ids), Allocation.is_active == True)
+            .all()
+        ) if all_ds_ids else []
+
+        candidate_emp_ids = set()
+        for ds in daily_sheets:
+            for raw_id in (ds.assigned_employee_ids or []):
+                try:
+                    candidate_emp_ids.add(int(raw_id))
+                except (TypeError, ValueError):
+                    pass
+
+        # Fast 1-index lookup of all team lead IDs in the company (prevents scanning 500 annotators)
+        from sqlalchemy import func
+        LEAD_TAG_TERMS = {"team lead", "lead", "tl"}
+        company_lead_ids = {
+            r[0] for r in db.query(Employee.id).filter(
+                func.lower(Employee.designation).in_(["team lead", "lead", "tl"])
+            ).all()
+        }
+
+        for _, a_emp_id, role_tags in project_alloc_rows:
+            if a_emp_id:
+                is_tagged_lead = any((t or "").strip().lower() in LEAD_TAG_TERMS for t in (role_tags or []))
+                if is_tagged_lead or (a_emp_id in company_lead_ids):
+                    candidate_emp_ids.add(a_emp_id)
+
+        # 1 batched query for designations & names of candidate managers/leads
+        emp_meta = {}
+        if candidate_emp_ids:
+            records = db.query(Employee.id, Employee.name, Employee.designation).filter(
+                Employee.id.in_(candidate_emp_ids)
+            ).all()
+            emp_meta = {
+                e.id: {
+                    "name": e.name,
+                    "designation": (e.designation or "").strip().lower()
+                } for e in records
+            }
+
+        # Pure in-memory resolution (0ms DB time)
         ds_pm_ids = {}
         ds_lead_ids = {}
         all_resolved_mgr_ids = set()
+
         for ds in daily_sheets:
-            pm_ids = project_pm_ids(db, ds)
-            lead_ids = project_lead_ids(db, ds)
+            assigned_ids = set()
+            for raw_id in (ds.assigned_employee_ids or []):
+                try:
+                    assigned_ids.add(int(raw_id))
+                except (TypeError, ValueError):
+                    pass
+
+            # Filter out PMs demoted to lead
+            pm_ids = {i for i in assigned_ids if emp_meta.get(i, {}).get("designation") not in LEAD_TAG_TERMS}
+            
+            # Leads: tagged in allocations or assigned occupants designated as leads
+            lead_ids = {i for i in assigned_ids if emp_meta.get(i, {}).get("designation") in LEAD_TAG_TERMS}
+            for sub_id, a_emp_id, role_tags in project_alloc_rows:
+                if sub_id == ds.id and a_emp_id:
+                    is_lead_tag = any((t or "").strip().lower() in LEAD_TAG_TERMS for t in (role_tags or []))
+                    is_lead_desig = emp_meta.get(a_emp_id, {}).get("designation") in LEAD_TAG_TERMS
+                    if is_lead_tag or is_lead_desig:
+                        lead_ids.add(a_emp_id)
+
             ds_pm_ids[ds.id] = pm_ids
             ds_lead_ids[ds.id] = lead_ids
-            all_resolved_mgr_ids.update(pm_ids)
-            all_resolved_mgr_ids.update(lead_ids)
+            all_resolved_mgr_ids.update(pm_ids | lead_ids)
 
-        if all_resolved_mgr_ids:
-            mgr_employees = db.query(Employee).filter(Employee.id.in_(list(all_resolved_mgr_ids))).all()
-            mgr_by_id = {m.id: m.name for m in mgr_employees}
-        else:
-            mgr_by_id = {}
+        mgr_by_id = {eid: emp_meta[eid]["name"] for eid in all_resolved_mgr_ids if eid in emp_meta}
 
         emp_pms = {e.id: set() for e in items}
         emp_leads = {e.id: set() for e in items}
@@ -1129,6 +1193,10 @@ def update_employee(
 
     db.commit()
     db.refresh(employee)
+
+    if linked_user:
+        from app.services.auth_service import invalidate_user_auth_cache
+        invalidate_user_auth_cache(linked_user.id)
     return employee
 
 
@@ -1267,6 +1335,10 @@ def verify_employee_email_change(
     db.commit()
     db.refresh(employee)
     
+    if linked_user:
+        from app.services.auth_service import invalidate_user_auth_cache
+        invalidate_user_auth_cache(linked_user.id)
+
     return employee
 
 class ConvertToFulltimeBody(BaseModel):
@@ -1366,6 +1438,10 @@ def convert_to_fulltime(
 
     db.commit()
     db.refresh(employee)
+
+    if linked_user:
+        from app.services.auth_service import invalidate_user_auth_cache
+        invalidate_user_auth_cache(linked_user.id)
 
     # ── Auto-generate full-time offer letter on conversion ──────────────────────
     try:
@@ -1469,6 +1545,9 @@ def delete_employee(
         )
 
         db.commit()
+        if linked_user:
+            from app.services.auth_service import invalidate_user_auth_cache
+            invalidate_user_auth_cache(linked_user.id)
         return {"message": "Employee archived successfully"}
     except SQLAlchemyError:
         db.rollback()
@@ -1525,6 +1604,9 @@ def restore_employee(
 
         db.commit()
         db.refresh(employee)
+        if linked_user:
+            from app.services.auth_service import invalidate_user_auth_cache
+            invalidate_user_auth_cache(linked_user.id)
         return employee
     except SQLAlchemyError:
         db.rollback()

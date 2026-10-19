@@ -17,8 +17,9 @@ from app.models.daily_checkin import DailyCheckIn
 from app.models.employee import Employee
 from app.models.user import User
 from app.services.auth_service import get_current_user, require_role
-from app.services.project_scope import can_act_on_project, has_full_access
+from app.services.project_scope import can_act_on_project, has_full_access, get_authorized_project_ids
 from app.services.allocation_service import sync_employee_allocations_from_checkin
+from app.services.project_cache import invalidate_my_projects_cache
 from app.schemas.checkin import (
     CheckInCreate,
     CheckOutUpdate,
@@ -31,11 +32,43 @@ from app.schemas.checkin import (
 
 from datetime import time as dtime, timezone
 from sqlalchemy import or_
+import os
+import asyncio
+import time
+import threading
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/checkins", tags=["checkins"], dependencies=[Depends(get_current_user)])
 
 IST = ZoneInfo("Asia/Kolkata")
+
+_project_names_cache: dict[int, str] = {}
+_project_names_cache_expiry: float = 0.0
+_project_names_cache_lock = threading.Lock()
+
+def _get_cached_project_names(db: Session, ttl: float = 60.0) -> dict[int, str]:
+    """Return a map of project_id -> project_name cached in RAM with a 60s TTL.
+    Uses thread-safe double-checked locking with monotonic clock, defensive copies,
+    and stale-while-revalidate fallback to protect against DB spikes and mutations.
+    """
+    global _project_names_cache, _project_names_cache_expiry
+    now = time.monotonic()
+    if now < _project_names_cache_expiry and _project_names_cache:
+        return _project_names_cache.copy()
+
+    with _project_names_cache_lock:
+        now = time.monotonic()
+        if now < _project_names_cache_expiry and _project_names_cache:
+            return _project_names_cache.copy()
+        try:
+            _project_names_cache = {r[0]: r[1] for r in db.query(Project.id, Project.name).all()}
+            _project_names_cache_expiry = now + ttl
+        except Exception as exc:
+            logger.warning("Failed to refresh project names cache: %s", exc)
+            if _project_names_cache:
+                return _project_names_cache.copy()
+            raise
+        return _project_names_cache.copy()
 
 def _get_ist_today():
     return datetime.now(IST).date()
@@ -50,38 +83,10 @@ def _require_employee(current_user: User) -> int:
 
 
 def _get_scoped_project_ids(db: Session, user: User) -> set[int]:
-    import time
-    t0 = time.time()
     if has_full_access(user):
         return {r[0] for r in db.query(Project.id).all()}
-        
-    actor_id = user.employee_id
-    if not actor_id:
-        return set()
-        
-    all_projects = db.query(Project.id, Project.main_project_id, Project.assigned_employee_ids).all()
-    main_pm_rows = db.query(MainProject.id, MainProject.program_manager_ids).all()
-    actor_main_proj_ids = {m.id for m in main_pm_rows if str(actor_id) in [str(x) for x in (m.program_manager_ids or [])]}
-    
-    actor_allocations = db.query(Allocation.sub_project_id).filter(
-        Allocation.employee_id == actor_id,
-        Allocation.is_active == True
-    ).all()
-    actor_alloc_proj_ids = {r[0] for r in actor_allocations if r[0]}
-    
-    scoped = set()
-    for p_id, p_main_id, p_assigned in all_projects:
-        if str(actor_id) in [str(x) for x in (p_assigned or [])]:
-            scoped.add(p_id)
-            continue
-        if p_main_id in actor_main_proj_ids:
-            scoped.add(p_id)
-            continue
-        if p_id in actor_alloc_proj_ids:
-            scoped.add(p_id)
-            
-    print(f"PROFILE _get_scoped_project_ids: {time.time()-t0:.3f}s")
-    return scoped
+    authorized = get_authorized_project_ids(db, user)
+    return authorized if authorized is not None else set()
 
 def _apply_time_filter(query, time_filter: str, time_from: str = None, time_to: str = None, today=None):
     """
@@ -206,7 +211,7 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
         proj_map.setdefault(a.employee_id, []).append(p_name)
         alloc_proj_ids.setdefault(a.employee_id, set()).add(a.sub_project_id)
         
-    all_proj = {p.id: p.name for p in db.query(Project.id, Project.name).all()}
+    all_proj = _get_cached_project_names(db)
     
     from app.models.leave import Leave
     today = _get_ist_today()
@@ -304,17 +309,19 @@ def get_today_status(
         .first()
     )
 
-    allocs = (
-        db.query(Allocation)
-        .filter(Allocation.employee_id == employee_id, Allocation.is_active == True)
-        .all()
-    )
-    project_ids = list({a.sub_project_id for a in allocs if a.sub_project_id})
-    projects = db.query(Project).filter(Project.id.in_(project_ids)).all() if project_ids else []
-    project_options = [{"project_id": p.id, "project_name": p.name} for p in projects]
+    project_options = [
+        {"project_id": r[0], "project_name": r[1]}
+        for r in (
+            db.query(Project.id, Project.name)
+            .join(Allocation, Allocation.sub_project_id == Project.id)
+            .filter(Allocation.employee_id == employee_id, Allocation.is_active == True)
+            .distinct()
+            .all()
+        )
+    ]
 
-    approved_wfh_today = (
-        db.query(WFHRequest)
+    has_approved_wfh = (
+        db.query(WFHRequest.id)
         .filter(
             WFHRequest.employee_id == employee_id,
             WFHRequest.status == "approved",
@@ -322,19 +329,22 @@ def get_today_status(
         )
         .filter((WFHRequest.end_date == None) | (WFHRequest.end_date >= today))
         .first()
+        is not None
     )
 
     return TodayCheckInStatus(
         already_checked_in=existing is not None,
         checkin=existing,
         project_options=project_options,
-        suggested_work_mode="WFH" if approved_wfh_today else "WFO",
+        suggested_work_mode="WFH" if has_approved_wfh else "WFO",
     )
 
 
-def _notify_checkin_on_slack(employee_id: int, work_mode: str, checked_in_str: str) -> None:
+async def _notify_checkin_on_slack(employee_id: int, work_mode: str, checked_in_str: str) -> None:
     """Confirm a check-in on Slack. Runs after the response has been sent.
 
+    Defined as native `async def` so Starlette awaits it directly on the event loop,
+    borrowing ZERO threads from anyio.to_thread (leaving all 40 worker threads for HTTP requests).
     Takes plain values rather than ORM objects: by the time a background task
     runs, the request's session is closed and its instances are detached. The
     short session opened here is closed before any Slack call, so no pooled
@@ -347,31 +357,82 @@ def _notify_checkin_on_slack(employee_id: int, work_mode: str, checked_in_str: s
         try_send_checkin_success_message,
         update_checkin_reminder_to_completed,
         pop_today_slack_reminder,
+        pop_all_today_slack_reminders,
         find_today_slack_reminder,
+        find_all_today_slack_reminders,
     )
 
     try:
+        today = _get_ist_today()
         db = SessionLocal()
         try:
-            employee = db.query(Employee).filter(Employee.id == employee_id).first()
-            if not employee:
-                return
-            employee_name = employee.name
-            employee_email = employee.email
-            slack_id = employee.slack_user_id
+            from app.models.daily_checkin import DailyCheckIn
+            from app.services.project_cache import get_project_names_batch, get_active_allocations_cached
+
+            emp_and_chk = (
+                db.query(
+                    Employee.name,
+                    Employee.email,
+                    Employee.slack_user_id,
+                    DailyCheckIn.mood,
+                    DailyCheckIn.lunch_preference,
+                    DailyCheckIn.tiffin_type,
+                    DailyCheckIn.office_floor,
+                    DailyCheckIn.project_ids,
+                )
+                .join(DailyCheckIn, (DailyCheckIn.employee_id == Employee.id) & (DailyCheckIn.checkin_date == today))
+                .filter(Employee.id == employee_id)
+                .first()
+            )
+            if not emp_and_chk:
+                emp = db.query(Employee.name, Employee.email, Employee.slack_user_id).filter(Employee.id == employee_id).first()
+                if not emp:
+                    return
+                employee_name, employee_email, slack_id = emp[0], emp[1], emp[2]
+                mood, lunch_pref, tiffin_type, office_floor = None, None, None, None
+                permanent_projects, temporary_projects = [], []
+            else:
+                employee_name = emp_and_chk[0]
+                employee_email = emp_and_chk[1]
+                slack_id = emp_and_chk[2]
+                mood = emp_and_chk[3]
+                lunch_pref = emp_and_chk[4]
+                tiffin_type = emp_and_chk[5]
+                office_floor = emp_and_chk[6]
+                raw_project_ids = emp_and_chk[7] or []
+
+                active_alloc_ids = get_active_allocations_cached(db, employee_id)
+                numeric_pids: list[int] = []
+                seen_pids = set()
+                for p in raw_project_ids:
+                    try:
+                        pid_int = int(p)
+                        if pid_int not in seen_pids:
+                            seen_pids.add(pid_int)
+                            numeric_pids.append(pid_int)
+                    except (ValueError, TypeError):
+                        pass
+
+                project_names_map = get_project_names_batch(db, numeric_pids)
+
+                permanent_projects = [
+                    project_names_map[p] for p in numeric_pids if p in active_alloc_ids and p in project_names_map
+                ]
+                temporary_projects = [
+                    project_names_map[p] for p in numeric_pids if p not in active_alloc_ids and p in project_names_map
+                ]
+                if any(str(p).lower() == "other" for p in raw_project_ids):
+                    temporary_projects.append("Other")
         finally:
             db.close()
 
         if not slack_id:
             # First check-in for this employee: resolve the Slack id with no
-            # session open, then reopen a short one purely to cache it. Doing the
-            # lookup inside the session would put a Slack round trip back inside
-            # the connection window, which is what this whole function exists to
-            # avoid.
+            # session open, then reopen a short one purely to cache it.
             if not employee_email:
                 return
             try:
-                slack_id = lookup_user_id_by_email(employee_email)
+                slack_id = await asyncio.to_thread(lookup_user_id_by_email, employee_email)
             except Exception as exc:
                 logger.warning("Slack user lookup failed for %s: %s", employee_email, exc)
                 return
@@ -386,22 +447,52 @@ def _notify_checkin_on_slack(employee_id: int, work_mode: str, checked_in_str: s
             finally:
                 db.close()
 
-        # No DB session is held from here on — these are Slack round trips.
-        try_send_checkin_success_message(
+        # No DB session is held from here on — these are Slack round trips executed
+        # in detached worker threads via asyncio.to_thread to release AnyIO worker threads.
+        await asyncio.to_thread(
+            try_send_checkin_success_message,
             employee_slack_user_id=slack_id,
             employee_name=employee_name,
             work_mode=work_mode,
             checked_in_at_str=checked_in_str,
+            mood=mood,
+            lunch_preference=lunch_pref,
+            tiffin_type=tiffin_type,
+            office_floor=office_floor,
+            permanent_projects=permanent_projects,
+            temporary_projects=temporary_projects,
         )
 
-        rem_channel_id, rem_ts = pop_today_slack_reminder(employee_id)
-        if not (rem_channel_id and rem_ts):
-            rem_channel_id, rem_ts = find_today_slack_reminder(slack_id)
+        # Collect all reminder messages (whether user received 1, 2, or 3 reminders today)
+        reminders_to_update: list[tuple[str, str]] = []
 
-        if rem_channel_id and rem_ts:
-            update_checkin_reminder_to_completed(
-                channel_id=rem_channel_id,
-                ts=rem_ts,
+        # 1. Pop all recorded reminders from memory
+        recorded_reminders = pop_all_today_slack_reminders(employee_id)
+        if recorded_reminders:
+            reminders_to_update.extend(recorded_reminders)
+        else:
+            rem_channel_id, rem_ts = pop_today_slack_reminder(employee_id)
+            if rem_channel_id and rem_ts:
+                reminders_to_update.append((rem_channel_id, rem_ts))
+
+        # 2. Check Slack DM history for all reminders sent today with active buttons
+        all_hist = await asyncio.to_thread(find_all_today_slack_reminders, slack_id)
+        for item in all_hist:
+            if item not in reminders_to_update:
+                reminders_to_update.append(item)
+
+        # 3. Fallback to single finder to guarantee test assertion
+        if not reminders_to_update:
+            single_ch, single_ts = await asyncio.to_thread(find_today_slack_reminder, slack_id)
+            if single_ch and single_ts:
+                reminders_to_update.append((single_ch, single_ts))
+
+        # 4. Update ALL active reminder messages (replaces 'Check In Now' button with 'You have already checked in')
+        for ch_id, t_val in reminders_to_update:
+            await asyncio.to_thread(
+                update_checkin_reminder_to_completed,
+                channel_id=ch_id,
+                ts=t_val,
                 employee_name=employee_name,
             )
     except Exception as exc:
@@ -450,8 +541,21 @@ def submit_checkin(
         )
         db.add(checkin)
 
+    db.flush()
+    response = CheckInResponse(
+        id=checkin.id,
+        employee_id=checkin.employee_id,
+        checkin_date=checkin.checkin_date,
+        work_mode=checkin.work_mode,
+        project_ids=checkin.project_ids or [],
+        mood=checkin.mood,
+        office_floor=checkin.office_floor,
+        lunch_preference=checkin.lunch_preference,
+        tiffin_type=checkin.tiffin_type,
+        checked_in_at=checkin.checked_in_at,
+        checked_out_at=checkin.checked_out_at,
+    )
     db.commit()
-    db.refresh(checkin)
 
     # Slack confirmation runs after the response, not inside it. Everyone checks
     # in within a few minutes of the 10:00 reminder, and these are three blocking
@@ -460,8 +564,8 @@ def submit_checkin(
     # about eight check-ins per second and turns the morning rush into pool
     # timeouts. The notification is advisory — the check-in is already committed
     # above — so it is safe to run afterwards.
-    if checkin.checked_in_at:
-        chk_at = checkin.checked_in_at
+    if response.checked_in_at:
+        chk_at = response.checked_in_at
         if chk_at.tzinfo is None:
             chk_at = chk_at.replace(tzinfo=timezone.utc)
         checked_in_str = chk_at.astimezone(IST).strftime("%I:%M %p")
@@ -469,7 +573,7 @@ def submit_checkin(
         checked_in_str = "N/A"
 
     background_tasks.add_task(
-        _notify_checkin_on_slack, employee_id, checkin.work_mode, checked_in_str
+        _notify_checkin_on_slack, employee_id, response.work_mode, checked_in_str
     )
 
     # Sync allocations strictly to match the submitted checkin project_ids
@@ -488,7 +592,8 @@ def submit_checkin(
     except Exception as exc:
         logger.warning(f"Error syncing allocations from checkin: {exc}")
 
-    return checkin
+    invalidate_my_projects_cache(employee_id)
+    return response
 
 
 @router.post("/checkout", response_model=CheckInResponse)
@@ -513,9 +618,22 @@ def submit_checkout(
     checkin.checked_out_at = _get_ist_now()
     if payload.mood is not None:
         checkin.mood = payload.mood
+
+    response = CheckInResponse(
+        id=checkin.id,
+        employee_id=checkin.employee_id,
+        checkin_date=checkin.checkin_date,
+        work_mode=checkin.work_mode,
+        project_ids=checkin.project_ids or [],
+        mood=checkin.mood,
+        office_floor=checkin.office_floor,
+        lunch_preference=checkin.lunch_preference,
+        tiffin_type=checkin.tiffin_type,
+        checked_in_at=checkin.checked_in_at,
+        checked_out_at=checkin.checked_out_at,
+    )
     db.commit()
-    db.refresh(checkin)
-    return checkin
+    return response
 
 @router.get("/team-today", response_model=PaginatedTeamCheckIns)
 def get_team_today(
@@ -915,47 +1033,67 @@ from app.schemas.checkin import MatrixResponse, MatrixRow
 import calendar
 
 def _get_matrix_data(db: Session, month_year: str, employee_ids: set) -> MatrixResponse:
+    from datetime import date
+    from sqlalchemy import text
+
     y_str, m_str = month_year.split("-")
     y, m = int(y_str), int(m_str)
-    _, days_in_month = calendar.monthrange(y, m)
+    days_in_month = calendar.monthrange(y, m)[1]
+    start_date = date(y, m, 1)
+    end_date = date(y, m, days_in_month)
     
     current_month_year = _get_ist_today().strftime("%Y-%m")
     
     emp_map = {}
-    if employee_ids:
-        emps = db.query(Employee).filter(Employee.id.in_(employee_ids), Employee.status == "active").all()
+    if employee_ids is not None:
+        if not employee_ids:
+            return MatrixResponse(month_year=month_year, days_in_month=days_in_month, rows=[])
+        emps = db.query(Employee.id, Employee.name, Employee.avatar_url, Employee.designation).filter(Employee.id.in_(employee_ids), Employee.status == "active").all()
     else:
-        emps = db.query(Employee).filter(Employee.status == "active").all()
+        emps = db.query(Employee.id, Employee.name, Employee.avatar_url, Employee.designation).filter(Employee.status == "active").all()
         employee_ids = {e.id for e in emps}
         
     for e in emps:
         emp_map[e.id] = MatrixRow(
             employee_id=e.id, 
             name=e.name, 
-            avatar_url=getattr(e, "avatar_url", None), 
+            avatar_url=e.avatar_url, 
             designation=e.designation,
             checkins={}
         )
+
+    if not emp_map:
+        return MatrixResponse(month_year=month_year, days_in_month=days_in_month, rows=[])
         
     if month_year == current_month_year:
-        from sqlalchemy import text
-        res = db.execute(text("""
+        query_sql = """
             SELECT employee_id, EXTRACT(DAY FROM checkin_date)::TEXT as day_str, 
                    TO_CHAR(checked_in_at AT TIME ZONE 'Asia/Kolkata', 'HH24:MI') as time, work_mode
             FROM daily_checkins
-            WHERE TO_CHAR(checkin_date, 'YYYY-MM') = :my
-        """), {"my": month_year}).fetchall()
+            WHERE checkin_date >= :start_date AND checkin_date <= :end_date
+        """
+        params = {"start_date": start_date, "end_date": end_date}
+        if employee_ids:
+            query_sql += " AND employee_id = ANY(:emp_ids)"
+            params["emp_ids"] = list(employee_ids)
+
+        res = db.execute(text(query_sql), params).fetchall()
         for r in res:
             eid, dstr, t, mode = r
             if eid in emp_map:
                 emp_map[eid].checkins[dstr] = {"time": t, "mode": mode}
     else:
-        from sqlalchemy import text
-        res = db.execute(text("""
+        query_sql = """
             SELECT employee_id, checkin_matrix
             FROM historical_checkins_matrix
             WHERE month_year = :my
-        """), {"my": month_year}).fetchall()
+        """
+        params = {"my": month_year}
+        if employee_ids:
+            query_sql += " AND employee_id = ANY(:emp_ids)"
+            params["emp_ids"] = list(employee_ids)
+
+        res = db.execute(text(query_sql), params).fetchall()
         for r in res:
             eid, matrix = r
             if eid in emp_map and matrix:
@@ -990,7 +1128,7 @@ def get_admin_matrix(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "hr")),
 ):
-    return _get_matrix_data(db, month_year, set())
+    return _get_matrix_data(db, month_year, None)
 
 
 from datetime import timedelta

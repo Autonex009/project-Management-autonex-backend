@@ -8,7 +8,7 @@ from app.utils.business_time import now_ist, today_ist
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, BackgroundTasks
 from fastapi import Request as HTTPRequest
 from sqlalchemy.orm import Session
-from sqlalchemy import or_
+from sqlalchemy import or_, and_
 from pydantic import BaseModel
 from app.db.database import get_db
 from app.constants.leave_types import (
@@ -630,7 +630,10 @@ def get_calendar(
     ).all()
 
     wfh_requests = db.query(WFHRequest).filter(
-        WFHRequest.wfh_date >= month_start,
+        or_(
+            WFHRequest.end_date >= month_start,
+            and_(WFHRequest.end_date.is_(None), WFHRequest.wfh_date >= month_start),
+        ),
         WFHRequest.wfh_date < month_end,
     ).all()
 
@@ -641,8 +644,6 @@ def get_calendar(
     manageable_ids = project_scope.get_manageable_employee_ids(db, current_user) if not is_admin else None
 
     def can_view_sensitive_details(target_employee_id: int) -> bool:
-        if current_user.role in ("pm", "team_lead") and current_user.employee_id == target_employee_id:
-            return False
         if is_admin:
             return True
         if current_user.employee_id and current_user.employee_id == target_employee_id:
@@ -689,6 +690,7 @@ def get_calendar(
             "employee_id": wfh.employee_id,
             "employee_name": emp.name if emp else "Unknown",
             "date": wfh.wfh_date.isoformat(),
+            "end_date": wfh.end_date.isoformat() if wfh.end_date else wfh.wfh_date.isoformat(),
             "status": wfh.status,
             "reason": wfh.reason,
         })
