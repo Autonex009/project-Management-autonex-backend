@@ -847,7 +847,7 @@ def confirm_team_today(
             desig = target_desigs.get(eid, "")
             if desig in project_scope.ADMIN_ONLY_SUBJECT_DESIGNATIONS or desig in project_scope.PM_ONLY_SUBJECT_DESIGNATIONS:
                 raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
+                    status_code=403,
                     detail="Team Leads cannot confirm check-ins for PMs or peer Leads",
                 )
 

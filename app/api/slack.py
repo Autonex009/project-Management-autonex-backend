@@ -37,10 +37,12 @@ def _bg_process_slack_interaction(payload_str: str):
         return
         
     action = actions[0]
+    action_id = action.get("action_id")
     try:
-        action_value = json.loads(action.get("value", "{}"))
-    except json.JSONDecodeError:
-        return
+        raw_val = action.get("value")
+        action_value = json.loads(raw_val) if raw_val else {}
+    except (json.JSONDecodeError, TypeError):
+        action_value = {}
         
     action_type = action_value.get("action")
     req_type = action_value.get("type")
@@ -51,11 +53,15 @@ def _bg_process_slack_interaction(payload_str: str):
     if not response_url:
         return
 
+    # If it is a URL link click (e.g. "Review in PM Portal"), no backend action is needed
+    if action.get("url") and not action_type:
+        return
+
     with SessionLocal() as db:
         employee = db.query(Employee).filter(Employee.slack_user_id == slack_user_id).first()
 
         # Checkin reminder
-        if action_type == "checkin_reminder" or action.get("action_id") == "checkin_now":
+        if action_type == "checkin_reminder" or action_id == "checkin_now":
             if employee:
                 from app.models.daily_checkin import DailyCheckIn
                 from datetime import date
@@ -77,18 +83,20 @@ def _bg_process_slack_interaction(payload_str: str):
                             "text": "✅ *You have already checked in for today.*"
                         }
                     })
-                    db.close()
                     _respond_to_slack(
                         response_url,
                         "You have already checked in for today.",
                         replace_original=True,
                         blocks=blocked_blocks
                     )
-                    return
-        
+            return
+
+        if not action_type or action_type not in ("approve", "reject") or req_type not in ("wfh", "leave") or not req_id:
+            logger.info("Ignoring non-approval slack interaction: action_id=%s, action_type=%s, req_type=%s", action_id, action_type, req_type)
+            return
+
         user = db.query(User).filter(User.employee_id == employee.id).first() if employee else None
         if not user:
-            db.close()
             _respond_to_slack(response_url, "You are not mapped to an Autonex user. Please contact the administrator.")
             return
 
@@ -96,7 +104,7 @@ def _bg_process_slack_interaction(payload_str: str):
         new_blocks = [b for b in original_blocks if b.get("type") != "actions"]
 
         approver_name = employee.name if employee else "an administrator"
-        status_text = f":white_check_mark: {action_type}d by {approver_name}" if "approve" in action_type else f":x: {action_type}ed by {approver_name}"
+        status_text = f":white_check_mark: {action_type}d by {approver_name}" if action_type == "approve" else f":x: {action_type}ed by {approver_name}"
         
         if new_blocks:
             new_blocks.append({

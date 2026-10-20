@@ -610,9 +610,7 @@ def list_employees_paginated(
                     candidate_emp_ids.add(int(raw_id))
                 except (TypeError, ValueError):
                     pass
-
         # Fast 1-index lookup of all team lead IDs in the company (prevents scanning 500 annotators)
-        from sqlalchemy import func
         LEAD_TAG_TERMS = {"team lead", "lead", "tl"}
         company_lead_ids = {
             r[0] for r in db.query(Employee.id).filter(
