@@ -12,6 +12,7 @@ class LeaveBase(BaseModel):
     leave_type: str
     reason: Optional[str] = None
     is_emergency: Optional[bool] = False
+    is_special_case: Optional[bool] = False
 
     @root_validator(pre=True)
     def map_half_day_leave_type(cls, values):

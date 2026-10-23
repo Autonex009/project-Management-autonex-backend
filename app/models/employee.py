@@ -61,10 +61,14 @@ class Employee(Base):
     # job (Phase 3) to fire 30d / 7d / 0d HR alerts.
     internship_end_date = Column(Date, nullable=True)
 
+    # ── Official Employment Start Date ───────────────────────────────────
+    # Official Date of Joining as specified in the employee's joining letter.
+    # When NULL, system displays '-' on the dashboard (no created_at fallback).
+    date_of_joining = Column(Date, nullable=True, index=True)
+
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(
         TIMESTAMP,
         server_default=func.now(),
         onupdate=func.now()
     )
-

@@ -1,6 +1,8 @@
-from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Literal
-from datetime import datetime
+from datetime import date, datetime
+from typing import List, Optional, Literal, Any
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+from app.utils.business_time import today_ist
 
 # Designation options
 DesignationType = Literal["Program Manager", "Annotator", "Developer", "QA", "Reviewer"]
@@ -27,7 +29,7 @@ def normalize_encord_id(value: Optional[str]) -> Optional[str]:
 
     Removes ALL whitespace, not just the edges: an id is an email address, so inner
     whitespace is always a paste artefact, and this has to agree exactly with
-    api\\analytics.py's `_norm_encord` — which cannot rely on SQL ``trim`` (spaces
+    api\analytics.py's `_norm_encord` — which cannot rely on SQL ``trim`` (spaces
     only) and so strips the lot.
     """
     if value is None:
@@ -45,6 +47,29 @@ def normalize_employee_type(value: Optional[str]) -> Optional[str]:
     return normalized
 
 
+def parse_and_validate_doj(value: Any) -> Optional[date]:
+    """Parse string/datetime into date and assert not in future (Asia/Kolkata IST)."""
+    if value is None or str(value).strip().lower() in ("", "null", "none"):
+        return None
+    parsed: Optional[date] = None
+    if isinstance(value, str):
+        val_str = value.split("T")[0].strip()
+        try:
+            parsed = date.fromisoformat(val_str)
+        except ValueError:
+            raise ValueError("Invalid date format for date_of_joining. Expected YYYY-MM-DD.")
+    elif isinstance(value, datetime):
+        parsed = value.date()
+    elif isinstance(value, date):
+        parsed = value
+    else:
+        raise ValueError("Invalid date type for date_of_joining.")
+
+    if parsed and parsed > today_ist():
+        raise ValueError("Date of joining cannot be in the future (IST).")
+    return parsed
+
+
 class EmployeeBase(BaseModel):
     name: str = Field(..., min_length=2)
     email: str = Field(..., pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -55,6 +80,7 @@ class EmployeeBase(BaseModel):
     encord_id: Optional[str] = None
     avatar_url: Optional[str] = None
     employee_type: str
+    date_of_joining: Optional[date] = None
     converted_to_fulltime_at: Optional[datetime] = None
     
     # Designation for role-based filtering
@@ -78,6 +104,11 @@ class EmployeeBase(BaseModel):
     def validate_encord_id(cls, value: Optional[str]) -> Optional[str]:
         return normalize_encord_id(value)
 
+    @field_validator("date_of_joining", mode="before")
+    @classmethod
+    def validate_date_of_joining(cls, value):
+        return parse_and_validate_doj(value)
+
     @field_validator("converted_to_fulltime_at", mode="before")
     @classmethod
     def validate_converted_to_fulltime_at(cls, value):
@@ -96,6 +127,18 @@ class EmployeeBase(BaseModel):
             except Exception:
                 pass
         return value
+
+    @model_validator(mode="after")
+    def validate_chronology(self):
+        if self.date_of_joining and self.converted_to_fulltime_at:
+            conv_date = (
+                self.converted_to_fulltime_at.date()
+                if isinstance(self.converted_to_fulltime_at, datetime)
+                else self.converted_to_fulltime_at
+            )
+            if conv_date < self.date_of_joining:
+                raise ValueError("Full-time start date cannot precede date of joining.")
+        return self
 
     @field_validator("slack_user_id", mode="before")
     @classmethod
@@ -121,6 +164,7 @@ class EmployeeUpdate(BaseModel):
     encord_id: Optional[str] = None
     avatar_url: Optional[str] = None
     employee_type: Optional[str] = None
+    date_of_joining: Optional[date] = None
     converted_to_fulltime_at: Optional[datetime] = None
     designation: Optional[str] = None
     work_model: Optional[str] = None
@@ -143,6 +187,11 @@ class EmployeeUpdate(BaseModel):
     def validate_encord_id(cls, value: Optional[str]) -> Optional[str]:
         return normalize_encord_id(value)
 
+    @field_validator("date_of_joining", mode="before")
+    @classmethod
+    def validate_date_of_joining(cls, value):
+        return parse_and_validate_doj(value)
+
     @field_validator("converted_to_fulltime_at", mode="before")
     @classmethod
     def validate_converted_to_fulltime_at(cls, value):
@@ -161,6 +210,18 @@ class EmployeeUpdate(BaseModel):
             except Exception:
                 pass
         return value
+
+    @model_validator(mode="after")
+    def validate_chronology(self):
+        if self.date_of_joining and self.converted_to_fulltime_at:
+            conv_date = (
+                self.converted_to_fulltime_at.date()
+                if isinstance(self.converted_to_fulltime_at, datetime)
+                else self.converted_to_fulltime_at
+            )
+            if conv_date < self.date_of_joining:
+                raise ValueError("Full-time start date cannot precede date of joining.")
+        return self
 
     @field_validator("slack_user_id", mode="before")
     @classmethod
@@ -187,3 +248,4 @@ class EmployeeResponse(EmployeeBase):
 class EmployeeCreateResponse(EmployeeResponse):
     temp_password: Optional[str] = None
     portal_url: Optional[str] = None
+
