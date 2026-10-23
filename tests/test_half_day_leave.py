@@ -708,4 +708,61 @@ def test_leaves_date_filtering(client_and_db):
     assert reasons == {"May leave", "June leave"}
 
 
+def test_special_case_consecutive_leave_bypass(client_and_db):
+    from unittest.mock import patch
+    from datetime import date
+    client, db = client_and_db
+    emp, admin = _seed_employee(db)
+
+    with patch("app.api.leaves.today_ist", return_value=date(2026, 6, 1)):
+        # 1. 10 consecutive working days with is_special_case=True applied by Admin -> Should SUCCEED (201)
+        payload_10 = {
+            "employee_id": emp.id,
+            "leave_type": "paid",
+            "start_date": "2026-06-15",
+            "end_date": "2026-06-26",
+            "reason": "10 consecutive days approved by CEO",
+            "is_special_case": True
+        }
+        resp = client.post("/api/leaves", json=payload_10)
+        assert resp.status_code == 201
+        created = resp.json()
+        assert created["is_special_case"] is True
+
+        # 2. Regular employee attempting to bypass via is_special_case=True -> Should return 403 Forbidden
+        from app.services.auth_service import get_current_user
+        employee_user = User(
+            id=99, email=emp.email, name=emp.name, role="employee",
+            employee_id=emp.id, is_active=True, password_hash="x"
+        )
+        db.add(employee_user)
+        db.commit()
+
+        client.app.dependency_overrides[get_current_user] = lambda: employee_user
+        payload_emp = {
+            "employee_id": emp.id,
+            "leave_type": "paid",
+            "start_date": "2026-07-06",
+            "end_date": "2026-07-17",
+            "reason": "10 consecutive days unapproved",
+            "is_special_case": True
+        }
+        resp_unauth = client.post("/api/leaves", json=payload_emp)
+        assert resp_unauth.status_code == 403
+        assert "Only privileged users" in resp_unauth.json()["detail"]
+
+        # Restore admin
+        client.app.dependency_overrides[get_current_user] = lambda: admin
+
+        # 3. Subsequent normal leave in adjacent window is not blocked by the 10-day special-case leave
+        payload_after = {
+            "employee_id": emp.id,
+            "leave_type": "paid",
+            "start_date": "2026-06-29",
+            "end_date": "2026-07-01",
+            "reason": "Normal 3-day leave",
+            "is_special_case": False
+        }
+        resp_after = client.post("/api/leaves", json=payload_after)
+        assert resp_after.status_code == 201
 

@@ -72,6 +72,7 @@ my_projects_cache = InMemoryTTLCache(ttl_seconds=60.0, max_size=1000)
 # L1 In-Memory Caches for Project Metadata & Active Allocations
 project_name_l1_cache = InMemoryTTLCache(ttl_seconds=300.0, max_size=2000)
 allocation_l1_cache = InMemoryTTLCache(ttl_seconds=60.0, max_size=1000)
+employee_profile_l1_cache = InMemoryTTLCache(ttl_seconds=300.0, max_size=1000)
 
 _redis_client: Optional[Any] = None
 _redis_initialized: bool = False

@@ -93,6 +93,11 @@ def list_badges_by_employee(
     if status:
         query = query.filter(EmployeeBadge.status == status)
 
+    # STRICT DOJ RULE: If employee has NO date_of_joining, tenure and yearly milestone badges are not shown
+    if not employee.date_of_joining:
+        from app.services.badge_service import NEVER_EXPIRE_CODES
+        query = query.filter(~EmployeeBadge.badge_code.in_(NEVER_EXPIRE_CODES))
+
     badges = query.order_by(EmployeeBadge.awarded_at.desc(), EmployeeBadge.id.desc()).all()
     return [_enrich_badge(db, b) for b in badges]
 

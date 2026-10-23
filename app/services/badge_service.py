@@ -1,6 +1,7 @@
 from datetime import date, datetime, time, timedelta
 from typing import Optional, Any, Dict, Tuple, List
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from dateutil.relativedelta import relativedelta
@@ -426,12 +427,17 @@ def award_monthly_badges(
 
 
 # =====================================================================
-# Tenure badges (3 months / 6 months) – based on created_at
+# Tenure badges (3 months / 6 months) – STRICTLY based on date_of_joining
 # =====================================================================
 
-def award_tenure_badges(db: Session, today: Optional[date] = None) -> int:
+def award_tenure_badges(
+    db: Session,
+    today: Optional[date] = None,
+    target_employee_id: Optional[int] = None,
+) -> int:
     """
-    Award tenure_3_months and tenure_6_months based on employee.created_at.
+    Award tenure_3_months and tenure_6_months based STRICTLY on employee.date_of_joining.
+    If date_of_joining is None, no tenure badge is awarded (ZERO fallback to created_at).
     These are one-time and never expire.
     """
     from app.models.employee import Employee
@@ -439,10 +445,14 @@ def award_tenure_badges(db: Session, today: Optional[date] = None) -> int:
     today = today or date.today()
     awarded = 0
 
-    employees = db.query(Employee).filter(Employee.created_at.isnot(None)).all()
+    query = db.query(Employee).filter(Employee.date_of_joining.isnot(None))
+    if target_employee_id is not None:
+        query = query.filter(Employee.id == target_employee_id)
+
+    employees = query.all()
 
     for emp in employees:
-        join = emp.created_at.date() if isinstance(emp.created_at, datetime) else emp.created_at
+        join = emp.date_of_joining
         if not join:
             continue
 
@@ -459,8 +469,8 @@ def award_tenure_badges(db: Session, today: Optional[date] = None) -> int:
                 period_end=None,
                 expires_at=None,
                 meta={
-                    "based_on": "created_at",
-                    "created_at": join.isoformat(),
+                    "based_on": "date_of_joining",
+                    "join_date": join.isoformat(),
                     "months": months,
                 },
             ):
@@ -475,8 +485,8 @@ def award_tenure_badges(db: Session, today: Optional[date] = None) -> int:
                 period_end=None,
                 expires_at=None,
                 meta={
-                    "based_on": "created_at",
-                    "created_at": join.isoformat(),
+                    "based_on": "date_of_joining",
+                    "join_date": join.isoformat(),
                     "months": months,
                 },
             ):
@@ -486,23 +496,32 @@ def award_tenure_badges(db: Session, today: Optional[date] = None) -> int:
 
 
 # =====================================================================
-# Yearly milestone – one badge per completed year
+# Yearly milestone – one badge per completed year (STRICTLY date_of_joining)
 # =====================================================================
 
-def award_yearly_milestones(db: Session, today: Optional[date] = None) -> int:
+def award_yearly_milestones(
+    db: Session,
+    today: Optional[date] = None,
+    target_employee_id: Optional[int] = None,
+) -> int:
     """
     Award one 'yearly_milestone' badge for every completed year
-    based on employee.created_at.
+    based STRICTLY on employee.date_of_joining.
+    If date_of_joining is None, no yearly milestone badge is awarded (ZERO fallback to created_at).
     """
     from app.models.employee import Employee
 
     today = today or date.today()
     awarded = 0
 
-    employees = db.query(Employee).filter(Employee.created_at.isnot(None)).all()
+    query = db.query(Employee).filter(Employee.date_of_joining.isnot(None))
+    if target_employee_id is not None:
+        query = query.filter(Employee.id == target_employee_id)
+
+    employees = query.all()
 
     for emp in employees:
-        join = emp.created_at.date() if isinstance(emp.created_at, datetime) else emp.created_at
+        join = emp.date_of_joining
         if not join:
             continue
 
@@ -515,8 +534,6 @@ def award_yearly_milestones(db: Session, today: Optional[date] = None) -> int:
 
         # Award one badge per completed year (idempotent via unique constraint)
         for y in range(1, years + 1):
-            # We use a synthetic period so the unique constraint works
-            # period_start = join anniversary of that year, period_end = same
             anniversary = join.replace(year=join.year + y)
             if award_badge(
                 db,
@@ -526,7 +543,7 @@ def award_yearly_milestones(db: Session, today: Optional[date] = None) -> int:
                 period_end=anniversary,
                 expires_at=None,          # never expires
                 meta={
-                    "based_on": "created_at",
+                    "based_on": "date_of_joining",
                     "year_number": y,
                     "join_date": join.isoformat(),
                 },
@@ -534,3 +551,46 @@ def award_yearly_milestones(db: Session, today: Optional[date] = None) -> int:
                 awarded += 1
 
     return awarded
+
+
+def recalculate_employee_milestones_async(employee_id: int) -> None:
+    """Async background task to re-evaluate tenure and yearly milestone badges for a single employee using a fresh DB session."""
+    from app.db.database import SessionLocal
+    from app.utils.business_time import today_ist
+    from app.models.employee import Employee
+    from app.models.employee_badge import EmployeeBadge
+    import logging
+
+    logger = logging.getLogger(__name__)
+    db = SessionLocal()
+    try:
+        emp = db.query(Employee).filter(Employee.id == employee_id).first()
+        if not emp or not emp.date_of_joining:
+            # Purge any old tenure/milestone badges if employee has NO date_of_joining
+            db.query(EmployeeBadge).filter(
+                EmployeeBadge.employee_id == employee_id,
+                EmployeeBadge.badge_code.in_(NEVER_EXPIRE_CODES),
+            ).delete(synchronize_session=False)
+            db.commit()
+            return
+
+        # Purge existing tenure badges to cleanly recalculate according to new date_of_joining
+        db.query(EmployeeBadge).filter(
+            EmployeeBadge.employee_id == employee_id,
+            EmployeeBadge.badge_code.in_(NEVER_EXPIRE_CODES),
+        ).delete(synchronize_session=False)
+        db.commit()
+
+        today = today_ist()
+        award_tenure_badges(db, today=today, target_employee_id=employee_id)
+        award_yearly_milestones(db, today=today, target_employee_id=employee_id)
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        logger.warning(
+            "Async milestone badge recalculation failed for employee %s: %s",
+            employee_id,
+            exc,
+        )
+    finally:
+        db.close()
