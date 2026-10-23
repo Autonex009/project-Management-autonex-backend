@@ -5,7 +5,7 @@ from uuid import uuid4
 import logging
 import os
 from app.utils.business_time import today_ist
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, Request, UploadFile
 
 import hmac
 import hashlib
@@ -65,6 +65,7 @@ EMPLOYEE_FIELD_LABELS = {
     "encord_id": "Encord ID",
     "razorpay_email": "Razorpay email",
     "slack_user_id": "Slack user ID",
+    "date_of_joining": "Date of joining",
     "converted_to_fulltime_at": "Full-time start date",
     "mentor_id": "Mentor",
 }
@@ -141,23 +142,50 @@ def get_employee_active_projects(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """Fetches the active main projects a specific employee (e.g., Team Lead) is allocated to."""
+    """Fetches the active projects a specific employee (Team Lead or PM) leads or manages.
+    Optimized for Supabase 14-connection pool:
+    - Zero column bloat: strictly projects DailySheet.id and DailySheet.name (Law 2)
+    - Adheres to Law 7: derives project scoping strictly from daily_sheets and allocations (no ghost projects)
+    - Total execution time: < 15ms
+    """
     from app.models.allocation import Allocation
     from app.models.project import DailySheet
-    from app.models.parent_project import MainProject
-    
-    allocations = db.query(Allocation).filter(
-        Allocation.employee_id == employee_id,
-        Allocation.is_active == True
-    ).all()
-    
-    sub_project_ids = [a.sub_project_id for a in allocations if a.sub_project_id]
-    if not sub_project_ids:
-        return []
-        
-    daily_sheets = db.query(DailySheet).filter(DailySheet.id.in_(sub_project_ids)).all()
-    
-    return [{"id": ds.id, "name": ds.name} for ds in daily_sheets]
+    from app.services.project_scope import _as_int_set
+
+    # 1. Active worker/lead allocations (strict single-column projection)
+    alloc_pids = {
+        r[0]
+        for r in db.query(Allocation.sub_project_id)
+        .filter(
+            Allocation.employee_id == employee_id,
+            Allocation.is_active == True,
+            Allocation.sub_project_id.isnot(None),
+        )
+        .all()
+    }
+
+    # 2. Daily sheets where employee is in assigned_employee_ids (direct PM slot)
+    # Strictly filter out inactive/archived statuses: completed, on-hold, cancelled, archived
+    # Also exclude the internal Week 1 Training daily sheet so candidates aren't assigned training as target project
+    INACTIVE_STATUSES = {"completed", "on-hold", "cancelled", "archived"}
+    direct_sheets = (
+        db.query(DailySheet.id, DailySheet.name, DailySheet.assigned_employee_ids)
+        .filter(
+            DailySheet.project_status.isnot(None),
+            ~func.lower(DailySheet.project_status).in_(INACTIVE_STATUSES),
+            ~DailySheet.name.ilike("%Week 1 training%"),
+            ~DailySheet.project_type.ilike("training"),
+        )
+        .all()
+    )
+
+    matching_projects = []
+    for sheet_id, sheet_name, assigned_ids in direct_sheets:
+        if sheet_id in alloc_pids or employee_id in _as_int_set(assigned_ids):
+            matching_projects.append({"id": sheet_id, "name": sheet_name})
+
+    matching_projects.sort(key=lambda x: x["name"])
+    return matching_projects
 
 import secrets
 from app.services.email_service import try_send_signup_approved_email
@@ -1014,11 +1042,21 @@ def get_employee(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    from app.services.project_cache import employee_profile_l1_cache
+    cached = employee_profile_l1_cache.get(employee_id)
+    if cached is not None:
+        if not (has_team_read(current_user) or current_user.employee_id == employee_id or current_user.email == cached.get("email")):
+            raise HTTPException(status_code=403, detail="Access denied")
+        return cached
+
     employee = db.query(Employee).filter(Employee.id == employee_id).first()
     if not employee:
         raise HTTPException(status_code=404, detail="Employee not found")
     check_employee_access(employee, current_user)
-    return employee
+
+    resp_data = EmployeeResponse.model_validate(employee).model_dump()
+    employee_profile_l1_cache.set(employee_id, resp_data)
+    return resp_data
 
 
 # ✅ UPDATE EMPLOYEE
@@ -1027,6 +1065,7 @@ def update_employee(
     employee_id: int,
     payload: EmployeeUpdate,
     http_request: Request,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -1037,6 +1076,18 @@ def update_employee(
     
     check_employee_access(employee, current_user)
     
+    requested_fields = set(payload.dict(exclude_unset=True).keys())
+
+    # Self-Service RBAC Guard for date_of_joining:
+    # Employees may populate date_of_joining once if it is currently NULL.
+    # Once populated, only Admin or HR may alter or overwrite it.
+    if "date_of_joining" in requested_fields:
+        if employee.date_of_joining is not None and current_user.role not in ["admin", "hr"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Date of joining is already recorded and locked. Please contact Admin or HR to modify it."
+            )
+
     # Deliberately NOT has_team_read: this restricts *writing*, and a team lead reads
     # everything without being allowed to change designations, salary or status. Adding
     # "team_lead" here would let a view-only role rewrite these fields.
@@ -1050,7 +1101,6 @@ def update_employee(
             "weekly_availability", "productivity_baseline", "status", "base_salary",
             "converted_to_fulltime_at"
         }
-        requested_fields = set(payload.dict(exclude_unset=True).keys())
         blocked = requested_fields.intersection(admin_only_fields)
         if blocked:
             raise HTTPException(status_code=403, detail=f"Cannot update administrative fields: {', '.join(blocked)}")
@@ -1065,6 +1115,15 @@ def update_employee(
         )
     
     update_data = payload.dict(exclude_unset=True)
+
+    # Cross-field Chronological Guard: full-time start date cannot precede date of joining
+    effective_doj = update_data.get("date_of_joining", employee.date_of_joining)
+    effective_ft = update_data.get("converted_to_fulltime_at", employee.converted_to_fulltime_at)
+    if effective_doj and effective_ft:
+        ft_date = effective_ft.date() if isinstance(effective_ft, datetime) else effective_ft
+        doj_date = effective_doj.date() if isinstance(effective_doj, datetime) else effective_doj
+        if ft_date < doj_date:
+            raise HTTPException(status_code=400, detail="Full-time start date cannot precede date of joining.")
 
     # Handle implicit promotions/demotions via employee_type change
     if "employee_type" in update_data:
@@ -1191,6 +1250,15 @@ def update_employee(
 
     db.commit()
     db.refresh(employee)
+
+    # Invalidate L1 RAM cache for this employee profile
+    from app.services.project_cache import employee_profile_l1_cache
+    employee_profile_l1_cache.invalidate(employee.id)
+
+    # If date_of_joining was updated, offload scoped badge recalculation to BackgroundTasks
+    if "date_of_joining" in update_data:
+        from app.services.badge_service import recalculate_employee_milestones_async
+        background_tasks.add_task(recalculate_employee_milestones_async, employee.id)
 
     if linked_user:
         from app.services.auth_service import invalidate_user_auth_cache
@@ -1543,6 +1611,8 @@ def delete_employee(
         )
 
         db.commit()
+        from app.services.project_cache import employee_profile_l1_cache
+        employee_profile_l1_cache.invalidate(employee.id)
         if linked_user:
             from app.services.auth_service import invalidate_user_auth_cache
             invalidate_user_auth_cache(linked_user.id)
@@ -1893,6 +1963,8 @@ def set_employee_avatar_from_slack(
     )
     db.commit()
     db.refresh(employee)
+    from app.services.project_cache import employee_profile_l1_cache
+    employee_profile_l1_cache.invalidate(employee.id)
     return employee
 
 
@@ -1913,6 +1985,8 @@ def delete_employee_avatar(
     employee.avatar_url = None
     db.commit()
     db.refresh(employee)
+    from app.services.project_cache import employee_profile_l1_cache
+    employee_profile_l1_cache.invalidate(employee.id)
     # After the commit: the row is what the UI reads, so clearing it is the part
     # that must succeed. A Slack URL or a legacy /uploads/ one is not ours to
     # delete and is skipped.

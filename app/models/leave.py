@@ -17,6 +17,7 @@ class Leave(Base):
     razorpay_applied = Column(Boolean, default=False)
     flagged = Column(Boolean, default=False, nullable=False)
     is_emergency = Column(Boolean, default=False, nullable=False)
+    is_special_case = Column(Boolean, default=False, nullable=True)
     approval_remark = Column(Text, nullable=True)
     is_half_day = Column(Boolean, default=False, nullable=True)
     half_day_slot = Column(String, nullable=True)

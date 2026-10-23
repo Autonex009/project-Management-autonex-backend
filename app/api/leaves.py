@@ -539,6 +539,7 @@ def _leave_to_schema(leave: Leave, approver_name: Optional[str] = None) -> Leave
         flagged=leave.flagged or False,
         approval_remark=leave.approval_remark,
         is_emergency=leave.is_emergency or False,
+        is_special_case=getattr(leave, "is_special_case", False) or False,
         is_half_day=leave.is_half_day or False,
         half_day_slot=leave.half_day_slot,
         created_at=leave.created_at.isoformat() if leave.created_at else None,
@@ -743,6 +744,7 @@ def _leave_to_schema_with_name(leave: Leave, approver_names: dict, employee_name
         "flagged": leave.flagged or False,
         "approval_remark": leave.approval_remark,
         "is_emergency": leave.is_emergency or False,
+        "is_special_case": getattr(leave, "is_special_case", False) or False,
         "is_half_day": leave.is_half_day or False,
         "half_day_slot": leave.half_day_slot,
         "created_at": leave.created_at.isoformat() if leave.created_at else None,
@@ -962,6 +964,8 @@ def validate_consecutive_leaves(
     for l in existing_leaves:
         if getattr(l, "is_half_day", False) or l.leave_type in ("first_half", "second_half"):
             continue
+        if getattr(l, "is_special_case", False):
+            continue
         if l.start_date is None or l.end_date is None:
             continue
         cur = max(l.start_date, window_start)
@@ -1119,7 +1123,14 @@ def create_leave(
         )
 
     # Validate consecutive leaves safeguard
-    validate_consecutive_leaves(payload.employee_id, payload.start_date, payload.end_date, db, is_half_day=payload.is_half_day)
+    if getattr(payload, "is_special_case", False):
+        if not is_privileged_actor(current_user):
+            raise HTTPException(
+                status_code=403,
+                detail="Only privileged users (Admin/HR) can apply special-case leaves exceeding the consecutive limit.",
+            )
+    else:
+        validate_consecutive_leaves(payload.employee_id, payload.start_date, payload.end_date, db, is_half_day=payload.is_half_day)
 
     # Reject if any existing leave (pending or approved) overlaps the requested range
     overlap = (
@@ -1221,6 +1232,7 @@ def create_leave(
         leave_type=payload.leave_type,
         reason=payload.reason,
         is_emergency=payload.is_emergency or False,
+        is_special_case=payload.is_special_case or False,
         status="pending",
         flagged=flagged,
         is_half_day=payload.is_half_day or False,
@@ -1257,6 +1269,7 @@ def create_leave(
             audit_service.field_diff("Reason", None, leave.reason),
             audit_service.field_diff("Status", None, leave.status),
             audit_service.field_diff("Over monthly limit", None, True if leave.flagged else None),
+            audit_service.field_diff("Special case override", None, True if leave.is_special_case else None),
         ),
         summary=(
             f"Applied for {get_leave_type_label(leave.leave_type)} leave"
@@ -1355,7 +1368,14 @@ def update_leave(
         validate_half_day_timing(payload.start_date, payload.half_day_slot)
 
     # Validate consecutive leaves safeguard (excluding this leave ID)
-    validate_consecutive_leaves(payload.employee_id, payload.start_date, payload.end_date, db, exclude_leave_id=leave_id, is_half_day=payload.is_half_day)
+    if getattr(payload, "is_special_case", False):
+        if not is_privileged_actor(current_user):
+            raise HTTPException(
+                status_code=403,
+                detail="Only privileged users (Admin/HR) can apply special-case leaves exceeding the consecutive limit.",
+            )
+    else:
+        validate_consecutive_leaves(payload.employee_id, payload.start_date, payload.end_date, db, exclude_leave_id=leave_id, is_half_day=payload.is_half_day)
 
     # Check for overlapping leaves (excluding this one)
     overlap = (
@@ -1434,7 +1454,7 @@ def update_leave(
         leave,
         [
             "start_date", "end_date", "leave_type", "reason",
-            "is_emergency", "status", "is_half_day", "half_day_slot",
+            "is_emergency", "is_special_case", "status", "is_half_day", "half_day_slot",
         ],
     )
 
@@ -1443,6 +1463,7 @@ def update_leave(
     leave.leave_type = payload.leave_type
     leave.reason = payload.reason
     leave.is_emergency = payload.is_emergency or False
+    leave.is_special_case = payload.is_special_case or False
     leave.status = "pending"  # reset to pending so PM re-reviews the edited request
     leave.is_half_day = payload.is_half_day or False
     leave.half_day_slot = payload.half_day_slot
@@ -1468,6 +1489,7 @@ def update_leave(
                 "leave_type": "Leave type",
                 "reason": "Reason",
                 "is_emergency": "Emergency",
+                "is_special_case": "Special case override",
                 "status": "Status",
                 "is_half_day": "Half day",
                 "half_day_slot": "Half-day slot",
@@ -1732,10 +1754,11 @@ def undo_reject_leave(
             status_code=409,
             detail=f"Cannot reopen — it now overlaps another active leave ({overlap.start_date} – {overlap.end_date}).",
         )
-    validate_consecutive_leaves(
-        leave.employee_id, leave.start_date, leave.end_date, db,
-        exclude_leave_id=leave_id, is_half_day=getattr(leave, "is_half_day", False),
-    )
+    if not getattr(leave, "is_special_case", False):
+        validate_consecutive_leaves(
+            leave.employee_id, leave.start_date, leave.end_date, db,
+            exclude_leave_id=leave_id, is_half_day=getattr(leave, "is_half_day", False),
+        )
 
     previous_status = leave.status
     leave.status = "pending"
