@@ -64,6 +64,16 @@ class LeaveCreate(LeaveBase):
             raise ValueError("Reason cannot be empty or just whitespace.")
         return v.strip()
 
+    @validator("leave_type")
+    def block_paused_sick_leave(cls, v):
+        normalized = normalize_leave_type(v)
+        if normalized in ("casual_sick", "casual", "sick"):
+            raise ValueError(
+                "Sick / Casual leave is temporarily paused. "
+                "Employees can only apply for Paid or Floater leave (or half-day slots)."
+            )
+        return normalized
+
 
 class LeaveUpdate(LeaveBase):
     reason: str = Field(..., min_length=1)
@@ -73,6 +83,16 @@ class LeaveUpdate(LeaveBase):
         if not v or not v.strip():
             raise ValueError("Reason cannot be empty or just whitespace.")
         return v.strip()
+
+    @validator("leave_type")
+    def block_paused_sick_leave(cls, v):
+        normalized = normalize_leave_type(v)
+        if normalized in ("casual_sick", "casual", "sick"):
+            raise ValueError(
+                "Sick / Casual leave is temporarily paused. "
+                "Employees can only apply for Paid or Floater leave (or half-day slots)."
+            )
+        return normalized
 
 
 class Leave(LeaveBase):

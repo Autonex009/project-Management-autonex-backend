@@ -492,6 +492,10 @@ def prepare_apply_leave(
         return {"error": "End date must be on or after start date."}
 
     normalized_type = normalize_leave_type(leave_type)
+    if normalized_type in ("casual_sick", "casual", "sick"):
+        return {
+            "error": "Sick / Casual leave is temporarily paused. Employees can only apply for Paid or Floater leave."
+        }
     working_days = _count_working_days(start, end)
 
     # Check balance
