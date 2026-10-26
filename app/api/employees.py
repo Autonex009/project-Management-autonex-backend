@@ -23,6 +23,7 @@ from app.db.database import get_db
 from app.constants.leave_types import is_intern, is_intern_or_contractor
 from app.services.salary_crypto import encrypt_salary
 from app.models.allocation import Allocation
+from app.models.onboarding_pipeline import OnboardingPipeline
 from app.models.employee import Employee
 from app.models.leave import Leave
 from app.models.notification import Notification
@@ -1576,6 +1577,17 @@ def delete_employee(
             {"is_active": False, "deactivated_reason": "Employee archived"},
             synchronize_session=False
         )
+
+        # Cancel any active onboarding pipeline for this candidate
+        cand_user_id = linked_user.id if linked_user else db.query(User.id).filter(User.employee_id == employee.id).scalar()
+        if cand_user_id:
+            active_pipes = db.query(OnboardingPipeline).filter(
+                OnboardingPipeline.candidate_id == cand_user_id,
+                OnboardingPipeline.status.in_(["pending_confirmation", "in_progress", "day_5_pending"]),
+            ).all()
+            for pipe in active_pipes:
+                pipe.status = "cancelled"
+
         db.flush()
 
         audit_service.record(
