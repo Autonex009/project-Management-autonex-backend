@@ -510,6 +510,17 @@ def submit_checkin(
     employee_id = _require_employee(current_user)
     today = _get_ist_today()
 
+    # -------------------------------------------------------------------------
+    # STRICT 11:00 AM IST LUNCH POLICY ENFORCEMENT
+    # -------------------------------------------------------------------------
+    now_ist = _get_ist_now()
+    if payload.work_mode == "WFO" and payload.lunch_preference in ("canteen", "order_tiffin"):
+        if now_ist.hour >= 11:
+            raise HTTPException(
+                status_code=400,
+                detail="Canteen lunch booking closes strictly at 11:00 AM IST. Today's order list has already been finalized."
+            )
+
     existing = (
         db.query(DailyCheckIn)
         .filter(DailyCheckIn.employee_id == employee_id, DailyCheckIn.checkin_date == today)

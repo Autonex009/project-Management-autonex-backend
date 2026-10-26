@@ -922,7 +922,7 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
-        # Daily Lunch Order PDF report (Slot 1) – weekdays at 11:00 AM IST
+    # Daily Lunch Order PDF report – weekdays strictly at 11:00 AM IST
     _scheduler.add_job(
         _scheduled_lunch_report,
         trigger="cron",
@@ -935,18 +935,12 @@ def start_scheduler() -> None:
         coalesce=True,
     )
 
-    # Daily Lunch Order PDF report (Slot 2) – weekdays at 12:00 PM (Noon) IST
-    _scheduler.add_job(
-        _scheduled_lunch_report,
-        trigger="cron",
-        day_of_week="mon-fri",
-        hour=LUNCH_REPORT_SECOND_HOUR,
-        minute=LUNCH_REPORT_SECOND_MINUTE,
-        id="daily_lunch_report_noon",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-    )
+    # Purge the obsolete 12:00 PM slot from the persistent SQLAlchemy job table
+    try:
+        _scheduler.remove_job("daily_lunch_report_noon")
+        logger.info("[scheduler] Obsolete 12:00 PM lunch report job purged successfully.")
+    except Exception:
+        pass
 
     # Internship lifecycle alerts — 30d, 7d, and 0d warnings (daily at 9:00 AM IST)
     _scheduler.add_job(
@@ -1052,7 +1046,7 @@ def _scheduled_lunch_report() -> None:
         html = f"""
         <p>Hi,</p>
         <p>Please find attached the <strong>Daily Lunch Order Summary</strong> for <strong>{date_str}</strong>.</p>
-        <p>The PDF is segregated by <b>Meal Plan</b> and then by <b>Floor</b> for easy preparation.</p>
+        <p>The PDF is organized strictly by <b>Menu Option</b> with dedicated signature boxes for food handout collection.</p>
         <p>Regards,<br>Autonex System</p>
         """
 
