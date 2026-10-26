@@ -1068,16 +1068,18 @@ def _resolve_employee(db: Session, current_user: User) -> Employee | None:
 @me_router.get("/me/encord-activity")
 def my_encord_activity(
     days: int = 7,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
     sub_project_id: Optional[int] = None,
     employee_id: Optional[int] = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """The signed-in user's OWN Encord platform hours per day (last `days` days).
+    """The signed-in user's OWN Encord platform hours per day (last `days` days or date range).
 
     Resolves the caller's Encord account via employees.encord_id, then reads their
     daily time from `encord_daily_time_spent`. Optionally scoped to one sub-project
-    (the employee's current project) — which also yields a per-day team average so
+    (the employee's current project) — which yields a per-day team average so
     the dashboard can compare the individual against their project's teammates.
 
     Returns `{ total_hours, daily: [{date, employee_hours, team_avg_hours}], ... }`.
@@ -1092,12 +1094,18 @@ def my_encord_activity(
         emp = _resolve_employee(db, current_user)
     encord_id = (emp.encord_id or "").strip() if emp else ""
 
-    # Window: the last `days` days ending on the latest synced date (the sync runs
-    # once a day, ~11:30pm, so "today" may not be in yet — anchoring to the latest
-    # available date guarantees the chart shows the most recent complete data).
+    # Window: If date_from and/or date_to are provided, respect them.
+    # Otherwise, default to the last `days` days ending on the latest synced date.
     latest = db.query(func.max(EncordDailyTimeSpent.metric_date)).scalar()
     end = latest or date.today()
     start = end - timedelta(days=days - 1)
+
+    if date_from:
+        start = _parse_date(date_from, start)
+    if date_to:
+        end = _parse_date(date_to, end)
+    if date_from or date_to:
+        days = max(1, (end - start).days + 1)
 
     empty = {
         "mapped": bool(encord_id),
@@ -1109,35 +1117,41 @@ def my_encord_activity(
     if not encord_id:
         return empty
 
-    # Optional project scoping. Prefer the Encord hash (rows are keyed by hash);
-    # fall back to the sub_project_id.
+    # Optional project scoping for team baseline.
+    # Prefer the Encord hash (rows are keyed by hash); fall back to the sub_project_id.
     sp = db.query(DailySheet).filter(DailySheet.id == sub_project_id).first() if sub_project_id else None
     project_hash = sp.encord_project_hash if sp else None
 
-    base = db.query(EncordDailyTimeSpent).filter(
+    # 1. Employee's OWN hours across all projects in the date range.
+    # An employee's personal daily working hours should always reflect all Encord work they completed.
+    norm_encord_id = _norm_encord(encord_id)
+    my_rows = db.query(EncordDailyTimeSpent).filter(
+        EncordDailyTimeSpent.metric_date >= start,
+        EncordDailyTimeSpent.metric_date <= end,
+        func.trim(func.lower(EncordDailyTimeSpent.user_email)) == norm_encord_id,
+    ).all()
+
+    mine_by_day: dict[date, int] = defaultdict(int)
+    for r in my_rows:
+        mine_by_day[r.metric_date] += int(r.time_spent_seconds or 0)
+
+    # 2. Team average: scoped to the sub-project if available, otherwise company-wide autonex.
+    team_base = db.query(EncordDailyTimeSpent).filter(
         EncordDailyTimeSpent.metric_date >= start,
         EncordDailyTimeSpent.metric_date <= end,
     )
     if sp is not None:
-        base = base.filter(
+        team_base = team_base.filter(
             EncordDailyTimeSpent.encord_project_hash == project_hash
-        ) if project_hash else base.filter(EncordDailyTimeSpent.sub_project_id == sp.id)
+        ) if project_hash else team_base.filter(EncordDailyTimeSpent.sub_project_id == sp.id)
 
-    rows = base.all()
-
-    # Per-day: this employee's seconds, and per-day team totals for the average.
-    mine_by_day: dict[date, int] = defaultdict(int)
+    team_rows = team_base.all()
     team_secs_by_day: dict[date, int] = defaultdict(int)
     team_users_by_day: dict[date, set] = defaultdict(set)
-    for r in rows:
-        d = r.metric_date
-        secs = int(r.time_spent_seconds or 0)
-        if _norm_encord(r.user_email) == _norm_encord(encord_id):
-            mine_by_day[d] += secs
-        # Team average is over Autonex teammates (billing cohort), including self.
+    for r in team_rows:
         if is_autonex_email(r.user_email):
-            team_secs_by_day[d] += secs
-            team_users_by_day[d].add(r.user_email)
+            team_secs_by_day[r.metric_date] += int(r.time_spent_seconds or 0)
+            team_users_by_day[r.metric_date].add(r.user_email)
 
     daily = []
     for i in range(days):
@@ -1153,11 +1167,12 @@ def my_encord_activity(
     return {
         "mapped": True,
         "encord_id": encord_id,
+        "sub_project_id": sp.id if sp else None,
+        "sub_project_name": sp.name if sp else None,
         "range": {"from": start.isoformat(), "to": end.isoformat(), "days": days},
         "total_hours": _hours(sum(mine_by_day.values())),
         "daily": daily,
     }
-
 
 @me_router.get("/leaderboard")
 def get_leaderboard(

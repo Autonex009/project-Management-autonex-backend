@@ -338,7 +338,7 @@ def get_leave_balances_text(db, employee) -> str:
     if is_contractor:
         return (
             f"• *Monthly Leave:* 1 / 1 this month ({used_this_month} used)\n"
-            f"• *Casual/Sick Leave:* 0 / 0 days left ({used_cl} used in {current_year})\n"
+            # f"• *Casual/Sick Leave:* 0 / 0 days left ({used_cl} used in {current_year})\n"
             f"• *Floater Leave:* 2 / 2 days left ({used_floater} used in {current_year})"
         )
     else:
@@ -347,7 +347,7 @@ def get_leave_balances_text(db, employee) -> str:
         floater_left = max(0, 2 - used_floater)
         return (
             f"• *Paid Leave:* {paid_left} / 12 days left ({used_paid} used in {current_year})\n"
-            f"• *Casual/Sick Leave:* {cl_left} / 6 days left ({used_cl} used in {current_year})\n"
+            # f"• *Casual/Sick Leave:* {cl_left} / 6 days left ({used_cl} used in {current_year})\n"
             f"• *Floater Leave:* {floater_left} / 2 days left ({used_floater} used in {current_year})"
         )
 
@@ -2142,7 +2142,8 @@ def send_checkin_success_message(
     if work_mode and work_mode.upper() == "WFH":
         lunch_str = "N/A (WFH)"
     elif lunch_preference == "canteen":
-        lunch_str = "Canteen"
+        meal_name = (tiffin_type or "").strip()
+        lunch_str = f"Canteen ({meal_name})" if meal_name else "Canteen"
     elif lunch_preference == "order_tiffin":
         type_str = f" ({tiffin_type.replace('_', ' ').title()})" if tiffin_type else ""
         lunch_str = f"Order Tiffin{type_str}"
@@ -2307,18 +2308,20 @@ def send_admin_late_list(*, channel_id: str, stats_payload: dict) -> bool:
         chunk_size = 50
         for i in range(0, len(projects), chunk_size):
             chunk = projects[i:i + chunk_size]
-            rows = [[make_cell("Project Name"), make_cell("Check-ins"), make_cell("Pending"), make_cell("Distribution (<9 | 9-10 | 10-11 | 11-12 | >12)")]]
+            rows = [[make_cell("Project Name"), make_cell("PM / Lead"), make_cell("Check-ins"), make_cell("Pending"), make_cell("Distribution (<9 | 9-10 | 10-11 | 11-12 | >12)")]]
             for p in chunk:
                 name_str = p['name'][:30] + "..." if len(p['name']) > 33 else p['name']
+                pm_lead_str = p.get('pm_lead', '—')
                 chk_str = f"{p['checked_in']}/{p['allocated_total']}"
                 pend_str = str(p['pending'])
                 dist_str = f"{p['dist_before_9']} | {p['dist_9_to_10']} | {p['dist_10_to_11']} | {p['dist_11_to_12']} | {p['dist_after_12']}"
-                rows.append([make_cell(name_str), make_cell(chk_str), make_cell(pend_str), make_cell(dist_str)])
+                rows.append([make_cell(name_str), make_cell(pm_lead_str), make_cell(chk_str), make_cell(pend_str), make_cell(dist_str)])
                 
             blocks.append({
                 "type": "table",
                 "rows": rows,
                 "column_settings": [
+                    {"align": "left", "is_wrapped": True},
                     {"align": "left", "is_wrapped": True},
                     {"align": "center"},
                     {"align": "center"},
@@ -2342,17 +2345,36 @@ def send_admin_late_list(*, channel_id: str, stats_payload: dict) -> bool:
         for i in range(0, len(employee_list), chunk_size):
             chunk = employee_list[i:i + chunk_size]
             if list_type == "late":
-                rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email"), make_cell("Time")]]
+                rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email"), make_cell("Project Name"), make_cell("PM / Lead"), make_cell("Time")]]
                 for idx, record in enumerate(chunk):
-                    name, email, time_str = record
-                    rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email), make_cell(time_str)])
-                col_settings = [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}, {"align": "right"}]
+                    name, email, proj_name, pm_lead, time_str = record
+                    rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email), make_cell(proj_name), make_cell(pm_lead), make_cell(time_str)])
+                col_settings = [
+                    {"align": "center"},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "right"}
+                ]
             elif list_type == "sentiment":
                 rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email"), make_cell("Sentiment")]]
                 for idx, record in enumerate(chunk):
                     name, email, mood_str = record
                     rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email), make_cell(mood_str)])
                 col_settings = [{"align": "center"}, {"align": "left", "is_wrapped": True}, {"align": "left", "is_wrapped": True}, {"align": "left"}]
+            elif list_type == "pending":
+                rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email"), make_cell("Project Name"), make_cell("PM / Lead")]]
+                for idx, record in enumerate(chunk):
+                    name, email, proj_name, pm_lead = record
+                    rows.append([make_cell(i + idx + 1), make_cell(name), make_cell(email), make_cell(proj_name), make_cell(pm_lead)])
+                col_settings = [
+                    {"align": "center"},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "left", "is_wrapped": True},
+                    {"align": "left", "is_wrapped": True}
+                ]
             else:
                 rows = [[make_cell("S.No"), make_cell("Employee Name"), make_cell("Email")]]
                 for idx, record in enumerate(chunk):

@@ -1,7 +1,7 @@
 """
 Daily Lunch Order Report
-- Generates a clean PDF (meal-plan segregated + floor grouped)
-- Sends it at 11 AM IST
+- Generates a clean PDF (Menu-Wise Segregated + Physical Signature Box)
+- Finalized strictly at 11:00 AM IST
 """
 import os
 from datetime import datetime, date
@@ -15,7 +15,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 )
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
@@ -26,16 +26,9 @@ from app.services.email_service import try_send_lunch_report_email
 
 IST = ZoneInfo("Asia/Kolkata")
 
-MEAL_ORDER = ["full_meal", "no_rice", "dal_and_rice"]
-MEAL_LABELS = {
-    "full_meal": "Full Meal",
-    "no_rice": "No Rice",
-    "dal_and_rice": "Dal & Rice",
-}
-FLOOR_ORDER = ["7", "9", "15", "17"]
-
 
 def _get_today_lunch_data(db: Session, target_date: Optional[date] = None) -> Dict:
+    """Queries WFO check-ins and groups orders strictly by Menu Item with employee details."""
     today = target_date or datetime.now(IST).date()
 
     rows = (
@@ -44,42 +37,46 @@ def _get_today_lunch_data(db: Session, target_date: Optional[date] = None) -> Di
         .filter(
             DailyCheckIn.checkin_date == today,
             DailyCheckIn.work_mode == "WFO",
-            DailyCheckIn.lunch_preference.isnot(None),
+            DailyCheckIn.lunch_preference.in_(["canteen", "order_tiffin"]),
         )
         .all()
     )
 
-    tiffin = defaultdict(lambda: defaultdict(list))   # meal -> floor -> [names]
-    canteen = defaultdict(list)                       # floor -> [names]
+    # Group by Menu Option: menu_name -> list of employee dicts
+    menu_groups: Dict[str, List[Dict[str, str]]] = defaultdict(list)
+    legacy_map = {
+        "full_meal": "Full Meal",
+        "no_rice": "No Rice",
+        "dal_and_rice": "Dal & Rice",
+    }
 
     for chk, name in rows:
-        floor = chk.office_floor or "—"
-        if chk.lunch_preference == "order_tiffin" and chk.tiffin_type:
-            tiffin[chk.tiffin_type][floor].append(name)
-        elif chk.lunch_preference == "canteen":
-            canteen[floor].append(name)
+        raw_name = (chk.tiffin_type or "Standard Canteen Meal").strip()
+        menu_name = legacy_map.get(raw_name, raw_name)
+        menu_groups[menu_name].append({
+            "name": name,
+            "floor": chk.office_floor or "—",
+        })
 
-    # sort names
-    for meal in tiffin:
-        for fl in tiffin[meal]:
-            tiffin[meal][fl].sort()
-    for fl in canteen:
-        canteen[fl].sort()
+    # Sort employees alphabetically under each menu option
+    for menu_name in menu_groups:
+        menu_groups[menu_name].sort(key=lambda x: x["name"].lower())
 
     return {
         "date": today,
-        "tiffin": tiffin,
-        "canteen": canteen,
+        "menu_groups": dict(menu_groups),
+        "total_count": len(rows),
     }
 
 
 def _build_pdf(data: Dict) -> bytes:
+    """Builds the printable Menu-Wise Lunch Sheet with signature columns."""
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
         pagesize=A4,
-        leftMargin=18 * mm,
-        rightMargin=18 * mm,
+        leftMargin=15 * mm,
+        rightMargin=15 * mm,
         topMargin=15 * mm,
         bottomMargin=15 * mm,
     )
@@ -90,7 +87,7 @@ def _build_pdf(data: Dict) -> bytes:
         parent=styles["Heading1"],
         alignment=TA_CENTER,
         fontSize=16,
-        spaceAfter=4,
+        spaceAfter=2,
     ))
     styles.add(ParagraphStyle(
         name="SubCenter",
@@ -98,141 +95,89 @@ def _build_pdf(data: Dict) -> bytes:
         alignment=TA_CENTER,
         fontSize=10,
         textColor=colors.grey,
-        spaceAfter=12,
+        spaceAfter=10,
     ))
     styles.add(ParagraphStyle(
-        name="SectionHeader",
+        name="MenuHeader",
         parent=styles["Heading2"],
-        fontSize=13,
-        textColor=colors.HexColor("#1e3a8a"),
-        spaceBefore=14,
-        spaceAfter=6,
-    ))
-    styles.add(ParagraphStyle(
-        name="MealHeader",
-        parent=styles["Heading3"],
-        fontSize=11,
-        textColor=colors.HexColor("#065f46"),
-        spaceBefore=10,
+        fontSize=12,
+        textColor=colors.HexColor("#0f172a"),
+        spaceBefore=12,
         spaceAfter=4,
+        keepWithNext=True,  # Prevents orphan headers at the bottom of pages
     ))
 
     story = []
-
-    # Title
     date_str = data["date"].strftime("%d %b %Y")
-    story.append(Paragraph(f"Daily Lunch Order Summary – {date_str}", styles["TitleCenter"]))
+
+    # Header
+    story.append(Paragraph(f"Daily Lunch Order Sheet – {date_str}", styles["TitleCenter"]))
     story.append(Paragraph(
-        f"Generated at {datetime.now(IST).strftime('%I:%M %p IST')}",
+        f"Finalized at 11:00 AM IST • Total Orders: {data['total_count']}",
         styles["SubCenter"]
     ))
 
-    # Summary counts
-    total_tiffin = sum(len(names) for meal in data["tiffin"].values() for names in meal.values())
-    full = sum(len(n) for n in data["tiffin"].get("full_meal", {}).values())
-    no_rice = sum(len(n) for n in data["tiffin"].get("no_rice", {}).values())
-    dal = sum(len(n) for n in data["tiffin"].get("dal_and_rice", {}).values())
-    total_canteen = sum(len(n) for n in data["canteen"].values())
+    # Summary Table by Menu Option
+    summary_data = [["Menu Option", "Total Orders"]]
+    for menu_name, items in sorted(data["menu_groups"].items()):
+        summary_data.append([menu_name, str(len(items))])
+    summary_data.append(["Total Canteen Meals", str(data["total_count"])])
 
-    summary_data = [
-        ["Total Tiffin Orders", str(total_tiffin)],
-        ["  • Full Meal", str(full)],
-        ["  • No Rice", str(no_rice)],
-        ["  • Dal & Rice", str(dal)],
-        ["Canteen", str(total_canteen)],
-    ]
-    summary_table = Table(summary_data, colWidths=[120*mm, 40*mm])
+    summary_table = Table(summary_data, colWidths=[120 * mm, 40 * mm])
     summary_table.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), "Helvetica"),
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e0e7ff")),
-        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#1e3a8a")),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e2e8f0")),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c7d2fe")),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e1")),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#f1f5f9")),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
     ]))
     story.append(summary_table)
-    story.append(Spacer(1, 8*mm))
+    story.append(Spacer(1, 6 * mm))
 
-    # ---------- 1. Order Tiffin ----------
-    story.append(Paragraph("1. Order Tiffin (Action Required)", styles["SectionHeader"]))
-
-    if total_tiffin == 0:
-        story.append(Paragraph("No tiffin orders today.", styles["Normal"]))
+    # Menu-Wise Tables with Signature Column
+    if not data["menu_groups"]:
+        story.append(Paragraph("No canteen orders placed today.", styles["Normal"]))
     else:
-        for meal_key in MEAL_ORDER:
-            floors = data["tiffin"].get(meal_key, {})
-            if not floors:
-                continue
+        for menu_name, items in sorted(data["menu_groups"].items()):
+            story.append(Paragraph(f"<b>{menu_name}</b> ({len(items)} orders)", styles["MenuHeader"]))
 
-            story.append(Paragraph(MEAL_LABELS[meal_key], styles["MealHeader"]))
+            table_data = [["Sr.", "Employee Name", "Floor", "Signature"]]
+            for idx, item in enumerate(items, 1):
+                table_data.append([
+                    str(idx),
+                    item["name"],
+                    f"Floor {item['floor']}",
+                    "",  # Blank box for employee physical signature
+                ])
 
-            # table header
-            table_data = [["Floor", "Employee Name"]]
-            for fl in FLOOR_ORDER:
-                names = floors.get(fl, [])
-                for name in names:
-                    table_data.append([fl, name])
-            # any other floor
-            for fl, names in floors.items():
-                if fl not in FLOOR_ORDER:
-                    for name in names:
-                        table_data.append([fl, name])
-
-            t = Table(table_data, colWidths=[30*mm, 130*mm])
+            t = Table(table_data, colWidths=[12 * mm, 75 * mm, 23 * mm, 50 * mm])
             t.setStyle(TableStyle([
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                 ("FONTSIZE", (0, 0), (-1, -1), 9),
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d1fae5")),
-                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#065f46")),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#a7f3d0")),
-                ("TOPPADDING", (0, 0), (-1, -1), 3),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f8fafc")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#334155")),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#cbd5e1")),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ("LEFTPADDING", (0, 0), (-1, -1), 5),
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f0fdf4")]),
+                ("ALIGN", (0, 0), (0, -1), "CENTER"),
+                ("ALIGN", (2, 0), (2, -1), "CENTER"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f8fafc")]),
             ]))
             story.append(t)
-            story.append(Spacer(1, 4*mm))
-
-    # ---------- 2. Canteen ----------
-    story.append(Paragraph("2. Canteen", styles["SectionHeader"]))
-
-    if total_canteen == 0:
-        story.append(Paragraph("No one selected Canteen today.", styles["Normal"]))
-    else:
-        table_data = [["Floor", "Employee Name"]]
-        for fl in FLOOR_ORDER:
-            for name in data["canteen"].get(fl, []):
-                table_data.append([fl, name])
-        for fl, names in data["canteen"].items():
-            if fl not in FLOOR_ORDER:
-                for name in names:
-                    table_data.append([fl, name])
-
-        t = Table(table_data, colWidths=[30*mm, 130*mm])
-        t.setStyle(TableStyle([
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dbeafe")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#1e40af")),
-            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#93c5fd")),
-            ("TOPPADDING", (0, 0), (-1, -1), 3),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
-            ("LEFTPADDING", (0, 0), (-1, -1), 6),
-            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#eff6ff")]),
-        ]))
-        story.append(t)
+            story.append(Spacer(1, 5 * mm))
 
     # Footer
-    story.append(Spacer(1, 10*mm))
+    story.append(Spacer(1, 5 * mm))
     story.append(Paragraph(
-        "<font size='8' color='#6b7280'>"
-        "Auto-generated from the Daily Check-in system. "
-        "Only employees who checked in as <b>WFO</b> and selected a lunch preference are included."
+        "<font size='8' color='#64748b'>"
+        "Confidential • Autonex Operations • Please collect signature of each employee upon food handout."
         "</font>",
         styles["Normal"]
     ))
@@ -266,7 +211,7 @@ def generate_and_send_lunch_report(
     html = f"""
     <p>Hi,</p>
     <p>Please find attached the <strong>Daily Lunch Order Summary</strong> for <strong>{data['date'].strftime('%d %b %Y')}</strong>.</p>
-    <p>The PDF is segregated by <b>Meal Plan</b> and then by <b>Floor</b> for easy preparation.</p>
+    <p>The PDF is organized strictly by <b>Menu Option</b> with dedicated signature boxes for food handout collection.</p>
     <p>Regards,<br>Autonex System</p>
     """
 
