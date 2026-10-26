@@ -602,6 +602,29 @@ def bulk_delete_allocations(
     for a in allocs:
         a.is_active = False
 
+    # Check if removing allocations from a Training project
+    is_training = project and (
+        (project.project_type or "").lower() == "training"
+        or "week 1 training" in (project.name or "").lower()
+    )
+    if is_training and allocs:
+        emp_ids = [a.employee_id for a in allocs if a.employee_id]
+        if emp_ids:
+            cand_user_ids = [
+                r[0] for r in db.query(User.id).filter(User.employee_id.in_(emp_ids)).all()
+            ]
+            if cand_user_ids:
+                active_pipes = db.query(OnboardingPipeline).filter(
+                    OnboardingPipeline.candidate_id.in_(cand_user_ids),
+                    OnboardingPipeline.status.in_(["pending_confirmation", "in_progress", "day_5_pending"]),
+                ).all()
+                for pipe in active_pipes:
+                    pipe.status = "cancelled"
+                    logger.info(
+                        "Cancelled onboarding pipeline #%s for candidate #%s upon bulk removal from training.",
+                        pipe.id, pipe.candidate_id
+                    )
+
     db.flush()
     sync_project_allocations(db, payload.project_id)
     project_scope.invalidate_project_scope_cache()
