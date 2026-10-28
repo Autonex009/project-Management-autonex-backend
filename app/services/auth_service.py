@@ -129,6 +129,7 @@ def _cache_user_in_redis(user: User) -> None:
             "employment_type": getattr(user, "employment_type", None),
             "work_description": getattr(user, "work_description", None),
             "password_hash": getattr(user, "password_hash", ""),
+            "razorpay_email": getattr(user, "razorpay_email", None),
         }
         redis_client.set(f"auth:user:{user.id}", json.dumps(payload), ex=900)
     except Exception:
@@ -156,6 +157,7 @@ def _get_user_from_redis(user_id: int) -> Optional[User]:
                 employment_type=d.get("employment_type"),
                 work_description=d.get("work_description"),
                 password_hash=d.get("password_hash", ""),
+                razorpay_email=d.get("razorpay_email"),
             )
     except Exception:
         pass
@@ -197,6 +199,7 @@ def _clone_user(u: User) -> User:
         must_change_password=getattr(u, "must_change_password", False),
         employment_type=getattr(u, "employment_type", None),
         work_description=getattr(u, "work_description", None),
+        razorpay_email=getattr(u, "razorpay_email", None),
     )
 
 

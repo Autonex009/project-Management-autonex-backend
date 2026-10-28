@@ -22,6 +22,7 @@ class User(Base):
     
     # Link to employee record (for pm/employee users)
     employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True, index=True)
+    razorpay_email = Column(Text, nullable=True)
     
     # Skills stored as JSON array (used during signup)
     skills = Column(JSON, nullable=True)
@@ -49,4 +50,3 @@ class RefreshToken(Base):
     token = Column(String(255), unique=True, nullable=False, index=True)
     expires_at = Column(TIMESTAMP, nullable=False)
     created_at = Column(TIMESTAMP, server_default=func.now())
-
