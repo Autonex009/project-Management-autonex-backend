@@ -94,6 +94,13 @@ class EmployeeBase(BaseModel):
     productivity_baseline: float = Field(1.0, gt=0, le=2.0)
     status: Optional[str] = "active"
 
+    @field_validator("razorpay_email", mode="before")
+    @classmethod
+    def validate_razorpay_email(cls, value: Optional[str]) -> Optional[str]:
+        if not value or not str(value).strip():
+            return None
+        return str(value).strip().lower()
+
     @field_validator("employee_type", mode="before")
     @classmethod
     def validate_employee_type(cls, value: str) -> str:
@@ -176,6 +183,13 @@ class EmployeeUpdate(BaseModel):
     productivity_baseline: Optional[float] = None
     status: Optional[str] = None
     base_salary: Optional[float] = None
+
+    @field_validator("razorpay_email", mode="before")
+    @classmethod
+    def validate_razorpay_email(cls, value: Optional[str]) -> Optional[str]:
+        if not value or not str(value).strip():
+            return None
+        return str(value).strip().lower()
 
     @field_validator("employee_type", mode="before")
     @classmethod

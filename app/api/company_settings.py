@@ -31,6 +31,50 @@ CANTEEN_MENU_KEY = "canteen_lunch_menu"
 REDIS_MENU_CACHE_KEY = "canteen:lunch_menu:v1"
 REDIS_MENU_TTL_SECONDS = 86400  # 24 Hours
 
+# Authorized canteen managers (defaults to Ashish Jadhav, extendable via company_settings)
+CANTEEN_DEFAULT_MANAGERS = {"jadhavashish061@gmail.com"}
+CANTEEN_MANAGERS_SETTING_KEY = "canteen_manager_emails"
+
+# Zero-DB Connection L1 Cache for authorized canteen managers (5-min TTL)
+canteen_managers_l1_cache = InMemoryTTLCache(ttl_seconds=300.0, max_size=10)
+
+
+def get_canteen_authorized_emails(db: Optional[Session] = None) -> set:
+    """Return set of authorized canteen manager emails (lowercase) using Zero-DB L1 RAM Cache."""
+    cached = canteen_managers_l1_cache.get("managers")
+    if cached is not None:
+        return cached
+
+    emails = {e.lower() for e in CANTEEN_DEFAULT_MANAGERS}
+    if db:
+        try:
+            setting = db.query(CompanySetting).filter(CompanySetting.key == CANTEEN_MANAGERS_SETTING_KEY).first()
+            if setting and setting.value:
+                db_emails = [e.strip().lower() for e in setting.value.replace("\n", ",").split(",") if e.strip()]
+                emails.update(db_emails)
+        except Exception as exc:
+            logger.debug("Failed to read canteen managers setting: %s", exc)
+
+    canteen_managers_l1_cache.set("managers", emails)
+    return emails
+
+
+def require_canteen_manager(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """Authorize admins, HR, or explicitly designated canteen managers."""
+    if current_user.role in ("admin", "hr"):
+        return current_user
+    authorized = get_canteen_authorized_emails(db)
+    if current_user.email and current_user.email.strip().lower() in authorized:
+        return current_user
+    raise HTTPException(
+        status_code=403,
+        detail="Access denied. Only canteen menu managers and administrators can update the menu.",
+    )
+
+
 # Tier 1: In-process RAM TTL Cache (0.001 ms, protects Redis during 10 AM rush)
 canteen_menu_l1_cache = InMemoryTTLCache(ttl_seconds=60.0, max_size=10)
 
@@ -137,15 +181,15 @@ def get_canteen_menu():
 @router.put(
     "/canteen-menu",
     response_model=List[CanteenMenuItem],
-    dependencies=[Depends(require_role("admin", "hr"))],
+    dependencies=[Depends(require_canteen_manager)],
 )
 def update_canteen_menu(
     payload: CanteenMenuPayload,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "hr")),
+    current_user: User = Depends(require_canteen_manager),
 ):
-    """Update daily canteen lunch menu (Admin and HR only).
+    """Update daily canteen lunch menu (Admin, HR, or authorized canteen managers).
     Immediately syncs PostgreSQL, flushes L2 Redis globally, and clears L1 RAM.
     """
     cleaned_items = [item.model_dump() for item in payload.items]
@@ -202,6 +246,14 @@ def update_canteen_menu(
 # -----------------------------------------------------------------------------
 # General Company Settings CRUD (Admin Only)
 # -----------------------------------------------------------------------------
+@router.get("/my-ip", dependencies=[Depends(require_role("admin"))])
+def get_current_admin_ip(http_request: Request):
+    """Return the admin's detected public IP for one-click whitelisting."""
+    from app.utils.client_ip import get_client_ip
+    client_ip = get_client_ip(http_request)
+    return {"ip": client_ip}
+
+
 @router.get("", response_model=List[CompanySettingResponse], dependencies=[Depends(require_role("admin"))])
 def list_settings(db: Session = Depends(get_db)):
     """Return all company settings."""
@@ -226,6 +278,21 @@ def upsert_setting(
     current_user: User = Depends(require_role("admin")),
 ):
     """Create or update a setting by its key (admin-only)."""
+    if key == "checkin_ip_list" and payload.value and payload.value.strip():
+        import ipaddress
+        lines = [e.strip() for line in payload.value.splitlines() for e in line.split(",") if e.strip()]
+        invalid_entries = []
+        for entry in lines:
+            try:
+                ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                invalid_entries.append(entry)
+        if invalid_entries:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid IP or CIDR subnet entries: {', '.join(invalid_entries)}. Please correct them before saving."
+            )
+
     setting = db.query(CompanySetting).filter(CompanySetting.key == key).first()
     existed = setting is not None
     old_value = setting.value if setting else None
@@ -270,6 +337,15 @@ def upsert_setting(
 
     db.commit()
     db.refresh(setting)
+
+    # Invalidate in-memory IP policy cache immediately
+    if key in ("checkin_ip_list", "checkin_ip_restriction_enabled"):
+        try:
+            from app.api.checkins import invalidate_checkin_ip_cache
+            invalidate_checkin_ip_cache()
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate checkin IP cache: {exc}")
+
     return setting
 
 
@@ -305,4 +381,13 @@ def delete_setting(
 
     db.delete(setting)
     db.commit()
+
+    # Invalidate in-memory IP policy cache immediately
+    if key in ("checkin_ip_list", "checkin_ip_restriction_enabled"):
+        try:
+            from app.api.checkins import invalidate_checkin_ip_cache
+            invalidate_checkin_ip_cache()
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate checkin IP cache: {exc}")
+
     return {"message": f"Setting '{key}' deleted successfully"}
