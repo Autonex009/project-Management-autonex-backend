@@ -4,6 +4,15 @@ import pytest
 from starlette.requests import Request
 from app.utils.client_ip import get_client_ip, parse_ip_whitelist, is_ip_allowed
 from app.api.checkins import get_cached_checkin_ip_policy, invalidate_checkin_ip_cache, _checkin_ip_cache
+from app.db.database import engine
+from app.models.company_settings import CompanySetting
+
+
+@pytest.fixture(autouse=True, scope="module")
+def setup_company_settings_table():
+    """Ensure company_settings table exists in fallback SQLite/test engine."""
+    CompanySetting.__table__.create(bind=engine, checkfirst=True)
+    yield
 
 
 def _build_mock_request(headers=None, client_host="192.168.1.50"):

@@ -194,20 +194,25 @@ def get_cached_checkin_ip_policy(db: Optional[Session] = None, ttl: float = 60.0
                 return tuple(_checkin_ip_cache["networks"]), _checkin_ip_cache["is_enabled"]
 
             # Single fast column-projection query
-            if db is not None:
-                settings = (
-                    db.query(CompanySetting.key, CompanySetting.value)
-                    .filter(CompanySetting.key.in_(["checkin_ip_list", "checkin_ip_restriction_enabled"]))
-                    .all()
-                )
-            else:
-                from app.db.database import SessionLocal
-                with SessionLocal() as session:
+            settings = []
+            try:
+                if db is not None:
                     settings = (
-                        session.query(CompanySetting.key, CompanySetting.value)
+                        db.query(CompanySetting.key, CompanySetting.value)
                         .filter(CompanySetting.key.in_(["checkin_ip_list", "checkin_ip_restriction_enabled"]))
                         .all()
                     )
+                else:
+                    from app.db.database import SessionLocal
+                    with SessionLocal() as session:
+                        settings = (
+                            session.query(CompanySetting.key, CompanySetting.value)
+                            .filter(CompanySetting.key.in_(["checkin_ip_list", "checkin_ip_restriction_enabled"]))
+                            .all()
+                        )
+            except Exception as exc:
+                logger.warning("checkins: Failed to query company_settings for IP policy (%s), falling back to default open policy", exc)
+                settings = []
 
             settings_map = {k: v for k, v in settings}
 
