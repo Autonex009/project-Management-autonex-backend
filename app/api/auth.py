@@ -67,6 +67,8 @@ class UserResponse(BaseModel):
     avatar_url: Optional[str] = None
     skills: Optional[list] = None
     must_change_password: bool = False
+    can_manage_canteen_menu: bool = False
+    razorpay_email: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -131,6 +133,17 @@ def build_user_response(user: User, db: Session, pre_fetched_employee: Optional[
     employee = _lookup_employee(user, db, pre_fetched_employee)
     designation = get_user_designation(user, db, employee)
     access_role = get_access_role(designation, user.role)
+    # Check canteen manager permission (Admin, HR, or authorized manager)
+    can_manage_canteen = False
+    if access_role in ("admin", "hr"):
+        can_manage_canteen = True
+    else:
+        try:
+            from app.api.company_settings import get_canteen_authorized_emails
+            can_manage_canteen = bool(user.email) and (user.email.strip().lower() in get_canteen_authorized_emails(db))
+        except Exception:
+            can_manage_canteen = False
+
     return UserResponse(
         id=user.id,
         name=user.name,
@@ -142,6 +155,11 @@ def build_user_response(user: User, db: Session, pre_fetched_employee: Optional[
         avatar_url=employee.avatar_url if employee else None,
         skills=user.skills,
         must_change_password=bool(user.must_change_password),
+        can_manage_canteen_menu=can_manage_canteen,
+        razorpay_email=(
+            (employee.razorpay_email if employee else None)
+            or getattr(user, "razorpay_email", None)
+        ),
     )
 
 

@@ -263,6 +263,7 @@ def create_employee(
         skills=employee.skills or [],
         is_active=True,
         must_change_password=True,
+        razorpay_email=employee.razorpay_email,
     )
     db.add(user)
 
@@ -1174,6 +1175,8 @@ def update_employee(
     if linked_user:
         linked_user.email = employee.email
         linked_user.name = employee.name
+        if "razorpay_email" in update_data:
+            linked_user.razorpay_email = employee.razorpay_email
         if "designation" in update_data:
             linked_user.role = get_user_role_from_designation(employee.designation)
         elif linked_user.role not in ("admin", "hr"):
