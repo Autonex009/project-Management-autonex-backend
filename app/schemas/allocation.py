@@ -52,6 +52,8 @@ class AllocationUpdate(BaseModel):
     weekly_hours_allocated: Optional[float] = Field(None, gt=0)
     weekly_tasks_allocated: Optional[int] = Field(None, ge=0)
     effective_week: Optional[date] = None
+    is_active: Optional[bool] = None
+    deactivated_reason: Optional[str] = None
 
 
 class AllocationResponse(AllocationBase):
