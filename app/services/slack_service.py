@@ -220,6 +220,45 @@ def open_direct_message_channel(user_id: str) -> str:
     raise RuntimeError(f"Slack DM open failed: {response.get('error') or 'unknown_error'}")
 
 
+def send_slack_dm(slack_user_id: str, message: str) -> bool:
+    """Send a direct Slack DM to an employee with a direct portal action button."""
+    try:
+        channel_id = open_direct_message_channel(slack_user_id)
+        portal_url = _checkin_frontend_url()
+        response = _slack_request(
+            "/chat.postMessage",
+            {
+                "channel": channel_id,
+                "text": message,
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": message,
+                        },
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "Check In Now"},
+                                "style": "primary",
+                                "url": portal_url,
+                                "action_id": "checkin_now",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+        return bool(response.get("ok"))
+    except Exception as exc:
+        logger.warning("[slack_service] Failed to send Slack DM to %s: %s", slack_user_id, exc)
+        return False
+
+
 def send_leave_applied_message(*, employee_name: str, employee_email: str, leave_type: str, start_date: str, end_date: str) -> bool:
     user_id = lookup_user_id_by_email(employee_email)
     if not user_id:
@@ -279,7 +318,7 @@ def try_send_leave_applied_message(**kwargs) -> bool:
 
 
 def get_leave_balances_text(db, employee) -> str:
-    from app.constants.leave_types import is_intern_or_contractor, normalize_leave_type
+    from app.constants.leave_types import is_intern_or_contractor, normalize_leave_type, get_working_days_count
     from app.models.leave import Leave
     from datetime import date, timedelta
     
@@ -295,15 +334,8 @@ def get_leave_balances_text(db, employee) -> str:
     def calc_days(l: Leave):
         if not getattr(l, "start_date", None) or not getattr(l, "end_date", None):
             return 0
-        if getattr(l, "is_half_day", False) or l.leave_type in ("first_half", "second_half", "half_day"):
-            return 0.5
-        d = 0
-        curr = l.start_date
-        while curr <= l.end_date:
-            if curr.weekday() < 5:
-                d += 1
-            curr += timedelta(days=1)
-        return d
+        is_half = bool(getattr(l, "is_half_day", False) or l.leave_type in ("first_half", "second_half", "half_day"))
+        return get_working_days_count(l.start_date, l.end_date, is_half)
 
     used_this_month = 0
     used_cl = 0
@@ -401,7 +433,7 @@ def build_leave_request_blocks(
     leave_type: str,
     start_date: str,
     end_date: str,
-    duration_days: int,
+    duration_days: int | float,
     reason: str | None,
     impacted_projects: list[str] | None,
     leave_id: int,
@@ -429,7 +461,8 @@ def build_leave_request_blocks(
         warning_msg = exceeds_limit_text or "Approval requires a mandatory remark."
         full_text += f"\n⚠️ *Limit Exceeded:* {warning_msg}"
 
-    full_text += f"\n\n*Request Details*\n• *Duration:* {duration_days} Day(s) ({date_str})\n• *Reason:* {normalized_reason}\n• *Projects Impacted:* {projects_text}"
+    dur_display = int(duration_days) if isinstance(duration_days, (int, float)) and duration_days == int(duration_days) else duration_days
+    full_text += f"\n\n*Request Details*\n• *Duration:* {dur_display} Day(s) ({date_str})\n• *Reason:* {normalized_reason}\n• *Projects Impacted:* {projects_text}"
 
     if leave_balances_text:
         full_text += f"\n\n*Leave Balances*\n{leave_balances_text}"
@@ -503,7 +536,7 @@ def send_pm_leave_request_message(
     leave_type: str,
     start_date: str,
     end_date: str,
-    duration_days: int,
+    duration_days: int | float,
     reason: str | None,
     impacted_projects: list[str] | None = None,
     leave_id: int,
@@ -544,7 +577,7 @@ def try_update_pm_leave_request_message(
     leave_type: str,
     start_date: str,
     end_date: str,
-    duration_days: int,
+    duration_days: int | float,
     reason: str | None,
     impacted_projects: list[str] | None = None,
     leave_id: int,
@@ -592,7 +625,7 @@ def build_wfh_request_blocks(
     employee_designation: str | None,
     start_date: str,
     end_date: str,
-    duration_days: int,
+    duration_days: int | float,
     reason: str | None,
     impacted_projects: list[str] | None,
     wfh_id: int,
@@ -694,7 +727,7 @@ def try_update_pm_wfh_request_message(
     employee_designation: str | None,
     start_date: str,
     end_date: str,
-    duration_days: int,
+    duration_days: int | float,
     reason: str | None,
     impacted_projects: list[str] | None = None,
     wfh_id: int,
@@ -734,7 +767,7 @@ def send_pm_wfh_request_message(
     employee_designation: str | None,
     start_date: str,
     end_date: str,
-    duration_days: int,
+    duration_days: int | float,
     reason: str | None,
     impacted_projects: list[str] | None = None,
     wfh_id: int,
