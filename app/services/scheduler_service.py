@@ -138,6 +138,15 @@ def _scheduled_encord_sync() -> None:
         logger.info(
             "[scheduler] Encord sync complete",
         )
+
+        # Post-sync fallback calculation for weekend compensation
+        try:
+            from app.services.weekly_compensation_service import sync_encord_weekly_compensation_fallback
+            sync_encord_weekly_compensation_fallback(db, target_date=now.date())
+            sync_encord_weekly_compensation_fallback(db, target_date=(now - timedelta(days=1)).date())
+            db.commit()
+        except Exception as wc_exc:
+            logger.error("[scheduler] Weekly compensation telemetry fallback failed: %s", wc_exc)
         
         # --- NEW CODE ADDED: SLACK LEADERBOARD ---
         from app.models.encord_analytics import EncordDailyTimeSpent

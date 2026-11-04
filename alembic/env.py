@@ -43,6 +43,7 @@ from app.models import (
     employee_badge,
     employee_note,
     onboarding_pipeline,
+    weekly_compensation,
 )
 
 
