@@ -103,6 +103,7 @@ class TodayCheckInStatus(BaseModel):
     checkin: Optional[CheckInResponse] = None
     project_options: List[dict] = []  # [{project_id, project_name}]
     suggested_work_mode: str = "WFO"  # "WFH" if an approved WFH request covers today
+    is_weekend_or_holiday: bool = False
 
     class Config:
         from_attributes = True
@@ -181,3 +182,163 @@ class MatrixResponse(BaseModel):
     month_year: str
     days_in_month: int
     rows: List[MatrixRow] = []
+
+
+
+# -------------------------------------------------------------
+# Check-in Pulse Dashboard Models (Minor Feature 04)
+# -------------------------------------------------------------
+
+class LeaveBreakdown(BaseModel):
+    total: int = 0
+    approved: int = 0
+    pending: int = 0
+    approved_checked_in: int = 0
+    approved_checked_in_names: List[str] = []
+
+
+class AttendanceOverview(BaseModel):
+    effective_percentage: float
+    checked_in: int
+    expected: int
+    active: int
+    on_leave: int
+    yet_to_check_in: int
+    leave_breakdown: Optional[LeaveBreakdown] = None
+
+
+class FloorBreakdown(BaseModel):
+    floor_7: int = 0
+    floor_9: int = 0
+    floor_15: int = 0
+    floor_17: int = 0
+    wfh: int = 0
+
+
+class AverageDetail(BaseModel):
+    time: str
+    status: str
+    count: Optional[int] = None
+    delta_minutes: Optional[int] = None
+
+
+class ModeAverages(BaseModel):
+    target_time: str = "09:30"
+    overall: AverageDetail
+    wfo: AverageDetail
+    wfh: AverageDetail
+
+
+class MoodPulse(BaseModel):
+    total: int = 0
+    great: int = 0
+    okay: int = 0
+    low: int = 0
+    stressed: int = 0
+    tiffins: int = 0
+    canteen: int = 0
+
+
+class CheckInPulseOverviewResponse(BaseModel):
+    date: str
+    updated_at: str
+    attention_badge_count: int = 0
+    attendance: AttendanceOverview
+    floor_breakdown: FloorBreakdown
+    averages: ModeAverages
+    mood_pulse: MoodPulse
+
+
+class TimingEmployeeItem(BaseModel):
+    id: int
+    name: str
+    initials: str
+    designation: Optional[str] = None
+    work_mode: str
+    office_floor: Optional[str] = None
+    time: str
+
+
+class TimingBucketItem(BaseModel):
+    id: str
+    label: str
+    total: int
+    wfo: int
+    wfh: int
+    is_late: bool = False
+    employees: List[TimingEmployeeItem] = []
+
+
+class CheckInPulseTimingResponse(BaseModel):
+    date: str
+    buckets: List[TimingBucketItem]
+
+
+class StreakEmployeeItem(BaseModel):
+    id: int
+    name: str
+    initials: str
+    designation: Optional[str] = None
+    last_seen: Optional[str] = None
+    days: int
+
+
+class StreakGroup(BaseModel):
+    count: int = 0
+    items: List[StreakEmployeeItem] = []
+
+
+class ConsecutiveMisses(BaseModel):
+    streak_2_days: StreakGroup
+    streak_3_days: StreakGroup
+    streak_5_plus_days: StreakGroup
+    unauthorized_wfh: Optional[StreakGroup] = None
+
+
+class UnaccountedEmployeeItem(BaseModel):
+    id: int
+    name: str
+    initials: str
+    designation: Optional[str] = None
+    pm_name: Optional[str] = None
+    slack_user_id: Optional[str] = None
+    has_pending_leave: bool = False
+    is_nudged_today: bool = False
+
+
+class NotCheckedInNoLeaveGroup(BaseModel):
+    count: int = 0
+    employees: List[UnaccountedEmployeeItem] = []
+
+
+class HabitualLateItem(BaseModel):
+    id: int
+    name: str
+    initials: str
+    designation: Optional[str] = None
+    late_count: int
+    note: str = "pattern, not one-off"
+
+
+class HabitualLateGroup(BaseModel):
+    count: int = 0
+    description: str = ">3x this month"
+    employees: List[HabitualLateItem] = []
+
+
+class CheckInPulseAttentionResponse(BaseModel):
+    date: str
+    consecutive_misses: ConsecutiveMisses
+    not_checked_in_no_leave: NotCheckedInNoLeaveGroup
+    habitual_late: HabitualLateGroup
+
+
+class NudgeRequest(BaseModel):
+    employee_id: Optional[int] = None
+    all_unaccounted: bool = False
+
+
+class NudgeResponse(BaseModel):
+    success: bool
+    nudged_count: int
+    message: str
