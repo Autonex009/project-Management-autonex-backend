@@ -537,7 +537,7 @@ def calculate_pulse_attention(
                 "unauthorized_wfh": {"count": 0, "items": []},
             },
             "not_checked_in_no_leave": {"count": 0, "employees": []},
-            "habitual_late": {"count": 0, "description": ">3x this month", "employees": []},
+            "habitual_late": {"count": 0, "description": ">3x past 30 days", "employees": []},
         }
 
     # 2. Approved and pending leaves today

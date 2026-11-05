@@ -16,7 +16,7 @@ from app.constants.leave_types import (
     RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type,
     is_valid_floater_date, get_floater_dates_for_year,
     is_weekend, is_fixed_holiday, get_fixed_holidays_for_year,
-    is_intern_or_contractor,
+    is_intern_or_contractor, get_working_days_count,
 )
 from app.models.allocation import Allocation
 from app.models.employee import Employee
@@ -1029,7 +1029,7 @@ def _bg_notify_leave_applied(leave_id: int, exceeds_by: float):
             end_date=leave.end_date.isoformat(),
         )
 
-        duration_days = 0.5 if leave.is_half_day else (leave.end_date - leave.start_date).days + 1
+        duration_days = get_working_days_count(leave.start_date, leave.end_date, is_half_day=getattr(leave, "is_half_day", False))
         escalates_to_admin = project_scope.escalates_to_admin(db, employee.id)
         escalates_to_pm = project_scope.escalates_to_pm(db, employee.id)
         pm_targets = (
