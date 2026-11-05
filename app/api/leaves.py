@@ -1,3 +1,4 @@
+from app.services.checkin_pulse_service import invalidate_checkin_pulse_cache
 import json
 import os
 from datetime import timedelta, date as date_type, timezone, datetime, time as time_type
@@ -15,7 +16,7 @@ from app.constants.leave_types import (
     RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type,
     is_valid_floater_date, get_floater_dates_for_year,
     is_weekend, is_fixed_holiday, get_fixed_holidays_for_year,
-    is_intern_or_contractor,
+    is_intern_or_contractor, get_working_days_count,
 )
 from app.models.allocation import Allocation
 from app.models.employee import Employee
@@ -1028,7 +1029,7 @@ def _bg_notify_leave_applied(leave_id: int, exceeds_by: float):
             end_date=leave.end_date.isoformat(),
         )
 
-        duration_days = 0.5 if leave.is_half_day else (leave.end_date - leave.start_date).days + 1
+        duration_days = get_working_days_count(leave.start_date, leave.end_date, is_half_day=getattr(leave, "is_half_day", False))
         escalates_to_admin = project_scope.escalates_to_admin(db, employee.id)
         escalates_to_pm = project_scope.escalates_to_pm(db, employee.id)
         pm_targets = (
@@ -1241,6 +1242,7 @@ def create_leave(
     db.add(leave)
     db.commit()
     db.refresh(leave)
+    invalidate_checkin_pulse_cache(leave.start_date, leave.end_date)
     leave._exceeds_by = exceeds_by
 
     # Recorded after the refresh because leave.id only exists once the insert lands.
@@ -1505,6 +1507,7 @@ def update_leave(
 
     db.commit()
     db.refresh(leave)
+    invalidate_checkin_pulse_cache(leave.start_date, leave.end_date)
     return _leave_to_schema(leave)
 
 
@@ -1632,6 +1635,7 @@ def approve_leave(
         result["sync_warning"] = sync_warning
         
     trigger_leave_revalidation(employee.id)
+    invalidate_checkin_pulse_cache(leave.start_date, leave.end_date)
     return result
 
 
@@ -1692,6 +1696,7 @@ def reject_leave(
 
     pm_name = current_user.name or "your PM"
 
+
     # In-app notification: employee
     emp_user = db.query(User).filter(User.employee_id == employee.id).first()
     if emp_user:
@@ -1712,6 +1717,7 @@ def reject_leave(
         approved=False,
     )
 
+    invalidate_checkin_pulse_cache(leave.start_date, leave.end_date)
     return {"message": "Leave rejected", "leave_id": leave_id, "status": "rejected"}
 
 
@@ -1799,6 +1805,7 @@ def undo_reject_leave(
         )
         db.commit()
 
+    invalidate_checkin_pulse_cache(leave.start_date, leave.end_date)
     return {"message": "Leave reopened", "leave_id": leave_id, "status": "pending"}
 
 
@@ -1873,6 +1880,7 @@ def undo_approve_leave(
         )
         db.commit()
 
+    invalidate_checkin_pulse_cache(leave.start_date, leave.end_date)
     return {"message": "Leave approval revoked, reverted to pending", "leave_id": leave_id, "status": "pending"}
 
 
@@ -1936,8 +1944,10 @@ def delete_leave(
         for ts, ch in zip(tss, chs):
             try_overwrite_deleted_message(ch, ts)
 
+    del_start, del_end = leave.start_date, leave.end_date
     db.delete(leave)
     db.commit()
+    invalidate_checkin_pulse_cache(del_start, del_end)
     return {"message": "Leave deleted successfully"}
 
 

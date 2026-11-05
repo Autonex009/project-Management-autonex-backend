@@ -36,6 +36,7 @@ from app.db.database import get_db
 from app.models.employee import Employee
 from app.models.leave import Leave
 from app.models.payroll import PayrollLeaveAdjustment, PayrollRun, PayrollBonus, PayrollAdditionalPayment, Salary
+from app.models.weekly_compensation import WeeklyCompensationRecord
 from app.models.perf_eval import PerfEvaluation
 from app.models.user import User
 from app.constants.leave_types import (
@@ -292,7 +293,8 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
                         bonus_limit: float = 0.0, bonus: float = 0.0,
                         additional_payment: float = 0.0,
                         bonus_eligible: bool = True,
-                        bonus_ineligible_reason: Optional[str] = None) -> dict:
+                        bonus_ineligible_reason: Optional[str] = None,
+                        weekly_compensation: float = 0.0) -> dict:
     """
     Each leave in `approved_leaves` carries `auto_unpaid_days` (from the annual-quota
     classifier) and `days_in_month` (working days within the month).
@@ -377,7 +379,8 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
     # payments are free-form. Both add on top of the post-deduction salary.
     bonus_amount = round(max(0.0, min(bonus or 0.0, bonus_limit or 0.0)), 2) if bonus_eligible else 0.0
     additional_amount = round(max(0.0, additional_payment or 0.0), 2)
-    final_salary = round(max(base - total_deduction, 0) + bonus_amount + additional_amount, 2)
+    weekly_comp_amount = round(max(0.0, weekly_compensation or 0.0), 2)
+    final_salary = round(max(base - total_deduction, 0) + bonus_amount + additional_amount + weekly_comp_amount, 2)
 
     return {
         "employee_id": emp.id,
@@ -400,6 +403,7 @@ def _build_employee_row(emp: Employee, approved_leaves: list, working_days: int,
         "bonus_eligible": bonus_eligible,
         "bonus_ineligible_reason": bonus_ineligible_reason,
         "additional_payment": additional_amount,
+        "weekly_compensation": weekly_comp_amount,
         "final_salary": final_salary,
     }
 
@@ -475,6 +479,34 @@ def preview_payroll(
             a.employee_id: a.amount
             for a in db.query(PayrollAdditionalPayment).filter(PayrollAdditionalPayment.payroll_run_id == existing_run.id).all()
         }
+
+    # Aggregated approved weekly compensation for this payroll month
+    weekly_comp_query = (
+        db.query(
+            WeeklyCompensationRecord.employee_id,
+            func.sum(
+                func.coalesce(
+                    WeeklyCompensationRecord.override_payout,
+                    WeeklyCompensationRecord.calculated_payout
+                )
+            ).label("total_comp")
+        )
+        .filter(WeeklyCompensationRecord.payroll_month == month)
+    )
+
+    if existing_run and existing_run.status == "finalized":
+        # Finalized runs only count records specifically locked to this run
+        weekly_comp_query = weekly_comp_query.filter(
+            WeeklyCompensationRecord.payroll_run_id == existing_run.id,
+            WeeklyCompensationRecord.status == "payroll_locked",
+        )
+    else:
+        weekly_comp_query = weekly_comp_query.filter(
+            WeeklyCompensationRecord.status.in_(["approved", "payroll_locked"])
+        )
+
+    weekly_comp_rows = weekly_comp_query.group_by(WeeklyCompensationRecord.employee_id).all()
+    weekly_comp_by_emp = {row.employee_id: float(row.total_comp or 0.0) for row in weekly_comp_rows}
 
     # Self-evaluations submitted for this payroll month (employees eligible for bonus)
     submitted_eval_emp_ids = {
@@ -593,6 +625,7 @@ def preview_payroll(
             additional_payment=emp_additional,
             bonus_eligible=bonus_eligible,
             bonus_ineligible_reason=bonus_ineligible_reason,
+            weekly_compensation=weekly_comp_by_emp.get(emp.id, 0.0),
         )
         row["salary_missing"] = emp_base_salary is None
         rows.append(row)
@@ -701,6 +734,16 @@ def save_payroll(
         run.reopened_at = None
         run.reopened_by = None
 
+        # Lock all approved weekly compensation records for this month
+        db.query(WeeklyCompensationRecord).filter(
+            WeeklyCompensationRecord.payroll_month == run.month,
+            WeeklyCompensationRecord.status == "approved"
+        ).update({
+            "is_locked": True,
+            "status": "payroll_locked",
+            "payroll_run_id": run.id
+        }, synchronize_session=False)
+
     for adj in body.adjustments:
         db.add(PayrollLeaveAdjustment(
             payroll_run_id=run.id,
@@ -802,6 +845,15 @@ def reopen_payroll(
     run.status = "draft"
     run.reopened_at = datetime.utcnow()
     run.reopened_by = current_user.id
+
+    # Unlock associated weekly compensation records back to approved
+    db.query(WeeklyCompensationRecord).filter(
+        WeeklyCompensationRecord.payroll_month == body.month,
+        WeeklyCompensationRecord.is_locked == True
+    ).update({
+        "is_locked": False,
+        "status": "approved"
+    }, synchronize_session=False)
     
     audit_service.record(
         db,
@@ -858,6 +910,15 @@ def discard_payroll_run(
             PayrollAdditionalPayment.payroll_run_id == run.id
         ).delete(),
     }
+    # Decouple and unlock weekly compensation records (work records are NEVER deleted)
+    db.query(WeeklyCompensationRecord).filter(
+        WeeklyCompensationRecord.payroll_month == month
+    ).update({
+        "payroll_run_id": None,
+        "is_locked": False,
+        "status": "approved"
+    }, synchronize_session=False)
+
     db.delete(run)
 
     audit_service.record(
@@ -930,7 +991,7 @@ def export_payroll_csv(
     writer.writerow([
         "Employee", "Designation", "Type",
         "Base Salary (₹)", f"Per Day (₹, ÷{data['working_days']})",
-        "Leave Days", "Paid Days", "Unpaid (Deducted) Days", "Deduction (₹)", "Bonus (₹)", "Additional Payments (₹)", "Final Salary (₹)", "Notes"
+        "Leave Days", "Paid Days", "Unpaid (Deducted) Days", "Deduction (₹)", "Bonus (₹)", "Additional Payments (₹)", "Weekly Comp (₹)", "Final Salary (₹)", "Notes"
     ])
     for row in data["employees"]:
         writer.writerow([
@@ -945,6 +1006,7 @@ def export_payroll_csv(
             row["total_deduction"],
             row.get("bonus", 0),
             row.get("additional_payment", 0),
+            row.get("weekly_compensation", 0),
             row["final_salary"],
             "Salary not set" if row.get("salary_missing") else "",
         ])

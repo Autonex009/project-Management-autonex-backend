@@ -185,7 +185,9 @@ def project_lead_ids(db: Session, project: Optional[DailySheet]) -> set[int]:
         tagged = any(
             _normalise(tag) in TEAM_LEAD_TAGS for tag in (role_tags or [])
         )
-        if tagged or designations.get(employee_id) in TEAM_LEAD_TAGS:
+        if tagged:
+            leads.add(int(employee_id))
+        elif not role_tags and designations.get(employee_id) in TEAM_LEAD_TAGS:
             leads.add(int(employee_id))
     return leads | _demoted_to_lead(db, project)
 
@@ -327,7 +329,7 @@ def get_authorized_project_ids(db: Optional[Session] = None, user: Optional[User
                 _normalise(tag) in (TEAM_LEAD_TAGS | {"pm", "project manager", "program manager"})
                 for tag in (role_tags or [])
             )
-            if tagged or is_mgr_or_tl:
+            if tagged or (not role_tags and is_mgr_or_tl):
                 authorized_ids.add(pid)
 
         # 3. Daily sheets where user is directly in assigned_employee_ids

@@ -1324,7 +1324,7 @@ def update_allocation(
                 )
 
     # GUARD (Pillar 5): Block re-activating an allocation on a non-training project for active onboarding trainees
-    if data.is_active is True and allocation.is_active is False:
+    if getattr(data, "is_active", None) is True and allocation.is_active is False:
         target_pid = data.sub_project_id or allocation.sub_project_id
         target_proj = db.query(Project).filter(Project.id == target_pid).first()
         is_target_training = target_proj and (
@@ -1392,6 +1392,13 @@ def update_allocation(
     # Force 8-hour flat assignment explicitly
     allocation.total_daily_hours = 8
 
+    if "is_active" in changed_keys:
+        if allocation.is_active is False and before_values.get("is_active") is True:
+            allocation.deactivated_at = func.now()
+        elif allocation.is_active is True and before_values.get("is_active") is False:
+            allocation.deactivated_at = None
+            allocation.deactivated_reason = None
+
     db.flush()
 
     # Sync allocated_employees count from actual records for affected projects
@@ -1419,6 +1426,8 @@ def update_allocation(
         "active_end_date": "End date",
         "time_distribution": "Time split",
         "override_flag": "Overbooking override",
+        "is_active": "Active status",
+        "deactivated_reason": "Deactivation reason",
     }
     updated_employee = db.query(Employee).filter(Employee.id == allocation.employee_id).first()
     updated_name = updated_employee.name if updated_employee else None

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 
 LEAVE_TYPE_CHOICES = ("paid", "casual_sick", "floater", "half_day", "first_half", "second_half")
 
@@ -147,6 +147,21 @@ def is_non_working_day(d: date) -> bool:
     # days off the salary divisor), so only weekends are non-working here. Leave-day
     # counting in app/api/leaves.py still excludes holidays separately.
     return is_weekend(d)
+
+
+def get_working_days_count(start_date: date, end_date: date, is_half_day: bool = False) -> int | float:
+    """Calculate the number of working days in [start_date, end_date], excluding weekends and fixed public holidays."""
+    if not start_date or not end_date or end_date < start_date:
+        return 0
+    count = 0
+    curr = start_date
+    while curr <= end_date:
+        if not is_weekend(curr) and not is_fixed_holiday(curr):
+            count += 1
+        curr += timedelta(days=1)
+    if is_half_day:
+        return 0.5 if count > 0 else 0
+    return count
 
 
 def normalize_leave_type(leave_type: str) -> str:
