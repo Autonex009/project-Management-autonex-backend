@@ -647,3 +647,30 @@ def test_worker_manageable_contains_only_self(db):
     worker_manageable_no_self = project_scope.get_manageable_employee_ids(db, worker_user, exclude_self=True)
     assert worker_manageable_no_self == set()
 
+
+
+def test_designated_team_lead_with_non_lead_role_tag_is_not_lead(db):
+    """An employee whose company designation is Team Lead, but whose allocation on a project
+    explicitly has other role tags (like ['Quality Review']), is NOT considered a lead of that project.
+    """
+    from datetime import date
+    from app.models.employee import Employee
+    from app.models.project import DailySheet
+    from app.models.allocation import Allocation
+
+    tl_worker = Employee(name="TL Reviewer", email="tl.rev@x.com", designation="Team Lead", employee_type="Full-time")
+    db.add(tl_worker)
+    db.commit()
+    db.refresh(tl_worker)
+
+    proj = DailySheet(name="Test Proj", client="C", project_type="Production", total_tasks=1, estimated_time_per_task=1, project_status="active", start_date=date.today(), project_duration_weeks=1, project_duration_days=7)
+    db.add(proj)
+    db.commit()
+    db.refresh(proj)
+
+    alloc = Allocation(employee_id=tl_worker.id, sub_project_id=proj.id, role_tags=["Quality Review"], is_active=True, total_daily_hours=8)
+    db.add(alloc)
+    db.commit()
+
+    leads = project_scope.project_lead_ids(db, proj)
+    assert tl_worker.id not in leads

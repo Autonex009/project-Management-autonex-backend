@@ -31,6 +31,7 @@ from app.constants.leave_types import (
     is_weekend,
     normalize_leave_type,
     get_leave_type_label,
+    get_working_days_count,
 )
 from app.services.knowledge_service import search_policy as _search_policy
 
@@ -40,13 +41,7 @@ logger = logging.getLogger(__name__)
 # ── Helper: count working days ──────────────────────────────────────
 def _count_working_days(start: date, end: date) -> int:
     """Count working days between start and end (inclusive), excluding weekends and fixed holidays."""
-    count = 0
-    current = start
-    while current <= end:
-        if not is_non_working_day(current):
-            count += 1
-        current += timedelta(days=1)
-    return count
+    return int(get_working_days_count(start, end))
 
 
 # ── Tool: get_leave_balance ─────────────────────────────────────────

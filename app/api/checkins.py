@@ -30,6 +30,23 @@ from app.schemas.checkin import (
     TeamCheckInRow,
     PaginatedTeamCheckIns,
     ConfirmResult,
+    CheckInPulseOverviewResponse,
+    CheckInPulseTimingResponse,
+    CheckInPulseAttentionResponse,
+    NudgeRequest,
+    NudgeResponse,
+)
+from app.services.checkin_pulse_service import (
+    get_pulse_data_cached,
+    invalidate_checkin_pulse_cache,
+    record_employee_nudged_today,
+    record_multiple_employees_nudged_today,
+    get_nudged_employee_ids_today,
+)
+from app.services.weekly_compensation_service import (
+    is_weekend_or_holiday,
+    record_weekend_checkin,
+    record_weekend_checkout,
 )
 
 from datetime import time as dtime, timezone
@@ -495,6 +512,176 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
     )
 
 
+# -------------------------------------------------------------------------
+# Check-in Pulse Micro-Endpoints (Minor Feature 04)
+# High-Performance Dashboard Insights for Admin, HR, PM, Team Leads
+# -------------------------------------------------------------------------
+
+@router.get("/pulse/overview", response_model=CheckInPulseOverviewResponse)
+def get_checkin_pulse_overview(
+    target_date: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "hr", "pm", "team_lead")),
+):
+    t_date = None
+    if target_date:
+        try:
+            t_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+        except ValueError:
+            t_date = _get_ist_today()
+
+    scoped_emp_ids = None
+    if not has_full_access(current_user):
+        scoped_pids = _get_scoped_project_ids(db, current_user)
+        if scoped_pids:
+            allocs = db.query(Allocation.employee_id).filter(
+                Allocation.sub_project_id.in_(scoped_pids),
+                Allocation.is_active == True,
+            ).all()
+            scoped_emp_ids = {a.employee_id for a in allocs if a.employee_id}
+        else:
+            scoped_emp_ids = set()
+
+    return get_pulse_data_cached(db, "overview", t_date, scoped_emp_ids)
+
+
+@router.get("/pulse/timing", response_model=CheckInPulseTimingResponse)
+def get_checkin_pulse_timing(
+    target_date: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "hr", "pm", "team_lead")),
+):
+    t_date = None
+    if target_date:
+        try:
+            t_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+        except ValueError:
+            t_date = _get_ist_today()
+
+    scoped_emp_ids = None
+    if not has_full_access(current_user):
+        scoped_pids = _get_scoped_project_ids(db, current_user)
+        if scoped_pids:
+            allocs = db.query(Allocation.employee_id).filter(
+                Allocation.sub_project_id.in_(scoped_pids),
+                Allocation.is_active == True,
+            ).all()
+            scoped_emp_ids = {a.employee_id for a in allocs if a.employee_id}
+        else:
+            scoped_emp_ids = set()
+
+    return get_pulse_data_cached(db, "timing", t_date, scoped_emp_ids)
+
+
+@router.get("/pulse/attention", response_model=CheckInPulseAttentionResponse)
+def get_checkin_pulse_attention(
+    target_date: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "hr", "pm", "team_lead")),
+):
+    t_date = None
+    if target_date:
+        try:
+            t_date = datetime.strptime(target_date, "%Y-%m-%d").date()
+        except ValueError:
+            t_date = _get_ist_today()
+
+    scoped_emp_ids = None
+    if not has_full_access(current_user):
+        scoped_pids = _get_scoped_project_ids(db, current_user)
+        if scoped_pids:
+            allocs = db.query(Allocation.employee_id).filter(
+                Allocation.sub_project_id.in_(scoped_pids),
+                Allocation.is_active == True,
+            ).all()
+            scoped_emp_ids = {a.employee_id for a in allocs if a.employee_id}
+        else:
+            scoped_emp_ids = set()
+
+    return get_pulse_data_cached(db, "attention", t_date, scoped_emp_ids)
+
+
+@router.post("/pulse/nudge", response_model=NudgeResponse)
+def nudge_unaccounted_employee(
+    payload: NudgeRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("admin", "hr", "pm", "team_lead")),
+):
+    """
+    Tier 3 Asynchronous Slack Nudge: Detaches payload, releases DB session immediately,
+    and dispatches friendly reminder via BackgroundTasks without holding open DB connections.
+    Enforces a strict 1-nudge-per-day rate limit per employee to avoid Slack spam.
+    """
+    nudged = 0
+    today = _get_ist_today()
+    already_nudged = get_nudged_employee_ids_today(today)
+
+    if payload.employee_id:
+        if payload.employee_id in already_nudged:
+            raise HTTPException(
+                status_code=400,
+                detail="This employee has already received a check-in reminder today. Nudges are limited to once per day.",
+            )
+
+        emp = db.query(Employee.id, Employee.name, Employee.slack_user_id).filter(Employee.id == payload.employee_id).first()
+        if not emp:
+            raise HTTPException(status_code=404, detail="Employee not found")
+
+        if not emp.slack_user_id:
+            raise HTTPException(status_code=400, detail=f"{emp.name} does not have a linked Slack account.")
+
+        msg = f"Hi {emp.name}, this is a gentle reminder to please complete your daily check-in on the portal."
+        try:
+            from app.services.slack_service import send_slack_dm
+            background_tasks.add_task(send_slack_dm, emp.slack_user_id, msg)
+            record_employee_nudged_today(emp.id, today)
+            invalidate_checkin_pulse_cache(today)
+            nudged = 1
+        except Exception as e:
+            logger.warning(f"Could not queue slack nudge: {e}")
+
+    elif payload.all_unaccounted:
+        from app.models.leave import Leave
+        active_emps = db.query(Employee.id, Employee.name, Employee.slack_user_id).filter(Employee.status == "active").all()
+        active_ids = {e.id for e in active_emps}
+        checked_ids = {r[0] for r in db.query(DailyCheckIn.employee_id).filter(DailyCheckIn.checkin_date == today, DailyCheckIn.checked_in_at.isnot(None)).all()}
+        leave_ids = {r[0] for r in db.query(Leave.employee_id).filter(Leave.status == "approved", Leave.start_date <= today, Leave.end_date >= today).all()}
+        unaccounted = active_ids - checked_ids - leave_ids
+
+        # Filter out employees who were already nudged today (Limit: 1 per day)
+        eligible_to_nudge = unaccounted - already_nudged
+
+        if not eligible_to_nudge:
+            return NudgeResponse(
+                success=True,
+                nudged_count=0,
+                message="All unaccounted employees have already received their daily reminder (Limit: 1 nudge per day).",
+            )
+
+        to_record = set()
+        for emp in active_emps:
+            if emp.id in eligible_to_nudge and emp.slack_user_id:
+                msg = f"Hi {emp.name}, this is a gentle reminder to please complete your daily check-in on the portal."
+                try:
+                    from app.services.slack_service import send_slack_dm
+                    background_tasks.add_task(send_slack_dm, emp.slack_user_id, msg)
+                    to_record.add(emp.id)
+                    nudged += 1
+                except Exception as e:
+                    logger.warning(f"Could not queue slack nudge: {e}")
+
+        if to_record:
+            record_multiple_employees_nudged_today(to_record, today)
+            invalidate_checkin_pulse_cache(today)
+
+    return NudgeResponse(
+        success=True,
+        nudged_count=nudged,
+        message=f"Successfully queued {nudged} check-in reminder(s)."
+    )
+
+
 @router.get("/today", response_model=TodayCheckInStatus)
 def get_today_status(
     response: Response,
@@ -539,6 +726,7 @@ def get_today_status(
         checkin=existing,
         project_options=project_options,
         suggested_work_mode="WFH" if has_approved_wfh else "WFO",
+        is_weekend_or_holiday=is_weekend_or_holiday(today),
     )
 
 
@@ -772,6 +960,21 @@ def submit_checkin(
         db.add(checkin)
 
     db.flush()
+
+    # Automatic weekend/holiday compensation record initialization
+    if is_weekend_or_holiday(checkin.checkin_date):
+        first_proj_id = None
+        if checkin.project_ids and isinstance(checkin.project_ids, list) and len(checkin.project_ids) > 0:
+            if isinstance(checkin.project_ids[0], int):
+                first_proj_id = checkin.project_ids[0]
+        record_weekend_checkin(
+            db=db,
+            employee_id=checkin.employee_id,
+            daily_checkin_id=checkin.id,
+            checkin_date=checkin.checkin_date,
+            project_id=first_proj_id,
+        )
+
     response = CheckInResponse(
         id=checkin.id,
         employee_id=checkin.employee_id,
@@ -823,6 +1026,7 @@ def submit_checkin(
         logger.warning(f"Error syncing allocations from checkin: {exc}")
 
     invalidate_my_projects_cache(employee_id)
+    invalidate_checkin_pulse_cache(today)
     return response
 
 
@@ -834,6 +1038,13 @@ def submit_checkout(
 ):
     employee_id = _require_employee(current_user)
     today = _get_ist_today()
+
+    # Pillar 1: Check-out is strictly enabled exclusively on weekends and official holidays
+    if not is_weekend_or_holiday(today):
+        raise HTTPException(
+            status_code=400,
+            detail="Check-out is only enabled on weekend shifts and official holidays."
+        )
 
     checkin = (
         db.query(DailyCheckIn)
@@ -849,6 +1060,15 @@ def submit_checkout(
     if payload.mood is not None:
         checkin.mood = payload.mood
 
+    # Record shift completion & portal duration in weekly compensation
+    record_weekend_checkout(
+        db=db,
+        employee_id=checkin.employee_id,
+        checkin_date=checkin.checkin_date,
+        checked_in_at=checkin.checked_in_at,
+        checked_out_at=checkin.checked_out_at,
+    )
+
     response = CheckInResponse(
         id=checkin.id,
         employee_id=checkin.employee_id,
@@ -863,6 +1083,7 @@ def submit_checkout(
         checked_out_at=checkin.checked_out_at,
     )
     db.commit()
+    invalidate_checkin_pulse_cache(today)
     return response
 
 @router.get("/team-today", response_model=PaginatedTeamCheckIns)

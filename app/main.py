@@ -11,7 +11,7 @@ from arq.connections import RedisSettings
 import anyio.to_thread
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log, employee_badge, onboarding_pipeline, employee_document
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log, employee_badge, onboarding_pipeline, employee_document, weekly_compensation
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
@@ -54,6 +54,7 @@ from app.api.slack import router as slack_router
 from app.api.checkins import router as checkins_router
 from app.api.onboarding_pipeline import router as onboarding_pipeline_router
 from app.api.employee_documents import router as employee_documents_router
+from app.api.weekly_compensation import router as weekly_compensation_router
 
 logger = logging.getLogger(__name__)
 
@@ -249,4 +250,5 @@ app.include_router(slack_router)
 app.include_router(checkins_router)
 app.include_router(onboarding_pipeline_router)
 app.include_router(employee_documents_router)
+app.include_router(weekly_compensation_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")

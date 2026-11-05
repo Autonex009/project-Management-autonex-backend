@@ -1,3 +1,4 @@
+from app.services.checkin_pulse_service import invalidate_checkin_pulse_cache
 """WFH (Work From Home) request management API."""
 import logging
 from datetime import date, timedelta
@@ -511,7 +512,7 @@ def create_wfh_request(
     notify_admins = escalates_to_admin or escalates_to_pm or not pm_targets
 
     notified_user_ids: set[int] = set()
-    duration_days = (end_date - req.wfh_date).days + 1
+    duration_days = sum(1 for i in range((end_date - req.wfh_date).days + 1) if (req.wfh_date + timedelta(days=i)).weekday() < 5)
     ts_list = []
     ch_list = []
 
@@ -589,6 +590,7 @@ def create_wfh_request(
                     "wfh_applied",
                 )
     db.commit()
+    invalidate_checkin_pulse_cache(req.wfh_date, getattr(req, "end_date", req.wfh_date))
 
     return _build_response(req, db)
 
@@ -668,6 +670,7 @@ def approve_wfh(
     )
 
     trigger_wfh_revalidation(employee.id if employee else req.employee_id)
+    invalidate_checkin_pulse_cache(req.wfh_date, getattr(req, "end_date", req.wfh_date))
     return {"message": "WFH request approved", "wfh_id": wfh_id, "status": "approved"}
 
 
@@ -736,6 +739,7 @@ def reject_wfh(
         approved=False,
     )
 
+    invalidate_checkin_pulse_cache(req.wfh_date, getattr(req, "end_date", req.wfh_date))
     return {"message": "WFH request rejected", "wfh_id": wfh_id, "status": "rejected"}
 
 
@@ -811,6 +815,7 @@ def undo_reject_wfh(
             "wfh_applied")
         db.commit()
 
+    invalidate_checkin_pulse_cache(req.wfh_date, getattr(req, "end_date", req.wfh_date))
     return {"message": "WFH request reopened", "wfh_id": wfh_id, "status": "pending"}
 
 
@@ -869,6 +874,7 @@ def undo_approve_wfh(
             "wfh_applied")
         db.commit()
 
+    invalidate_checkin_pulse_cache(req.wfh_date, getattr(req, "end_date", req.wfh_date))
     return {"message": "WFH approval revoked, reverted to pending", "wfh_id": wfh_id, "status": "pending"}
 
 
@@ -951,6 +957,7 @@ def update_wfh_request(
     )
     db.commit()
     db.refresh(req)
+    invalidate_checkin_pulse_cache(req.wfh_date, getattr(req, "end_date", req.wfh_date))
     return _build_response(req, db)
 
 
@@ -1002,8 +1009,10 @@ def delete_wfh(
         for ts, ch in zip(tss, chs):
             try_overwrite_deleted_message(ch, ts)
 
+    del_s, del_e = req.wfh_date, getattr(req, "end_date", req.wfh_date)
     db.delete(req)
     db.commit()
+    invalidate_checkin_pulse_cache(del_s, del_e)
     return {"message": "WFH request deleted"}
 
 
@@ -1033,7 +1042,7 @@ def _revalidate_pending_wfh_background(employee_id: int, db: Session):
             return dt - timedelta(days=dt.weekday())
 
         def calc_days(start_date, end_date):
-            return (end_date - start_date).days + 1
+            return sum(1 for i in range((end_date - start_date).days + 1) if (start_date + timedelta(days=i)).weekday() < 5)
 
         for p_req in pending_wfh:
             month_start = p_req.wfh_date.replace(day=1)
