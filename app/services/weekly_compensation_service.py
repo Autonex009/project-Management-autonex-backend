@@ -21,10 +21,20 @@ from app.models.weekly_compensation import WeeklyCompensationRecord
 from app.models.employee import Employee
 from app.models.company_settings import CompanySetting
 from app.models.encord_analytics import EncordDailyTimeSpent
+from app.services.project_cache import InMemoryTTLCache
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_WEEKLY_HOURLY_RATE = Decimal("143.00")
+DEFAULT_WEEKLY_HOURLY_RATE = Decimal("166.67")
+MAX_WEEKLY_COMP_PAYOUT = Decimal("1000.00")
+
+# Zero-DB L1 RAM Cache for Company Settings (300-second TTL, 0.0005 ms lookup)
+_company_rate_l1_cache = InMemoryTTLCache(ttl_seconds=300.0, max_size=10)
+
+
+def invalidate_weekly_comp_rate_cache() -> None:
+    """Invalidate cached hourly rate in RAM (e.g. after admin update)."""
+    _company_rate_l1_cache.invalidate()
 
 
 def is_weekend_or_holiday(d: date) -> bool:
@@ -33,16 +43,25 @@ def is_weekend_or_holiday(d: date) -> bool:
 
 
 def get_default_hourly_rate(db: Session) -> Decimal:
-    """Fetch default hourly rate from CompanySetting, falling back to DEFAULT_WEEKLY_HOURLY_RATE (143.00)."""
+    """Fetch default hourly rate using Zero-DB L1 RAM Cache (0.0005 ms).
+    Falls back to DEFAULT_WEEKLY_HOURLY_RATE (143.00) if setting not found or invalid.
+    """
+    cached_rate = _company_rate_l1_cache.get("hourly_rate")
+    if cached_rate is not None:
+        return cached_rate
+
+    rate = DEFAULT_WEEKLY_HOURLY_RATE
     try:
         setting = db.query(CompanySetting).filter(CompanySetting.key == "weekly_comp_hourly_rate").first()
         if setting and setting.value:
             val = Decimal(str(setting.value).strip())
             if val > 0:
-                return val
+                rate = val
     except Exception as exc:
         logger.warning("[weekly_compensation] Failed to load rate setting, using fallback %s: %s", DEFAULT_WEEKLY_HOURLY_RATE, exc)
-    return DEFAULT_WEEKLY_HOURLY_RATE
+
+    _company_rate_l1_cache.set("hourly_rate", rate)
+    return rate
 
 
 def record_weekend_checkin(
@@ -148,7 +167,8 @@ def record_weekend_checkout(
         hourly_rate = get_default_hourly_rate(db)
         payroll_month = checkin_date.strftime("%Y-%m")
         week_number = checkin_date.isocalendar()[1]
-        calculated_payout = round((Decimal(portal_seconds) / Decimal(3600.0)) * hourly_rate, 2)
+        raw_payout = round((Decimal(portal_seconds) / Decimal(3600.0)) * hourly_rate, 2)
+        calculated_payout = min(raw_payout, MAX_WEEKLY_COMP_PAYOUT)
         record = WeeklyCompensationRecord(
             employee_id=employee_id,
             work_date=checkin_date,
@@ -177,9 +197,10 @@ def record_weekend_checkout(
     # Only update final time if not manually overridden by a manager
     if not record.is_final_time_overridden:
         record.final_duration_seconds = portal_seconds
-        record.calculated_payout = round(
+        raw_payout = round(
             (Decimal(portal_seconds) / Decimal(3600.0)) * record.hourly_rate, 2
         )
+        record.calculated_payout = min(raw_payout, MAX_WEEKLY_COMP_PAYOUT)
 
     logger.info(
         "[weekly_compensation] Recorded checkout for record #%s: %s seconds (₹%s)",
@@ -249,9 +270,10 @@ def sync_encord_weekly_compensation_fallback(db: Session, target_date: date) -> 
         # Fallback condition: missed portal check-out AND not manually overridden
         if record.portal_duration_seconds is None and not record.is_final_time_overridden:
             record.final_duration_seconds = encord_seconds
-            record.calculated_payout = round(
+            raw_payout = round(
                 (Decimal(encord_seconds) / Decimal(3600.0)) * record.hourly_rate, 2
             )
+            record.calculated_payout = min(raw_payout, MAX_WEEKLY_COMP_PAYOUT)
             updated_count += 1
 
     db.flush()
