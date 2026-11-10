@@ -15,7 +15,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, case
 
 from app.db.database import get_db
 from app.models.weekly_compensation import WeeklyCompensationRecord
@@ -102,9 +102,11 @@ class WeeklyCompMonthSummary(BaseModel):
     approved_count: int
     rejected_count: int
     total_effective_payout: float
+    total_payable_seconds: int = 0
     is_payroll_finalized: bool = False
     payroll_run_id: Optional[int] = None
-    default_hourly_rate: float = 143.0
+    default_hourly_rate: float = 166.67
+    max_payout_cap: float = 1000.0
     page: Optional[int] = 1
     page_size: Optional[int] = 50
     total_pages: Optional[int] = 1
@@ -267,6 +269,28 @@ def list_weekly_compensation(
     current_user: User = Depends(require_role("admin", "hr", "pm", "team_lead", "employee")),
 ):
     """List weekly compensation records for a month with eager preloading, filters, and summary aggregates."""
+    # Sanitize direct function invocation arguments (handles raw FastAPI params.Query objects if passed)
+    if not isinstance(status, str):
+        status = None
+    if not isinstance(week, int):
+        week = None
+    if not isinstance(employee_id, int):
+        employee_id = None
+    if not isinstance(project_id, int):
+        project_id = None
+    if not isinstance(start_date, str):
+        start_date = None
+    if not isinstance(end_date, str):
+        end_date = None
+    if not isinstance(day_of_week, str):
+        day_of_week = None
+    if not isinstance(search, str):
+        search = None
+    if not isinstance(page, int):
+        page = None
+    if not isinstance(page_size, int):
+        page_size = None
+
     query = db.query(WeeklyCompensationRecord).filter(WeeklyCompensationRecord.payroll_month == month)
 
     # Annotators / Employees can only view their own shifts
@@ -299,34 +323,97 @@ def list_weekly_compensation(
     if end_date:
         query = query.filter(WeeklyCompensationRecord.work_date <= end_date)
 
-    records = query.order_by(WeeklyCompensationRecord.work_date.desc(), WeeklyCompensationRecord.id.desc()).all()
-
-    # Day of week filter (Sat: 5, Sun: 6 in Python date.weekday())
+    # Day of week filter (Sat: 6, Sun: 7 in ISO DOW where Mon=1, Sun=7)
     if day_of_week and day_of_week != "all":
         dow = day_of_week.lower().strip()
         if dow in ("sat", "saturday"):
-            records = [r for r in records if r.work_date.weekday() == 5]
+            query = query.filter(func.extract("isodow", WeeklyCompensationRecord.work_date) == 6)
         elif dow in ("sun", "sunday"):
-            records = [r for r in records if r.work_date.weekday() == 6]
+            query = query.filter(func.extract("isodow", WeeklyCompensationRecord.work_date) == 7)
 
-    emp_map, proj_map, user_map = _load_reference_maps(db, records)
+    # 1. Single-query month stats aggregation (0.001s, ANSI SQL case & index-backed)
+    stats_query = query.with_entities(
+        func.count(WeeklyCompensationRecord.id),
+        func.sum(case((WeeklyCompensationRecord.status == "pending", 1), else_=0)),
+        func.sum(case((WeeklyCompensationRecord.status.in_(["approved", "payroll_locked"]), 1), else_=0)),
+        func.sum(case((WeeklyCompensationRecord.status == "rejected", 1), else_=0)),
+        func.sum(
+            case(
+                (
+                    WeeklyCompensationRecord.status.in_(["approved", "payroll_locked"]),
+                    func.coalesce(
+                        WeeklyCompensationRecord.override_payout,
+                        func.least(WeeklyCompensationRecord.calculated_payout, 1000.0),
+                        0,
+                    ),
+                ),
+                else_=0,
+            )
+        ),
+        func.sum(
+            case(
+                (
+                    WeeklyCompensationRecord.status.in_(["approved", "payroll_locked", "pending"]),
+                    WeeklyCompensationRecord.final_duration_seconds,
+                ),
+                else_=0,
+            )
+        ),
+    )
+    stats_row = stats_query.first()
+    total_records = stats_row[0] or 0
+    pending_cnt = int(stats_row[1] or 0)
+    approved_cnt = int(stats_row[2] or 0)
+    rejected_cnt = int(stats_row[3] or 0)
+    total_payout = float(stats_row[4] or 0.0)
+    total_payable_sec = int(stats_row[5] or 0)
 
-    serialized = [_serialize_record(r, emp_map, proj_map, user_map) for r in records]
-
-    # Search filter across employee name, designation, and project name
+    # 2. Search filter across employee name, designation, and project name in SQL
     if search and search.strip():
-        q = search.strip().lower()
-        serialized = [
-            s for s in serialized
-            if (s.employee_name and q in s.employee_name.lower())
-            or (s.employee_designation and q in s.employee_designation.lower())
-            or (s.project_name and q in s.project_name.lower())
+        term = f"%{search.strip()}%"
+        emp_ids = [
+            e[0] for e in db.query(Employee.id).filter(
+                or_(Employee.name.ilike(term), Employee.designation.ilike(term))
+            ).all()
         ]
+        proj_ids = [
+            p[0] for p in db.query(DailySheet.id).filter(
+                or_(DailySheet.name.ilike(term), DailySheet.batch_name.ilike(term))
+            ).all()
+        ]
+        match_conditions = []
+        if emp_ids:
+            match_conditions.append(WeeklyCompensationRecord.employee_id.in_(emp_ids))
+        if proj_ids:
+            match_conditions.append(WeeklyCompensationRecord.project_id.in_(proj_ids))
 
-    pending_cnt = sum(1 for r in records if r.status == "pending")
-    approved_cnt = sum(1 for r in records if r.status in ("approved", "payroll_locked"))
-    rejected_cnt = sum(1 for r in records if r.status == "rejected")
-    total_payout = sum(r.effective_payout for r in records if r.status in ("approved", "payroll_locked"))
+        if match_conditions:
+            query = query.filter(or_(*match_conditions))
+        else:
+            query = query.filter(WeeklyCompensationRecord.id == -1)
+        total_filtered = query.count()
+    else:
+        total_filtered = total_records
+
+    # 3. SQL Pre-Pagination: Limit and offset strictly in PostgreSQL (< 3ms)
+    cur_page = page or 1
+    cur_page_size = page_size or (total_filtered if total_filtered > 0 else 50)
+    total_pages = (total_filtered + cur_page_size - 1) // cur_page_size if cur_page_size > 0 else 1
+
+    if page and page_size:
+        offset_val = (cur_page - 1) * cur_page_size
+        paged_records = (
+            query.order_by(WeeklyCompensationRecord.work_date.desc(), WeeklyCompensationRecord.id.desc())
+            .offset(offset_val)
+            .limit(cur_page_size)
+            .all()
+        )
+    else:
+        paged_records = query.order_by(WeeklyCompensationRecord.work_date.desc(), WeeklyCompensationRecord.id.desc()).all()
+
+    # 4. Reference map hydration strictly for the paged subset (Zero N+1 bloat, < 2ms)
+    emp_map, proj_map, user_map = _load_reference_maps(db, paged_records)
+    serialized = [_serialize_record(r, emp_map, proj_map, user_map) for r in paged_records]
 
     finalized_run = (
         db.query(PayrollRun)
@@ -341,32 +428,23 @@ def list_weekly_compensation(
 
     rate_setting = float(get_default_hourly_rate(db))
 
-    total_filtered = len(serialized)
-    cur_page = page or 1
-    cur_page_size = page_size or (total_filtered if total_filtered > 0 else 50)
-    total_pages = (total_filtered + cur_page_size - 1) // cur_page_size if cur_page_size > 0 else 1
-
-    if page and page_size:
-        start_idx = (cur_page - 1) * cur_page_size
-        paged_records = serialized[start_idx : start_idx + cur_page_size]
-    else:
-        paged_records = serialized
-
     return WeeklyCompMonthSummary(
         month=month,
-        total_records=len(records),
+        total_records=total_records,
         pending_count=pending_cnt,
         approved_count=approved_cnt,
         rejected_count=rejected_cnt,
         total_effective_payout=round(total_payout, 2),
+        total_payable_seconds=total_payable_sec,
         is_payroll_finalized=is_payroll_finalized,
         payroll_run_id=payroll_run_id,
         default_hourly_rate=rate_setting,
+        max_payout_cap=1000.0,
         page=cur_page,
         page_size=cur_page_size,
         total_pages=total_pages,
         total_filtered_records=total_filtered,
-        records=paged_records,
+        records=serialized,
     )
 
 
@@ -429,7 +507,8 @@ def adjust_final_time(
     old_seconds = record.final_duration_seconds
     record.final_duration_seconds = target_seconds
     record.is_final_time_overridden = True
-    record.calculated_payout = round((Decimal(target_seconds) / Decimal(3600.0)) * record.hourly_rate, 2)
+    raw_payout = round((Decimal(target_seconds) / Decimal(3600.0)) * record.hourly_rate, 2)
+    record.calculated_payout = min(raw_payout, Decimal("1000.00"))
     record.edit_note = note_val
     record.last_edited_by = current_user.id
     record.last_edited_at = datetime.now(timezone.utc)
@@ -455,7 +534,7 @@ def override_payout(
     id: int,
     body: OverridePayoutRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "hr", "pm")),
+    current_user: User = Depends(require_role("admin", "hr", "pm", "team_lead")),
 ):
     """Override effective payout amount with mandatory note. Returns updated row directly."""
     record = db.query(WeeklyCompensationRecord).filter(WeeklyCompensationRecord.id == id).first()

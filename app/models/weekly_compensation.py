@@ -41,7 +41,9 @@ class WeeklyCompensationRecord(Base):
 
     @property
     def effective_payout(self) -> float:
-        return float(self.override_payout if self.override_payout is not None else self.calculated_payout)
+        if self.override_payout is not None:
+            return float(self.override_payout)
+        return float(min(self.calculated_payout or 0.0, 1000.0))
 
     # In-Row Audit Trail (Zero join overhead for tooltip rendering)
     edit_note = Column(Text, nullable=True)

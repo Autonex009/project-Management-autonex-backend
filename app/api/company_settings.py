@@ -346,6 +346,13 @@ def upsert_setting(
         except Exception as exc:
             logger.warning(f"Failed to invalidate checkin IP cache: {exc}")
 
+    if key == "weekly_comp_hourly_rate":
+        try:
+            from app.services.weekly_compensation_service import invalidate_weekly_comp_rate_cache
+            invalidate_weekly_comp_rate_cache()
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate weekly comp rate cache: {exc}")
+
     return setting
 
 
@@ -389,5 +396,12 @@ def delete_setting(
             invalidate_checkin_ip_cache()
         except Exception as exc:
             logger.warning(f"Failed to invalidate checkin IP cache: {exc}")
+
+    if key == "weekly_comp_hourly_rate":
+        try:
+            from app.services.weekly_compensation_service import invalidate_weekly_comp_rate_cache
+            invalidate_weekly_comp_rate_cache()
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate weekly comp rate cache: {exc}")
 
     return {"message": f"Setting '{key}' deleted successfully"}
