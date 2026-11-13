@@ -90,6 +90,9 @@ REFRESH_MATRIX_MINUTE = int(os.getenv("REFRESH_MATRIX_MINUTE", "5"))
 CREATE_PARTITION_HOUR = int(os.getenv("CREATE_PARTITION_HOUR", "2"))
 CREATE_PARTITION_MINUTE = int(os.getenv("CREATE_PARTITION_MINUTE", "0"))
 
+PURGE_TOKENS_HOUR = int(os.getenv("PURGE_TOKENS_HOUR", "3"))
+PURGE_TOKENS_MINUTE = int(os.getenv("PURGE_TOKENS_MINUTE", "0"))
+
 # Hiring sync interval
 HIRING_SYNC_INTERVAL_HOURS = int(os.getenv("HIRING_SYNC_INTERVAL_HOURS", "12"))
 
@@ -422,6 +425,34 @@ def _create_next_month_partition() -> None:
         logger.info("[scheduler] Created next month partition: %s", table_name)
     except Exception as exc:
         logger.error("[scheduler] Failed to create partition: %s", exc)
+    finally:
+        db.close()
+
+
+def _scheduled_purge_expired_tokens() -> None:
+    """Daily database maintenance: Purge dead/expired refresh tokens.
+
+    Adheres strictly to the 20ms connection pool budget:
+    - Zero external network I/O or sleeps while holding the session.
+    - Leverages idx_refresh_tokens_expires_at for sub-5ms index range scan.
+    - Strict try...finally guarantees immediate connection release back to SQLAlchemy pool.
+    """
+    from app.models.user import RefreshToken
+
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        deleted_count = (
+            db.query(RefreshToken)
+            .filter(RefreshToken.expires_at < now)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        if deleted_count > 0:
+            logger.info("[scheduler] Token maintenance: purged %d expired refresh token(s)", deleted_count)
+    except Exception as exc:
+        db.rollback()
+        logger.error("[scheduler] Token maintenance failed: %s", exc)
     finally:
         db.close()
 
@@ -926,6 +957,18 @@ def start_scheduler() -> None:
         hour=CREATE_PARTITION_HOUR,
         minute=CREATE_PARTITION_MINUTE,
         id="create_checkins_partition",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Daily dead refresh tokens purge - 03:00 AM IST (system dead zone)
+    _scheduler.add_job(
+        _scheduled_purge_expired_tokens,
+        trigger="cron",
+        hour=PURGE_TOKENS_HOUR,
+        minute=PURGE_TOKENS_MINUTE,
+        id="purge_expired_refresh_tokens",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

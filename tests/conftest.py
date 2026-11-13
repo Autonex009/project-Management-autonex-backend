@@ -18,3 +18,10 @@ def compile_jsonb_sqlite(type_, compiler, **kw):
 # Override autoincrement flag on DailyCheckIn.id for SQLite test sessions
 from app.models.daily_checkin import DailyCheckIn
 DailyCheckIn.__table__.c.id.autoincrement = "auto"
+
+# Preload models to satisfy ForeignKey references when create_all runs in test fixtures
+import app.models.payroll  # noqa: F401
+import app.models.parent_project  # noqa: F401
+import app.models.sub_project  # noqa: F401
+import app.models.project  # noqa: F401
+import app.models.weekly_compensation  # noqa: F401
