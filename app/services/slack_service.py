@@ -149,6 +149,67 @@ def try_lookup_user_avatar_by_email(email: str) -> str | None:
         return None
 
 
+def get_slack_user_info(slack_user_id: str) -> dict | None:
+    """Fetch full user details (profile, email, avatar, etc.) from Slack solely by Slack user ID.
+    
+    This completely bypasses email lookups and avoids failures when the portal email
+    differs from the user's Slack account email.
+    """
+    if not slack_user_id:
+        return None
+    try:
+        response = _slack_request("/users.info", {"user": slack_user_id}, method="GET")
+        if not response.get("ok"):
+            error_code = response.get("error")
+            logger.warning("Slack user info lookup failed for user_id %s: %s", slack_user_id, error_code)
+            return None
+        return response.get("user")
+    except Exception as exc:
+        logger.warning("Slack user info lookup skipped for user_id %s: %s", slack_user_id, exc)
+        return None
+
+
+def lookup_user_avatar_by_user_id(slack_user_id: str) -> str | None:
+    """Return the best-resolution profile image URL for a Slack user, by Slack user ID."""
+    response = _slack_request("/users.info", {"user": slack_user_id}, method="GET")
+    if not response.get("ok"):
+        error_code = response.get("error")
+        if error_code in ("user_not_found", "users_not_found"):
+            logger.warning("Slack avatar lookup skipped for user_id %s: %s", slack_user_id, error_code)
+            return None
+        raise RuntimeError(f"Slack lookup failed: {error_code or 'unknown_error'}")
+
+    profile = response.get("user", {}).get("profile", {}) or {}
+    for key in ("image_original", "image_512", "image_192", "image_72", "image_48"):
+        url = profile.get(key)
+        if url:
+            return url
+    return None
+
+
+def try_lookup_user_avatar_by_user_id(slack_user_id: str) -> str | None:
+    try:
+        return lookup_user_avatar_by_user_id(slack_user_id)
+    except Exception as exc:
+        logger.warning("Slack avatar lookup skipped for user_id %s: %s", slack_user_id or "unknown", exc)
+        return None
+
+
+def try_lookup_employee_avatar(employee) -> str | None:
+    """Look up avatar by employee's slack_user_id first, falling back to email."""
+    slack_user_id = getattr(employee, "slack_user_id", None)
+    if slack_user_id:
+        avatar = try_lookup_user_avatar_by_user_id(slack_user_id)
+        if avatar:
+            return avatar
+
+    email = getattr(employee, "email", None)
+    if email:
+        return try_lookup_user_avatar_by_email(email)
+
+    return None
+
+
 def get_or_cache_employee_slack_user_id(db, employee) -> str | None:
     if getattr(employee, "slack_user_id", None):
         return employee.slack_user_id
