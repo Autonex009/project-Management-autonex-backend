@@ -5,7 +5,7 @@ import sys
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 os.environ["DATABASE_URL"] = "sqlite:///:memory:"
-os.environ["REDIS_URL"] = ""
+os.environ["REDIS_URL"] = "redis://localhost:6379"
 os.environ["JWT_SECRET_KEY"] = "test-secret-key-for-pytest"
 os.environ["OTP_SECRET_KEY"] = "test-otp-secret-key-for-pytest"
 
