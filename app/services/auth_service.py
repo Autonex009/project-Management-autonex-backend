@@ -264,22 +264,31 @@ def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
 
-    if token is None:
-        token = request.cookies.get("access_token")
+    payload = None
+    # 1. Primary: HttpOnly access_token cookie (used by web browser clients)
+    cookie_token = request.cookies.get("access_token")
+    if cookie_token:
+        try:
+            payload = decode_token(cookie_token)
+        except JWTError:
+            payload = None
 
-    if token is None:
+    # 2. Fallback: Authorization: Bearer header (used by Swagger UI, curl, scripts, tests)
+    if payload is None and token:
+        try:
+            payload = decode_token(token)
+        except JWTError:
+            payload = None
+
+    if payload is None:
         raise credentials_exception
 
-    # if is_token_blacklisted(token):
-    #     raise credentials_exception
-
+    sub = payload.get("sub")
+    if sub is None:
+        raise credentials_exception
     try:
-        payload = decode_token(token)
-        sub = payload.get("sub")
-        if sub is None:
-            raise credentials_exception
         user_id = int(sub)
-    except (JWTError, ValueError):
+    except ValueError:
         raise credentials_exception
 
     # 1. Tier 1: Check L1 RAM (< 0.001 ms)
