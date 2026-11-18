@@ -9,6 +9,7 @@ from typing import List, Optional
 from pydantic import BaseModel
 from app.services.project_scope import _as_int_set
 from app.services.project_cache import invalidate_my_projects_cache
+from app.constants.project_constants import ARCHIVED_STATUSES
 
 from app.db.database import get_db, SessionLocal
 from app.models.allocation import Allocation
@@ -255,8 +256,7 @@ def get_allocations_page(
     if auth_ids is not None:
         query = query.filter(Project.id.in_(auth_ids))
 
-    # Active vs Archived
-    ARCHIVED_STATUSES = {"completed", "on-hold", "cancelled"}
+    # Active vs Archived (using canonical ARCHIVED_STATUSES)
     view = (project_view or "active").strip().lower()
     if view == "archived":
         query = query.filter(func.lower(Project.project_status).in_(ARCHIVED_STATUSES))

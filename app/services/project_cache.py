@@ -326,7 +326,7 @@ def get_cached_projects_dropdown(db: Optional[Any] = None) -> list[dict]:
         from sqlalchemy import func
         from app.models.project import DailySheet as Project
 
-        ARCHIVED_STATUSES = {"completed", "on-hold", "cancelled"}
+        from app.constants.project_constants import ARCHIVED_STATUSES
         rows = (
             session.query(
                 Project.id,
