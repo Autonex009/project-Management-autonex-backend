@@ -42,7 +42,7 @@ from app.models.user import User
 from app.constants.leave_types import (
     is_non_working_day,
     normalize_leave_type,
-    get_annual_leave_quota,
+    get_leave_quota,
     ANNUAL_LEAVE_QUOTA,
     INTERN_MONTHLY_PAID_QUOTA,
     is_intern,
@@ -121,7 +121,13 @@ def _working_dates(start: date_type, end: date_type, year: int):
         d += timedelta(days=1)
 
 
-def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_until: date_type | None = None):
+def _classify_year_leaves(
+    leaves: list,
+    year: int,
+    intern: bool = False,
+    intern_until: date_type | None = None,
+    paid_quota_override: int | float | None = None,
+):
     """
     Apply the paid-leave entitlement to one employee's approved leaves for a calendar year.
 
@@ -183,7 +189,7 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
                 if is_intern_for_date and ltype == "casual_sick":
                     unpaid_dates[wd] = weight
                 else:
-                    quota = get_annual_leave_quota(ltype)
+                    quota = get_leave_quota(ltype, custom_paid_quota=paid_quota_override)
                     used[ltype] = used.get(ltype, 0.0) + weight
                     excess = used[ltype] - quota
                     if excess <= 0:
@@ -209,6 +215,8 @@ def _classify_year_leaves(leaves: list, year: int, intern: bool = False, intern_
 
         if intern and ltype == "casual_sick":
             quota = 0.0
+        elif ltype == "paid" and paid_quota_override is not None:
+            quota = float(paid_quota_override)
 
         used_days = used.get(ltype, 0.0)
         balances[ltype] = {
@@ -558,7 +566,21 @@ def preview_payroll(
         emp_is_intern = is_intern_or_contractor(emp.employee_type)
         # A promoted intern keeps the monthly rule for leave taken before the promotion.
         intern_until = emp.converted_to_fulltime_at.date() if emp.converted_to_fulltime_at else None
-        classification, balances = _classify_year_leaves(emp_year_leaves, year, emp_is_intern, intern_until)
+        emp_paid_quota = get_leave_quota(
+            "paid",
+            target_year=year,
+            employee_type=emp.employee_type,
+            converted_to_fulltime_at=emp.converted_to_fulltime_at,
+            date_of_joining=getattr(emp, "date_of_joining", None),
+            created_at=getattr(emp, "created_at", None),
+        )
+        classification, balances = _classify_year_leaves(
+            emp_year_leaves,
+            year,
+            emp_is_intern,
+            intern_until,
+            paid_quota_override=emp_paid_quota,
+        )
 
         # Interns' paid leave is monthly — report the balance for THIS month.
         if emp_is_intern and "paid" in balances:

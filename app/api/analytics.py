@@ -11,7 +11,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -68,7 +68,12 @@ def get_pm_team_summary(pm_id: int, db: Session = Depends(get_db)):
     }
 
 @router.get("/dashboard-kpis")
-def get_dashboard_kpis(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_dashboard_kpis(
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
     from app.models.employee import Employee
     from app.models.project import DailySheet
     from app.models.leave import Leave
@@ -76,8 +81,26 @@ def get_dashboard_kpis(db: Session = Depends(get_db), current_user: User = Depen
     from app.models.allocation import Allocation
     from datetime import date
     from sqlalchemy import func
+    import hashlib
 
+    today = date.today()
     allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
+
+    # === SMART PREFLIGHT ETAG CHECK (< 1-2ms) ===
+    # Check max updated_at across Leave, WFHRequest, and active Employee count
+    leave_meta = db.query(func.max(Leave.updated_at), func.count(Leave.id)).first()
+    wfh_meta = db.query(func.max(WFHRequest.updated_at), func.count(WFHRequest.id)).first()
+    emp_meta = db.query(func.count(Employee.id)).filter(Employee.status != "archived").scalar() or 0
+    role_scope = f"{current_user.id}:{','.join(map(str, allowed_ids)) if allowed_ids else 'all'}"
+
+    etag_raw = f"{role_scope}:{today}:{leave_meta}:{wfh_meta}:{emp_meta}"
+    current_etag = f'"{hashlib.md5(etag_raw.encode()).hexdigest()}"'
+
+    if request.headers.get("if-none-match") == current_etag:
+        return Response(status_code=304)
+
+    response.headers["ETag"] = current_etag
+    response.headers["Cache-Control"] = "no-cache"
     
     pm_emp_ids = None
     if allowed_ids is not None:

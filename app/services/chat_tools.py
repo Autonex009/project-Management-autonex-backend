@@ -32,6 +32,7 @@ from app.constants.leave_types import (
     normalize_leave_type,
     get_leave_type_label,
     get_working_days_count,
+    get_leave_quota,
 )
 from app.services.knowledge_service import search_policy as _search_policy
 
@@ -89,7 +90,14 @@ def get_leave_balance(employee_id: int, db: Session) -> dict:
     # Build balance
     balance = {}
     for leave_type, quota in ANNUAL_LEAVE_QUOTA.items():
-        effective_quota = quota
+        effective_quota = get_leave_quota(
+            leave_type,
+            target_year=current_year,
+            employee_type=employee.employee_type,
+            converted_to_fulltime_at=getattr(employee, "converted_to_fulltime_at", None),
+            date_of_joining=getattr(employee, "date_of_joining", None),
+            created_at=getattr(employee, "created_at", None),
+        )
         if employee_is_intern and leave_type == "paid":
             # Interns get 1 paid leave/month
             effective_quota = INTERN_MONTHLY_PAID_QUOTA

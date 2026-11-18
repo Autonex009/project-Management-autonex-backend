@@ -33,6 +33,7 @@ class User(Base):
     work_description = Column(Text, nullable=True)
     password_reset_token_hash = Column(String(64), nullable=True)
     password_reset_expires_at = Column(TIMESTAMP, nullable=True)
+    token_version = Column(Integer, default=1, server_default="1", nullable=False)
     
     created_at = Column(TIMESTAMP, server_default=func.now())
     updated_at = Column(
@@ -48,5 +49,5 @@ class RefreshToken(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     token = Column(String(255), unique=True, nullable=False, index=True)
-    expires_at = Column(TIMESTAMP, nullable=False)
+    expires_at = Column(TIMESTAMP, nullable=False, index=True)
     created_at = Column(TIMESTAMP, server_default=func.now())

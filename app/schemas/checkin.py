@@ -195,6 +195,8 @@ class LeaveBreakdown(BaseModel):
     pending: int = 0
     approved_checked_in: int = 0
     approved_checked_in_names: List[str] = []
+    pending_checked_in: int = 0
+    pending_checked_in_names: List[str] = []
 
 
 class AttendanceOverview(BaseModel):

@@ -334,6 +334,7 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
 
     token = create_access_token({
         "sub": str(user.id),
+        "token_version": getattr(user, "token_version", 1),
         "role": response_user.role,
         "designation": response_user.designation,
         "employee_id": user.employee_id,
@@ -538,23 +539,42 @@ def reset_password(
 
 @router.post("/logout")
 def logout(request: Request, db: Session = Depends(get_db)):
-    """Invalidate current tokens."""
-    # Delete refresh token from DB if present
-    refresh_token = request.cookies.get("refresh_token")
-    if refresh_token:
-        verify_and_delete_refresh_token(refresh_token, db)
-
+    """Invalidate current tokens immediately on server and client."""
+    # 1. Bump token_version in DB to instantly invalidate all active JWTs for this user
     access_token = request.cookies.get("access_token")
+    if not access_token:
+        auth_header = request.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            access_token = auth_header.split(" ")[1]
+
     if access_token:
         try:
-            payload = decode_token(access_token)
+            from jose import jwt
+            from app.services.auth_service import SECRET_KEY, ALGORITHM, invalidate_user_auth_cache
+            # Decode without verifying expiration so logout succeeds even if token just expired
+            payload = jwt.decode(access_token, SECRET_KEY, algorithms=[ALGORITHM], options={"verify_exp": False})
             sub = payload.get("sub")
             if sub:
-                from app.services.auth_service import invalidate_user_auth_cache
-                invalidate_user_auth_cache(int(sub))
-        except Exception:
-            pass
-        
+                user_id = int(sub)
+                db.query(User).filter(User.id == user_id).update(
+                    {User.token_version: User.token_version + 1},
+                    synchronize_session=False,
+                )
+                db.commit()
+                invalidate_user_auth_cache(user_id)
+        except Exception as exc:
+            logger.warning("[logout] Failed to bump token_version: %s", exc)
+
+    # 2. Delete refresh token from DB if present
+    refresh_token = request.cookies.get("refresh_token")
+    if refresh_token:
+        import hashlib
+        token_hash = hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
+        db.query(RefreshToken).filter(
+            (RefreshToken.token == token_hash) | (RefreshToken.token == refresh_token)
+        ).delete(synchronize_session=False)
+        db.commit()
+
     secure_flag, samesite_policy = _get_cookie_settings()
     response = JSONResponse(content={"message": "Logged out successfully"})
     response.delete_cookie("access_token", path="/", secure=secure_flag, samesite=samesite_policy, httponly=True)
@@ -579,11 +599,12 @@ def refresh_access_token(request: Request, db: Session = Depends(get_db)):
     
     access_token = create_access_token({
         "sub": str(user.id),
+        "token_version": getattr(user, "token_version", 1),
         "role": response_user.role,
         "designation": response_user.designation,
         "employee_id": user.employee_id,
+        "must_change_password": bool(user.must_change_password),
     })
-    new_refresh_token = create_refresh_token(user.id, db)
     
     response = JSONResponse(content={
         "token": access_token,
@@ -600,15 +621,8 @@ def refresh_access_token(request: Request, db: Session = Depends(get_db)):
         max_age=15 * 60,  # 15 mins
         path="/",
     )
-    response.set_cookie(
-        key="refresh_token",
-        value=new_refresh_token,
-        httponly=True,
-        secure=secure_flag,
-        samesite=samesite_policy,
-        max_age=7 * 24 * 60 * 60,  # 7 days
-        path="/",
-    )
+    # Note: refresh_token is NOT deleted or re-created, preserving its 7-day lifespan
+    # and eliminating multi-tab race conditions.
     return response
 
 

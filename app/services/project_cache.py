@@ -17,12 +17,13 @@ logger = logging.getLogger(__name__)
 class InMemoryTTLCache:
     """Thread-safe in-memory cache with configurable TTL and max-size eviction.
     Protects the 14-connection Supabase pool by serving burst views from RAM.
+    Supports both instance-level and optional per-item TTL overrides.
     """
 
     def __init__(self, ttl_seconds: float = 60.0, max_size: int = 1000) -> None:
         self.ttl = ttl_seconds
         self.max_size = max_size
-        self._cache: dict[Any, tuple[float, Any]] = {}
+        self._cache: dict[Any, tuple] = {}
         self._lock = threading.Lock()
 
     def get(self, key: Any) -> Optional[Any]:
@@ -30,27 +31,34 @@ class InMemoryTTLCache:
         now = time.time()
         with self._lock:
             if key in self._cache:
-                timestamp, value = self._cache[key]
-                if now - timestamp < self.ttl:
-                    return value
+                entry = self._cache[key]
+                ts = entry[0]
+                val = entry[1]
+                effective_ttl = entry[2] if len(entry) > 2 else self.ttl
+                if now - ts < effective_ttl:
+                    return val
                 # Expired - remove immediately
                 del self._cache[key]
         return None
 
-    def set(self, key: Any, value: Any) -> None:
+    def set(self, key: Any, value: Any, ttl: Optional[float] = None) -> None:
         """Store item with current timestamp, self-pruning expired or excess entries."""
         now = time.time()
+        item_ttl = ttl if ttl is not None else self.ttl
         with self._lock:
             # Self-prune expired keys if cache reaches or exceeds max_size
             if len(self._cache) >= self.max_size:
-                expired = [k for k, (ts, _) in self._cache.items() if now - ts >= self.ttl]
+                expired = [
+                    k for k, entry in self._cache.items()
+                    if now - entry[0] >= (entry[2] if len(entry) > 2 else self.ttl)
+                ]
                 for k in expired:
                     del self._cache[k]
                 # If still over capacity after pruning expired, pop oldest (FIFO)
                 while len(self._cache) >= self.max_size:
                     self._cache.pop(next(iter(self._cache)), None)
 
-            self._cache[key] = (now, value)
+            self._cache[key] = (now, value, item_ttl)
 
     def invalidate(self, key: Optional[Any] = None) -> None:
         """Invalidate cache for a specific key, or clear all entries if key is None."""
@@ -75,36 +83,50 @@ allocation_l1_cache = InMemoryTTLCache(ttl_seconds=60.0, max_size=1000)
 employee_profile_l1_cache = InMemoryTTLCache(ttl_seconds=300.0, max_size=1000)
 
 _redis_client: Optional[Any] = None
-_redis_initialized: bool = False
+_last_redis_try: float = 0.0
 _redis_lock = threading.Lock()
 
 
 def get_redis_client() -> Optional[Any]:
-    """Thread-safe lazy initialization of Redis client with circuit breaker fallback."""
-    global _redis_client, _redis_initialized
-    if _redis_initialized:
+    """Thread-safe lazy initialization of Redis client with resilient 15s retry cooldown."""
+    global _redis_client, _last_redis_try
+    if _redis_client is not None:
         return _redis_client
+
+    now = time.time()
+    # Retry every 15 seconds if previously failed, rather than giving up permanently
+    if now - _last_redis_try < 15.0:
+        return None
+
     with _redis_lock:
-        if _redis_initialized:
+        if _redis_client is not None:
             return _redis_client
+        _last_redis_try = now
+
         import os
         from dotenv import load_dotenv
         load_dotenv()
         redis_url = os.getenv("REDIS_URL")
-        if redis_url:
-            try:
-                import redis
-                client = redis.from_url(redis_url, socket_timeout=2.0, decode_responses=True)
-                client.ping()
-                _redis_client = client
-                logger.info("project_cache: Connected to Redis L2 layer successfully.")
-            except Exception as exc:
-                logger.warning("project_cache: Redis connection failed (%s), running in L1 RAM mode only.", exc)
-                _redis_client = None
-        else:
+        if not redis_url:
+            return None
+
+        try:
+            import redis
+            client = redis.from_url(
+                redis_url,
+                socket_timeout=0.5,            # 500ms is plenty for Railway internal mesh (<1ms)
+                socket_connect_timeout=0.5,
+                decode_responses=True,
+                health_check_interval=30,       # Proactively drops dead sockets
+            )
+            client.ping()
+            _redis_client = client
+            logger.info("project_cache: Connected to Redis L2 layer successfully.")
+            return _redis_client
+        except Exception as exc:
+            logger.warning("project_cache: Redis connection failed (%s), will retry in 15s.", exc)
             _redis_client = None
-        _redis_initialized = True
-        return _redis_client
+            return None
 
 
 def get_project_names_batch(db: Any, project_ids: list[int | str]) -> dict[int, str]:
@@ -304,7 +326,7 @@ def get_cached_projects_dropdown(db: Optional[Any] = None) -> list[dict]:
         from sqlalchemy import func
         from app.models.project import DailySheet as Project
 
-        ARCHIVED_STATUSES = {"completed", "on-hold", "cancelled"}
+        from app.constants.project_constants import ARCHIVED_STATUSES
         rows = (
             session.query(
                 Project.id,

@@ -15,7 +15,7 @@ from app.worker_metrics import instrumented, start_metrics_server, watch_queue_d
 logger = logging.getLogger(__name__)
 
 # Railway provides the Redis connection string via the REDIS_URL environment variable
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+REDIS_URL = os.getenv("REDIS_URL") or "redis://localhost:6379"
 
 def perform_sync(start: Optional[datetime], end: Optional[datetime]):
     """Synchronous wrapper function to handle the SQLAlchemy session."""

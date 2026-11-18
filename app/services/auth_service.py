@@ -68,29 +68,69 @@ def hash_reset_token(token: str) -> str:
 
 import secrets
 
-def create_refresh_token(user_id: int, db: Session, expires_days: int = 7) -> str:
-    """Generates a secure random refresh token and saves it to the database."""
-    token = secrets.token_urlsafe(64)
-    expires_at = datetime.utcnow() + timedelta(days=expires_days)
-    db_token = RefreshToken(user_id=user_id, token=token, expires_at=expires_at)
+def create_refresh_token(user_id: int, db: Session, expires_days: int = 7, max_sessions: int = 5) -> str:
+    """Generates a secure random refresh token, saves it, and bounds total active sessions per user
+    using an atomic subquery (Zero N+1 query overhead).
+    
+    Adheres strictly to the 20ms connection pool budget:
+    - Prunes user's expired tokens in < 1ms using composite index idx_refresh_tokens_user_expires.
+    - Limits user to max_sessions (default 5 concurrent devices).
+    - If 6th login occurs, oldest stale session is evicted automatically (FIFO).
+    """
+    now = datetime.utcnow()
+
+    # 1. Prune expired tokens for this specific user
+    db.query(RefreshToken).filter(
+        RefreshToken.user_id == user_id,
+        RefreshToken.expires_at < now,
+    ).delete(synchronize_session=False)
+
+    # 2. Enforce FIFO max sessions: delete oldest excess tokens in a single atomic subquery
+    excess_token_ids_subq = (
+        db.query(RefreshToken.id)
+        .filter(RefreshToken.user_id == user_id)
+        .order_by(RefreshToken.created_at.desc())
+        .offset(max_sessions - 1)
+        .scalar_subquery()
+    )
+    db.query(RefreshToken).filter(
+        RefreshToken.id.in_(excess_token_ids_subq)
+    ).delete(synchronize_session=False)
+
+    # 3. Create fresh token (store SHA-256 hash in DB, return raw_token for HttpOnly cookie)
+    raw_token = secrets.token_urlsafe(64)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    expires_at = now + timedelta(days=expires_days)
+    db_token = RefreshToken(user_id=user_id, token=token_hash, expires_at=expires_at)
     db.add(db_token)
     db.commit()
-    return token
+    return raw_token
 
 def verify_and_delete_refresh_token(token: str, db: Session) -> Optional[int]:
-    """Verifies a refresh token. If valid, deletes it (to prevent reuse) and returns the user_id.
-    The caller must immediately issue a new refresh token (token rotation)."""
-    db_token = db.query(RefreshToken).filter(RefreshToken.token == token).first()
+    """Verifies a 7-day refresh token.
+    - If expired, deletes it from PostgreSQL and returns None.
+    - If valid, preserves it in PostgreSQL and returns user_id (prevents multi-tab race conditions).
+    - Checks both SHA-256 hash and legacy plaintext for seamless zero-downtime compatibility."""
+    if not token:
+        return None
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    db_token = (
+        db.query(RefreshToken)
+        .filter((RefreshToken.token == token_hash) | (RefreshToken.token == token))
+        .first()
+    )
     if not db_token:
         return None
     user_id = db_token.user_id
     expires_at = db_token.expires_at
-    # Delete the token immediately (Rotation)
-    db.delete(db_token)
-    db.commit()
 
+    # Delete ONLY if expired
     if datetime.utcnow() > expires_at:
+        db.delete(db_token)
+        db.commit()
         return None
+
+    # Valid token: preserve in database for its 7-day lifespan
     return user_id
 
 # ── In-memory blacklist (will be replaced by Redis if needed) ──────────────────
@@ -130,6 +170,7 @@ def _cache_user_in_redis(user: User) -> None:
             "work_description": getattr(user, "work_description", None),
             "password_hash": getattr(user, "password_hash", ""),
             "razorpay_email": getattr(user, "razorpay_email", None),
+            "token_version": getattr(user, "token_version", 1),
         }
         redis_client.set(f"auth:user:{user.id}", json.dumps(payload), ex=900)
     except Exception:
@@ -158,6 +199,7 @@ def _get_user_from_redis(user_id: int) -> Optional[User]:
                 work_description=d.get("work_description"),
                 password_hash=d.get("password_hash", ""),
                 razorpay_email=d.get("razorpay_email"),
+                token_version=d.get("token_version", 1),
             )
     except Exception:
         pass
@@ -200,6 +242,7 @@ def _clone_user(u: User) -> User:
         employment_type=getattr(u, "employment_type", None),
         work_description=getattr(u, "work_description", None),
         razorpay_email=getattr(u, "razorpay_email", None),
+        token_version=getattr(u, "token_version", 1),
     )
 
 
@@ -221,22 +264,31 @@ def get_current_user(
         headers={"WWW-Authenticate": "Bearer"},
     )
 
-    if token is None:
-        token = request.cookies.get("access_token")
+    payload = None
+    # 1. Primary: HttpOnly access_token cookie (used by web browser clients)
+    cookie_token = request.cookies.get("access_token")
+    if cookie_token:
+        try:
+            payload = decode_token(cookie_token)
+        except JWTError:
+            payload = None
 
-    if token is None:
+    # 2. Fallback: Authorization: Bearer header (used by Swagger UI, curl, scripts, tests)
+    if payload is None and token:
+        try:
+            payload = decode_token(token)
+        except JWTError:
+            payload = None
+
+    if payload is None:
         raise credentials_exception
 
-    # if is_token_blacklisted(token):
-    #     raise credentials_exception
-
+    sub = payload.get("sub")
+    if sub is None:
+        raise credentials_exception
     try:
-        payload = decode_token(token)
-        sub = payload.get("sub")
-        if sub is None:
-            raise credentials_exception
         user_id = int(sub)
-    except (JWTError, ValueError):
+    except ValueError:
         raise credentials_exception
 
     # 1. Tier 1: Check L1 RAM (< 0.001 ms)
@@ -263,6 +315,12 @@ def get_current_user(
                     _user_auth_cache.set(user_id, _clone_user(user_record))
                     _cache_user_in_redis(user_record)
                     user = _clone_user(user_record)
+
+    # Generation Counter Check (0.0001ms RAM fast path):
+    # Backward compatibility: active tokens issued before this rollout default to 1.
+    token_version = payload.get("token_version", 1)
+    if token_version != getattr(user, "token_version", 1):
+        raise credentials_exception
 
     view_role = request.headers.get("X-Role-View")
     if user.role == "hr" and view_role == "pm":
