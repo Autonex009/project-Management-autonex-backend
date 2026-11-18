@@ -379,7 +379,7 @@ def try_send_leave_applied_message(**kwargs) -> bool:
 
 
 def get_leave_balances_text(db, employee) -> str:
-    from app.constants.leave_types import is_intern_or_contractor, normalize_leave_type, get_working_days_count
+    from app.constants.leave_types import is_intern_or_contractor, normalize_leave_type, get_working_days_count, get_leave_quota
     from app.models.leave import Leave
     from datetime import date, timedelta
     
@@ -435,13 +435,24 @@ def get_leave_balances_text(db, employee) -> str:
             f"• *Floater Leave:* 2 / 2 days left ({used_floater} used in {current_year})"
         )
     else:
-        paid_left = max(0, 12 - used_paid)
-        cl_left = max(0, 6 - used_cl)
+        paid_quota = get_leave_quota(
+            "paid",
+            target_year=current_year,
+            employee_type=employee.employee_type,
+            converted_to_fulltime_at=getattr(employee, "converted_to_fulltime_at", None),
+            date_of_joining=getattr(employee, "date_of_joining", None),
+            created_at=getattr(employee, "created_at", None),
+        )
+        paid_left = max(0, paid_quota - used_paid)
+        paid_left_str = int(paid_left) if isinstance(paid_left, float) and paid_left.is_integer() else f"{paid_left:g}"
+        used_paid_str = int(used_paid) if isinstance(used_paid, float) and used_paid.is_integer() else f"{used_paid:g}"
         floater_left = max(0, 2 - used_floater)
+        floater_left_str = int(floater_left) if isinstance(floater_left, float) and floater_left.is_integer() else f"{floater_left:g}"
+        used_floater_str = int(used_floater) if isinstance(used_floater, float) and used_floater.is_integer() else f"{used_floater:g}"
         return (
-            f"• *Paid Leave:* {paid_left} / 12 days left ({used_paid} used in {current_year})\n"
+            f"• *Paid Leave:* {paid_left_str} / {paid_quota} days left ({used_paid_str} used in {current_year})\n"
             # f"• *Casual/Sick Leave:* {cl_left} / 6 days left ({used_cl} used in {current_year})\n"
-            f"• *Floater Leave:* {floater_left} / 2 days left ({used_floater} used in {current_year})"
+            f"• *Floater Leave:* {floater_left_str} / 2 days left ({used_floater_str} used in {current_year})"
         )
 
 def get_wfh_balances_text(db, employee) -> str:

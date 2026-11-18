@@ -16,7 +16,7 @@ from app.constants.leave_types import (
     RAZORPAY_LEAVE_TYPE_IDS, get_leave_type_label, normalize_leave_type,
     is_valid_floater_date, get_floater_dates_for_year,
     is_weekend, is_fixed_holiday, get_fixed_holidays_for_year,
-    is_intern_or_contractor, get_working_days_count,
+    is_intern_or_contractor, get_working_days_count, get_leave_quota,
 )
 from app.models.allocation import Allocation
 from app.models.employee import Employee
@@ -134,7 +134,9 @@ def get_employee_leave_balances(
     emp = db.query(
         Employee.id,
         Employee.employee_type,
-        Employee.converted_to_fulltime_at
+        Employee.converted_to_fulltime_at,
+        Employee.date_of_joining,
+        Employee.created_at,
     ).filter(Employee.id == target_emp_id).first()
 
     if not emp:
@@ -157,7 +159,22 @@ def get_employee_leave_balances(
     emp_is_intern = is_intern_or_contractor(emp.employee_type)
     intern_until = emp.converted_to_fulltime_at.date() if emp.converted_to_fulltime_at else None
 
-    classification, balances = _classify_year_leaves(leaves, target_year, emp_is_intern, intern_until)
+    emp_paid_quota = get_leave_quota(
+        "paid",
+        target_year=target_year,
+        employee_type=emp.employee_type,
+        converted_to_fulltime_at=emp.converted_to_fulltime_at,
+        date_of_joining=emp.date_of_joining,
+        created_at=emp.created_at,
+    )
+
+    classification, balances = _classify_year_leaves(
+        leaves,
+        target_year,
+        emp_is_intern,
+        intern_until,
+        paid_quota_override=emp_paid_quota,
+    )
 
     if emp_is_intern and "paid" in balances:
         month_start = date_type(target_year, target_month, 1)
