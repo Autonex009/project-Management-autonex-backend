@@ -27,6 +27,12 @@ from app.schemas.project import (
     ProjectCheckinStats,
     ProjectGuidelineSummary,
 )
+from app.constants.project_constants import (
+    TEAM_LEAD_ROLE_TAG,
+    is_project_archived,
+    is_project_active,
+    is_project_development,
+)
 
 
 def normalize_project_payload(data: dict, db: Session | None = None) -> dict:
@@ -1144,17 +1150,15 @@ def _get_filtered_enriched_projects(
 
         # Status and project_view
         status_val = (p.project_status or "active").lower().strip()
-        archived_statuses = ["completed", "on-hold", "cancelled"]
-        is_archived = status_val in archived_statuses
+        is_archived = is_project_archived(status_val)
+        is_dev = is_project_development(p.project_types)
 
-        types = p.project_types or {}
-        is_dev = bool(types and "Development" in types)
-
-        if project_view == "development":
-            if not is_dev:
+        # Tab routing: Archived has strict precedence over Development type
+        if project_view == "archived":
+            if not is_archived:
                 continue
-        elif project_view == "archived":
-            if is_dev or not is_archived:
+        elif project_view == "development":
+            if not is_dev or is_archived:
                 continue
         elif project_view in ("active", "active_projects"):
             if is_dev or is_archived:
@@ -1225,20 +1229,25 @@ def list_projects_paginated(
 
     # Enrich ONLY the visible projects for full payload response
     if is_dashboard:
+        enriched = enrich_projects_bulk(db, paginated_projects)
         items = [{
-            "id": p.id,
-            "name": p.name,
-            "client": p.client,
-            "sentiment": p.sentiment,
-            "encord_project_hash": p.encord_project_hash,
-            "autonex_annotators": p.autonex_annotators,
-            "autonex_reviewers": p.autonex_reviewers,
-            "project_status": p.project_status,
-            "required_manpower": p.required_manpower,
-            "allocated_employees": p.allocated_employees,
-            "end_date": p.end_date,
-            "is_at_risk": (p.allocated_employees or 0) < (p.required_manpower or 0)
-        } for p in paginated_projects]
+            "id": p.get("id"),
+            "name": p.get("name"),
+            "client": p.get("client"),
+            "sentiment": p.get("sentiment"),
+            "encord_project_hash": p.get("encord_project_hash"),
+            "autonex_annotators": p.get("autonex_annotators"),
+            "autonex_reviewers": p.get("autonex_reviewers"),
+            "project_status": p.get("project_status"),
+            "required_manpower": p.get("required_manpower"),
+            "allocated_employees": p.get("allocated_employees"),
+            "end_date": p.get("end_date"),
+            "is_at_risk": (p.get("allocated_employees") or 0) < (p.get("required_manpower") or 0),
+            "pm_names": p.get("pm_names") or [],
+            "team_lead_names": p.get("team_lead_names") or [],
+            "pm_ids": p.get("pm_ids") or [],
+            "team_lead_ids": p.get("team_lead_ids") or [],
+        } for p in enriched]
     else:
         items = enrich_projects_bulk(db, paginated_projects)
 
@@ -1261,6 +1270,8 @@ def get_projects_kpi(
     metrics = {
         "totalProjects": len(filtered),
         "activeProjects": 0,
+        "standardActiveProjects": 0,
+        "devActiveProjects": 0,
         "overburdenedProjects": 0,
         "balancedProjects": 0,
         "onHoldProjects": 0,
@@ -1278,28 +1289,29 @@ def get_projects_kpi(
 
     for p in filtered:
         status_val = (p.project_status or "active").lower().strip()
-        archived_statuses = ["completed", "on-hold", "cancelled"]
-        is_archived = status_val in archived_statuses
+        is_archived = is_project_archived(status_val)
+        is_dev = is_project_development(p.project_types)
 
-        types = p.project_types or {}
-        is_dev = bool(types and "Development" in types)
-
-        # Tab counts
-        if is_dev:
-            tab_counts["development"] += 1
-        elif is_archived:
+        # Tab counts - Archive check takes precedence over development type
+        if is_archived:
             tab_counts["archived"] += 1
+        elif is_dev:
+            tab_counts["development"] += 1
         else:
             tab_counts["active"] += 1
 
-        # Metrics
-        if not is_archived and not is_dev:
+        # Metrics - activeProjects counts ALL active projects (both standard and dev)
+        if not is_archived:
             metrics["activeProjects"] += 1
-            active_for_cap.append(p)
+            if is_dev:
+                metrics["devActiveProjects"] += 1
+            else:
+                metrics["standardActiveProjects"] += 1
+                active_for_cap.append(p)
 
         if status_val == "completed":
             metrics["completedProjects"] += 1
-        elif status_val == "on-hold":
+        elif status_val in ("on-hold", "on_hold"):
             metrics["onHoldProjects"] += 1
         elif status_val == "cancelled":
             metrics["cancelledProjects"] += 1
@@ -1343,20 +1355,44 @@ def update_project(
     old_status = project.project_status
     new_status = update_data.get('project_status', old_status)
 
-    if old_status != "archived" and new_status == "archived":
-        db.query(Allocation).filter(
+    old_is_archived = is_project_archived(old_status)
+    new_is_archived = is_project_archived(new_status)
+    released_allocations = 0
+
+    # ── Case A: Project transitioning from ACTIVE to ARCHIVED ──
+    if not old_is_archived and new_is_archived:
+        # Collect PM IDs to PROTECT them from deallocation
+        protected_leader_ids = set()
+        for emp_id in (project.assigned_employee_ids or []):
+            try:
+                protected_leader_ids.add(int(emp_id))
+            except (TypeError, ValueError):
+                continue
+
+        # Fetch active allocations for this project
+        active_allocs = db.query(Allocation).filter(
             Allocation.sub_project_id == project.id,
             Allocation.is_active == True
-        ).update({
-            "is_active": False,
-            "deactivated_at": func.now(),
-            "deactivated_reason": "project_archived"
-        }, synchronize_session=False)
-    elif old_status == "archived" and new_status != "archived":
+        ).all()
+
+        for alloc in active_allocs:
+            is_pm = alloc.employee_id in protected_leader_ids
+            is_tl = bool(alloc.role_tags and TEAM_LEAD_ROLE_TAG in alloc.role_tags)
+
+            # Protect PM and Team Lead; deallocate workers/trainees
+            if not is_pm and not is_tl:
+                alloc.is_active = False
+                alloc.deactivated_at = func.now()
+                alloc.deactivated_reason = f"project_{new_status}"
+                released_allocations += 1
+
+    # ── Case B: Project transitioning from ARCHIVED back to ACTIVE (Restore) ──
+    elif old_is_archived and not new_is_archived:
+        # Reactivate allocations that were paused specifically due to project archival
         db.query(Allocation).filter(
             Allocation.sub_project_id == project.id,
             Allocation.is_active == False,
-            Allocation.deactivated_reason == "project_archived"
+            Allocation.deactivated_reason.like("project_%")
         ).update({
             "is_active": True,
             "deactivated_at": None,
@@ -1422,15 +1458,8 @@ def update_project(
             ).count()
         )
 
-    # Auto-release: when project is completed, delete all allocations
-    released_allocations = 0
-    if new_status == 'completed' and old_status != 'completed':
-        released_allocations = db.query(Allocation).filter(
-            Allocation.sub_project_id == project_id
-        ).count()
-        db.query(Allocation).filter(Allocation.sub_project_id == project_id).delete()
-        project.allocated_employees = 0
-    elif (old_status != "archived" and new_status == "archived") or (old_status == "archived" and new_status != "archived"):
+    # Update allocated_employees headcount when transitioning between active & archived
+    if old_is_archived != new_is_archived:
         project.allocated_employees = (
             db.query(Allocation).filter(
                 Allocation.sub_project_id == project.id,
@@ -1484,8 +1513,8 @@ def update_project(
                 f"Updated project {project.name} — "
                 + ", ".join(d["field"] for d in details[:4])
                 + (
-                    f"; completing it released {released_allocations} allocation"
-                    f"{'s' if released_allocations != 1 else ''}"
+                    f"; archiving released {released_allocations} worker allocation"
+                    f"{'s' if released_allocations != 1 else ''} (leaders retained)"
                     if released_allocations
                     else ""
                 )
@@ -1520,7 +1549,7 @@ def delete_project(
     project_id: int,
     http_request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(require_role("admin", "pm")),
+    current_user: User = Depends(require_role("admin")),
 ):
     project = db.query(Project).filter(Project.id == project_id).first()
 
@@ -1530,6 +1559,14 @@ def delete_project(
     project_scope.require_project_scope(
         db, current_user, project, action="delete this project"
     )
+
+    # Safety Guard: Only empty draft projects with zero allocations can be deleted.
+    has_allocations = db.query(Allocation).filter(Allocation.sub_project_id == project_id).first()
+    if has_allocations:
+        raise HTTPException(
+            status_code=400,
+            detail="This project has historical allocations and cannot be deleted. Please Archive the project instead to preserve audit logs."
+        )
 
     # Counted before deletion — this endpoint quietly destroys allocations and
     # performance history alongside the project, and the entry should say how much.

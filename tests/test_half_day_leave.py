@@ -90,7 +90,7 @@ def client_and_db():
 def _seed_employee(db):
     emp = Employee(name="Karan Dev", email="karan@x.com", status="active",
                    employee_type="employee", base_salary_enc=encrypt_salary(30000.0),
-                   razorpay_email="karan@x.com")
+                   razorpay_email="karan@x.com", date_of_joining=date(2026, 1, 1))
     db.add(emp)
     db.commit()
     db.refresh(emp)

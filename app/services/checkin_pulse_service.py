@@ -9,6 +9,7 @@ Complies with skills3.md:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -32,13 +33,29 @@ logger = logging.getLogger(__name__)
 IST = ZoneInfo("Asia/Kolkata")
 TARGET_CHECKIN_MINUTES = 9 * 60 + 30  # 09:30 AM IST (570 minutes past midnight)
 
-# L1 In-Process RAM Cache (TTL 30s)
+# L1 RAM Caches with tab-specific natural TTLs
 _pulse_l1_cache = InMemoryTTLCache(ttl_seconds=30.0, max_size=500)
-_pulse_flight_lock = threading.Lock()
 
-PULSE_REDIS_VER_KEY_PREFIX = "cache:checkin_pulse:ver"
+# Per-key locks to prevent cache stampedes without blocking other tabs
+_flight_locks: dict[str, threading.Lock] = {}
+_flight_meta_lock = threading.Lock()
+
+
+def _get_key_lock(key: str) -> threading.Lock:
+    with _flight_meta_lock:
+        if key not in _flight_locks:
+            _flight_locks[key] = threading.Lock()
+        return _flight_locks[key]
+
+
+# Tab-specific TTL configuration
+TAB_TTLS = {
+    "overview": 15,      # 15s in RAM / 30s in Redis (fast live attendance)
+    "timing": 30,        # 30s in RAM / 60s in Redis
+    "attention": 300,    # 5 minutes in RAM / 10 minutes in Redis (heavy analytics)
+}
+
 PULSE_REDIS_KEY_PREFIX = "cache:checkin_pulse"
-L2_TTL_SECONDS = 30  # Align with frontend 30s auto-refresh interval
 
 
 def _get_ist_today() -> date:
@@ -150,27 +167,42 @@ def _format_minutes_to_time_str(minutes_val: Optional[float]) -> str:
     return f"{h:02d}:{m:02d}"
 
 
-def _get_pulse_version(redis_client: Optional[Any], date_str: str) -> int:
-    if not redis_client:
-        return 1
-    try:
-        val = redis_client.get(f"{PULSE_REDIS_VER_KEY_PREFIX}:{date_str}")
-        return int(val) if val else 1
-    except Exception:
-        return 1
+def _build_scope_key(scoped_employee_ids: Optional[Set[int]]) -> str:
+    """Generate a 100% deterministic scope key safe across processes and container restarts.
+    Replaces non-deterministic Python hash()!
+    """
+    if scoped_employee_ids is None:
+        return "all"
+    sorted_str = ",".join(str(i) for i in sorted(scoped_employee_ids))
+    return f"scope_{hashlib.md5(sorted_str.encode()).hexdigest()[:12]}"
 
 
 def invalidate_checkin_pulse_cache(
     target_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    tabs: Optional[List[str]] = None,
 ) -> None:
-    """Atomic O(1) cache invalidation. Bumps version key and clears local L1 RAM.
-    Supports a single date, or date range [target_date, end_date] (capped at 31 days).
-    Always ensures today's cache is invalidated if today falls within the range.
+    """Invalidate pulse cache in RAM and Redis.
+    On check-in, only 'overview' and 'timing' are invalidated.
+    'attention' (30-day heavy analytics) is NEVER invalidated on check-ins!
     """
-    _pulse_l1_cache.invalidate()
-
     today = _get_ist_today()
+    if isinstance(target_date, str):
+        try:
+            target_date = date.fromisoformat(target_date)
+        except Exception:
+            target_date = today
+    elif isinstance(target_date, datetime):
+        target_date = target_date.date()
+
+    if isinstance(end_date, str):
+        try:
+            end_date = date.fromisoformat(end_date)
+        except Exception:
+            end_date = target_date
+    elif isinstance(end_date, datetime):
+        end_date = end_date.date()
+
     dates_to_invalidate: Set[date] = set()
 
     if target_date is None:
@@ -189,19 +221,28 @@ def invalidate_checkin_pulse_cache(
         if s <= today <= e:
             dates_to_invalidate.add(today)
 
+    target_tabs = tabs or ["overview", "timing", "attention"]
+
+    # 1. Clear targeted tabs from local RAM cache
+    for d in dates_to_invalidate:
+        d_str = d.isoformat()
+        with _pulse_l1_cache._lock:
+            for tab in target_tabs:
+                keys_to_del = [k for k in _pulse_l1_cache._cache if f":{tab}:" in str(k) and d_str in str(k)]
+                for k in keys_to_del:
+                    _pulse_l1_cache._cache.pop(k, None)
+
+    # 2. Clear targeted tabs from Redis
     redis_client = get_redis_client()
     if redis_client:
         try:
-            pipe = redis_client.pipeline()
             for d in dates_to_invalidate:
                 d_str = d.isoformat()
-                key = f"{PULSE_REDIS_VER_KEY_PREFIX}:{d_str}"
-                pipe.incr(key)
-                pipe.expire(key, 86400)
-            pipe.execute()
-            logger.info("checkin_pulse: Incremented version counter for %d date(s)", len(dates_to_invalidate))
+                for tab in target_tabs:
+                    for key in redis_client.scan_iter(f"{PULSE_REDIS_KEY_PREFIX}:{tab}:*:{d_str}*"):
+                        redis_client.delete(key)
         except Exception as exc:
-            logger.warning("checkin_pulse: Failed to increment Redis version: %s", exc)
+            logger.debug("Redis pulse invalidation error: %s", exc)
 
 
 def _get_working_days_back(target_date: date, count: int = 5) -> List[date]:
@@ -274,7 +315,6 @@ def calculate_pulse_overview(
     approved_leave_ids = {r[0] for r in leaves_today if r[1] == "approved"}
     pending_leave_ids = {r[0] for r in leaves_today if r[1] == "pending"}
     all_leave_ids = approved_leave_ids | pending_leave_ids
-    all_leave_ids = approved_leave_ids | pending_leave_ids
 
     # 3. Check-ins today (Single-partition indexed scan)
     checkins = db.query(
@@ -297,6 +337,10 @@ def calculate_pulse_overview(
     approved_checked_in_ids = approved_leave_ids & checked_in_ids
     approved_checked_in_names = list(dict.fromkeys(r[2] for r in leaves_today if r[0] in approved_checked_in_ids))
 
+    # Pending leave employee who still checked in
+    pending_checked_in_ids = pending_leave_ids & checked_in_ids
+    pending_checked_in_names = list(dict.fromkeys(r[2] for r in leaves_today if r[0] in pending_checked_in_ids))
+
     # Total on leave count = approved + pending (e.g. 5 approved + 5 pending = 10)
     on_leave_count = len(all_leave_ids)
 
@@ -317,6 +361,8 @@ def calculate_pulse_overview(
         "pending": len(pending_leave_ids),
         "approved_checked_in": len(approved_checked_in_ids),
         "approved_checked_in_names": approved_checked_in_names,
+        "pending_checked_in": len(pending_checked_in_ids),
+        "pending_checked_in_names": pending_checked_in_names,
     }
 
     # Floor / Remote Breakdown
@@ -665,7 +711,7 @@ def calculate_pulse_attention(
           AND checkin_date <= :today
           AND employee_id = ANY(:emp_ids)
           AND checked_in_at IS NOT NULL
-          AND EXTRACT(HOUR FROM checked_in_at AT TIME ZONE 'Asia/Kolkata') >= 11
+          AND CAST(checked_in_at AT TIME ZONE 'Asia/Kolkata' AS time) >= '11:00:00'
         GROUP BY employee_id
         HAVING COUNT(*) >= 3
         ORDER BY late_count DESC
@@ -722,38 +768,50 @@ def get_pulse_data_cached(
     target_date: Optional[date] = None,
     scoped_employee_ids: Optional[Set[int]] = None,
 ) -> Dict[str, Any]:
-    """Retrieve pulse data with L1 RAM (500 ns) + L2 Redis (0.8 ms) + single-flight mutex."""
     today = target_date or _get_ist_today()
     today_str = today.isoformat()
-    scope_key = "all" if scoped_employee_ids is None else f"scope_{hash(frozenset(scoped_employee_ids))}"
+    scope_key = _build_scope_key(scoped_employee_ids)
 
-    redis_client = get_redis_client()
-    ver = _get_pulse_version(redis_client, today_str)
+    # Clean, simple deterministic key (No version counters needed!)
+    cache_key = f"{PULSE_REDIS_KEY_PREFIX}:{tab}:{scope_key}:{today_str}"
 
-    cache_key = f"{PULSE_REDIS_KEY_PREFIX}:{tab}:{scope_key}:{today_str}:v{ver}"
-
-    # 1. Tier 1: In-process RAM
+    # 1. Tier 1: In-process RAM (< 0.001 ms)
     val = _pulse_l1_cache.get(cache_key)
     if val is not None:
         return val
 
-    # 2. Tier 2: Distributed Redis
+    ttl = TAB_TTLS.get(tab, 30)
+
+    # 2. Tier 2: Redis Mesh (< 1 ms)
+    redis_client = get_redis_client()
     if redis_client:
         try:
             cached_json = redis_client.get(cache_key)
             if cached_json:
                 data = json.loads(cached_json)
-                _pulse_l1_cache.set(cache_key, data)
+                _pulse_l1_cache.set(cache_key, data, ttl=ttl)
                 return data
         except Exception as e:
-            logger.warning("checkin_pulse: Redis read error: %s", e)
+            logger.debug("Redis read error: %s", e)
 
-    # 3. Tier 3: Single-flight execution on DB miss
-    with _pulse_flight_lock:
-        # Double check after acquiring lock
+    # 3. Tier 3: Compute with per-key lock (Overview NEVER waits for Attention!)
+    lock = _get_key_lock(cache_key)
+    with lock:
+        # Re-check RAM after acquiring lock
         val = _pulse_l1_cache.get(cache_key)
         if val is not None:
             return val
+
+        # Re-check Redis after acquiring lock
+        if redis_client:
+            try:
+                cached_json = redis_client.get(cache_key)
+                if cached_json:
+                    data = json.loads(cached_json)
+                    _pulse_l1_cache.set(cache_key, data, ttl=ttl)
+                    return data
+            except Exception:
+                pass
 
         if tab == "overview":
             res = calculate_pulse_overview(db, today, scoped_employee_ids)
@@ -764,14 +822,14 @@ def get_pulse_data_cached(
         else:
             raise ValueError(f"Unknown pulse tab: {tab}")
 
-        # Store in L1
-        _pulse_l1_cache.set(cache_key, res)
+        # Store in RAM with tab-specific natural TTL
+        _pulse_l1_cache.set(cache_key, res, ttl=ttl)
 
-        # Store in L2 Redis
+        # Store in Redis
         if redis_client:
             try:
-                redis_client.setex(cache_key, L2_TTL_SECONDS, json.dumps(res))
+                redis_client.setex(cache_key, ttl * 2, json.dumps(res))
             except Exception as e:
-                logger.warning("checkin_pulse: Redis write error: %s", e)
+                logger.debug("Redis write error: %s", e)
 
         return res

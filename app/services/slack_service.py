@@ -149,6 +149,67 @@ def try_lookup_user_avatar_by_email(email: str) -> str | None:
         return None
 
 
+def get_slack_user_info(slack_user_id: str) -> dict | None:
+    """Fetch full user details (profile, email, avatar, etc.) from Slack solely by Slack user ID.
+    
+    This completely bypasses email lookups and avoids failures when the portal email
+    differs from the user's Slack account email.
+    """
+    if not slack_user_id:
+        return None
+    try:
+        response = _slack_request("/users.info", {"user": slack_user_id}, method="GET")
+        if not response.get("ok"):
+            error_code = response.get("error")
+            logger.warning("Slack user info lookup failed for user_id %s: %s", slack_user_id, error_code)
+            return None
+        return response.get("user")
+    except Exception as exc:
+        logger.warning("Slack user info lookup skipped for user_id %s: %s", slack_user_id, exc)
+        return None
+
+
+def lookup_user_avatar_by_user_id(slack_user_id: str) -> str | None:
+    """Return the best-resolution profile image URL for a Slack user, by Slack user ID."""
+    response = _slack_request("/users.info", {"user": slack_user_id}, method="GET")
+    if not response.get("ok"):
+        error_code = response.get("error")
+        if error_code in ("user_not_found", "users_not_found"):
+            logger.warning("Slack avatar lookup skipped for user_id %s: %s", slack_user_id, error_code)
+            return None
+        raise RuntimeError(f"Slack lookup failed: {error_code or 'unknown_error'}")
+
+    profile = response.get("user", {}).get("profile", {}) or {}
+    for key in ("image_original", "image_512", "image_192", "image_72", "image_48"):
+        url = profile.get(key)
+        if url:
+            return url
+    return None
+
+
+def try_lookup_user_avatar_by_user_id(slack_user_id: str) -> str | None:
+    try:
+        return lookup_user_avatar_by_user_id(slack_user_id)
+    except Exception as exc:
+        logger.warning("Slack avatar lookup skipped for user_id %s: %s", slack_user_id or "unknown", exc)
+        return None
+
+
+def try_lookup_employee_avatar(employee) -> str | None:
+    """Look up avatar by employee's slack_user_id first, falling back to email."""
+    slack_user_id = getattr(employee, "slack_user_id", None)
+    if slack_user_id:
+        avatar = try_lookup_user_avatar_by_user_id(slack_user_id)
+        if avatar:
+            return avatar
+
+    email = getattr(employee, "email", None)
+    if email:
+        return try_lookup_user_avatar_by_email(email)
+
+    return None
+
+
 def get_or_cache_employee_slack_user_id(db, employee) -> str | None:
     if getattr(employee, "slack_user_id", None):
         return employee.slack_user_id
@@ -318,7 +379,7 @@ def try_send_leave_applied_message(**kwargs) -> bool:
 
 
 def get_leave_balances_text(db, employee) -> str:
-    from app.constants.leave_types import is_intern_or_contractor, normalize_leave_type, get_working_days_count
+    from app.constants.leave_types import is_intern_or_contractor, normalize_leave_type, get_working_days_count, get_leave_quota
     from app.models.leave import Leave
     from datetime import date, timedelta
     
@@ -374,13 +435,24 @@ def get_leave_balances_text(db, employee) -> str:
             f"• *Floater Leave:* 2 / 2 days left ({used_floater} used in {current_year})"
         )
     else:
-        paid_left = max(0, 12 - used_paid)
-        cl_left = max(0, 6 - used_cl)
+        paid_quota = get_leave_quota(
+            "paid",
+            target_year=current_year,
+            employee_type=employee.employee_type,
+            converted_to_fulltime_at=getattr(employee, "converted_to_fulltime_at", None),
+            date_of_joining=getattr(employee, "date_of_joining", None),
+            created_at=getattr(employee, "created_at", None),
+        )
+        paid_left = max(0, paid_quota - used_paid)
+        paid_left_str = int(paid_left) if isinstance(paid_left, float) and paid_left.is_integer() else f"{paid_left:g}"
+        used_paid_str = int(used_paid) if isinstance(used_paid, float) and used_paid.is_integer() else f"{used_paid:g}"
         floater_left = max(0, 2 - used_floater)
+        floater_left_str = int(floater_left) if isinstance(floater_left, float) and floater_left.is_integer() else f"{floater_left:g}"
+        used_floater_str = int(used_floater) if isinstance(used_floater, float) and used_floater.is_integer() else f"{used_floater:g}"
         return (
-            f"• *Paid Leave:* {paid_left} / 12 days left ({used_paid} used in {current_year})\n"
+            f"• *Paid Leave:* {paid_left_str} / {paid_quota} days left ({used_paid_str} used in {current_year})\n"
             # f"• *Casual/Sick Leave:* {cl_left} / 6 days left ({used_cl} used in {current_year})\n"
-            f"• *Floater Leave:* {floater_left} / 2 days left ({used_floater} used in {current_year})"
+            f"• *Floater Leave:* {floater_left_str} / 2 days left ({used_floater_str} used in {current_year})"
         )
 
 def get_wfh_balances_text(db, employee) -> str:

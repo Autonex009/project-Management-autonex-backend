@@ -52,6 +52,15 @@ def _build_engine():
     if build_local_engine is not None:
         return build_local_engine(DATABASE_URL, connect_args)
 
+    # ── SQLite (Tests / Local) ─────────────────────────────────────────
+    if DATABASE_URL.startswith("sqlite"):
+        from sqlalchemy.pool import StaticPool
+        return create_engine(
+            DATABASE_URL,
+            connect_args=connect_args,
+            poolclass=StaticPool,
+        )
+
     # ── Vercel (serverless) ─────────────────────────────────────────────
     # With Fluid Compute ON, invocations share one warm instance and its
     # module-level globals, so a small pool persists across requests and gets

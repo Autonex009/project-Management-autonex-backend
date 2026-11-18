@@ -21,7 +21,7 @@ from app.utils.client_ip import get_client_ip, parse_ip_whitelist, is_ip_allowed
 from app.services.auth_service import get_current_user, require_role
 from app.services.project_scope import can_act_on_project, has_full_access, get_authorized_project_ids
 from app.services.allocation_service import sync_employee_allocations_from_checkin
-from app.services.project_cache import invalidate_my_projects_cache, get_redis_client
+from app.services.project_cache import invalidate_my_projects_cache, get_redis_client, InMemoryTTLCache
 from app.schemas.checkin import (
     CheckInCreate,
     CheckOutUpdate,
@@ -517,6 +517,39 @@ def _build_paginated_checkins(db: Session, base_query, page: int, limit: int, kp
 # High-Performance Dashboard Insights for Admin, HR, PM, Team Leads
 # -------------------------------------------------------------------------
 
+_pm_scoped_emp_l1_cache = InMemoryTTLCache(ttl_seconds=60.0, max_size=500)
+
+
+def _resolve_scoped_emp_ids_cached(db: Session, user: User) -> Optional[set[int]]:
+    """
+    Law 3 RAM Caching for Scoped Employee IDs:
+    Resolves active employee IDs under a PM / Team Lead's assigned projects.
+    Cached for 60 seconds in process RAM to eliminate redundant WAN roundtrips to Supabase
+    across burst hits to /pulse/overview, /pulse/timing, and /pulse/attention.
+    Returns None for full-access users (Admin, HR).
+    """
+    if has_full_access(user):
+        return None
+
+    cache_key = f"scoped_emp:{user.id}"
+    cached = _pm_scoped_emp_l1_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    scoped_pids = _get_scoped_project_ids(db, user)
+    if scoped_pids:
+        allocs = db.query(Allocation.employee_id).filter(
+            Allocation.sub_project_id.in_(scoped_pids),
+            Allocation.is_active == True,
+        ).all()
+        res = {a.employee_id for a in allocs if a.employee_id}
+    else:
+        res = set()
+
+    _pm_scoped_emp_l1_cache.set(cache_key, res)
+    return res
+
+
 @router.get("/pulse/overview", response_model=CheckInPulseOverviewResponse)
 def get_checkin_pulse_overview(
     target_date: Optional[str] = None,
@@ -530,18 +563,7 @@ def get_checkin_pulse_overview(
         except ValueError:
             t_date = _get_ist_today()
 
-    scoped_emp_ids = None
-    if not has_full_access(current_user):
-        scoped_pids = _get_scoped_project_ids(db, current_user)
-        if scoped_pids:
-            allocs = db.query(Allocation.employee_id).filter(
-                Allocation.sub_project_id.in_(scoped_pids),
-                Allocation.is_active == True,
-            ).all()
-            scoped_emp_ids = {a.employee_id for a in allocs if a.employee_id}
-        else:
-            scoped_emp_ids = set()
-
+    scoped_emp_ids = _resolve_scoped_emp_ids_cached(db, current_user)
     return get_pulse_data_cached(db, "overview", t_date, scoped_emp_ids)
 
 
@@ -558,18 +580,7 @@ def get_checkin_pulse_timing(
         except ValueError:
             t_date = _get_ist_today()
 
-    scoped_emp_ids = None
-    if not has_full_access(current_user):
-        scoped_pids = _get_scoped_project_ids(db, current_user)
-        if scoped_pids:
-            allocs = db.query(Allocation.employee_id).filter(
-                Allocation.sub_project_id.in_(scoped_pids),
-                Allocation.is_active == True,
-            ).all()
-            scoped_emp_ids = {a.employee_id for a in allocs if a.employee_id}
-        else:
-            scoped_emp_ids = set()
-
+    scoped_emp_ids = _resolve_scoped_emp_ids_cached(db, current_user)
     return get_pulse_data_cached(db, "timing", t_date, scoped_emp_ids)
 
 
@@ -586,18 +597,7 @@ def get_checkin_pulse_attention(
         except ValueError:
             t_date = _get_ist_today()
 
-    scoped_emp_ids = None
-    if not has_full_access(current_user):
-        scoped_pids = _get_scoped_project_ids(db, current_user)
-        if scoped_pids:
-            allocs = db.query(Allocation.employee_id).filter(
-                Allocation.sub_project_id.in_(scoped_pids),
-                Allocation.is_active == True,
-            ).all()
-            scoped_emp_ids = {a.employee_id for a in allocs if a.employee_id}
-        else:
-            scoped_emp_ids = set()
-
+    scoped_emp_ids = _resolve_scoped_emp_ids_cached(db, current_user)
     return get_pulse_data_cached(db, "attention", t_date, scoped_emp_ids)
 
 
@@ -615,10 +615,21 @@ def nudge_unaccounted_employee(
     """
     nudged = 0
     today = _get_ist_today()
+    today_str = today.isoformat()
     already_nudged = get_nudged_employee_ids_today(today)
+    redis_client = get_redis_client()
 
     if payload.employee_id:
-        if payload.employee_id in already_nudged:
+        # Atomic check-and-set via Redis SADD (Returns 1 if new, 0 if already existed)
+        if redis_client:
+            is_new = redis_client.sadd(f"nudge:checkin:{today_str}", payload.employee_id)
+            redis_client.expire(f"nudge:checkin:{today_str}", 86400 * 2)
+            if not is_new:
+                raise HTTPException(
+                    status_code=400,
+                    detail="This employee has already received a check-in reminder today.",
+                )
+        elif payload.employee_id in already_nudged:
             raise HTTPException(
                 status_code=400,
                 detail="This employee has already received a check-in reminder today. Nudges are limited to once per day.",
@@ -636,7 +647,6 @@ def nudge_unaccounted_employee(
             from app.services.slack_service import send_slack_dm
             background_tasks.add_task(send_slack_dm, emp.slack_user_id, msg)
             record_employee_nudged_today(emp.id, today)
-            invalidate_checkin_pulse_cache(today)
             nudged = 1
         except Exception as e:
             logger.warning(f"Could not queue slack nudge: {e}")
@@ -673,7 +683,6 @@ def nudge_unaccounted_employee(
 
         if to_record:
             record_multiple_employees_nudged_today(to_record, today)
-            invalidate_checkin_pulse_cache(today)
 
     return NudgeResponse(
         success=True,
@@ -1026,7 +1035,7 @@ def submit_checkin(
         logger.warning(f"Error syncing allocations from checkin: {exc}")
 
     invalidate_my_projects_cache(employee_id)
-    invalidate_checkin_pulse_cache(today)
+    invalidate_checkin_pulse_cache(today, tabs=["overview", "timing"])
     return response
 
 
@@ -1083,7 +1092,6 @@ def submit_checkout(
         checked_out_at=checkin.checked_out_at,
     )
     db.commit()
-    invalidate_checkin_pulse_cache(today)
     return response
 
 @router.get("/team-today", response_model=PaginatedTeamCheckIns)

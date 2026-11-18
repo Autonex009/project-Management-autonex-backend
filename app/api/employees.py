@@ -74,6 +74,7 @@ EMPLOYEE_FIELD_LABELS = {
 
 from app.services.slack_service import (
     try_get_or_cache_employee_slack_user_id,
+    try_lookup_employee_avatar,
     try_lookup_user_avatar_by_email,
     try_notify_employee_promoted_fulltime,
 )
@@ -1944,7 +1945,7 @@ def set_employee_avatar_from_slack(
 
     check_employee_access(employee, current_user)
 
-    avatar_url = try_lookup_user_avatar_by_email(employee.email)
+    avatar_url = try_lookup_employee_avatar(employee)
     if not avatar_url:
         raise HTTPException(
             status_code=404,
