@@ -287,6 +287,7 @@ def calculate_pulse_overview(
                 "active": 0,
                 "on_leave": 0,
                 "yet_to_check_in": 0,
+                "late": 0,
             },
             "floor_breakdown": {"floor_7": 0, "floor_9": 0, "floor_15": 0, "floor_17": 0, "wfh": 0},
             "averages": {
@@ -413,6 +414,9 @@ def calculate_pulse_overview(
     # Fast attention badge count: Only unaccounted absentees today
     badge_attention = len(unaccounted_ids)
 
+    # Late check-ins: check-ins at or after 11:00 AM (hour >= 11, matching Timing tab 11+ bucket)
+    late_count = sum(1 for m in overall_minutes if m >= 11 * 60)
+
     return {
         "date": today_str,
         "updated_at": _get_ist_now_time_str(),
@@ -424,6 +428,7 @@ def calculate_pulse_overview(
             "active": total_active,
             "on_leave": on_leave_count,
             "yet_to_check_in": yet_to_check_in_count,
+            "late": late_count,
             "leave_breakdown": leave_breakdown,
         },
         "floor_breakdown": {

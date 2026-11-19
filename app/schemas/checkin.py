@@ -206,6 +206,7 @@ class AttendanceOverview(BaseModel):
     active: int
     on_leave: int
     yet_to_check_in: int
+    late: int = 0
     leave_breakdown: Optional[LeaveBreakdown] = None
 
 
