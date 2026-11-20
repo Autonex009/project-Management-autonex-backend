@@ -26,7 +26,15 @@ from app.models.user import User
 from app.models.employee import Employee
 from app.models.allocation import Allocation
 
-from app.constants.perf_params import PERF_PARAM_NAME_SET, RATING_MIN, RATING_MAX
+from app.constants.perf_params import (
+    PERF_PARAM_NAME_SET,
+    PERF_PARAM_WEIGHTS,
+    PERF_PARAM_CATEGORIES,
+    LEGACY_PERF_PARAM_NAME_SET,
+    RATING_MIN,
+    RATING_MAX,
+    calculate_weighted_rating,
+)
 from app.db.database import get_db
 from app.models.perf_eval import PerfEvaluation
 from app.models.notification import Notification
@@ -235,7 +243,7 @@ class PerfEvalCreate(BaseModel):
     def check_params(cls, v):
         names = {p.name for p in v}
         if names != PERF_PARAM_NAME_SET:
-            raise ValueError("parameter_values must cover exactly the five fixed parameters")
+            raise ValueError("parameter_values must cover exactly the seven fixed parameters")
         return v
 
 
@@ -263,8 +271,8 @@ class PerfEvalReview(BaseModel):
     @classmethod
     def check_params(cls, v):
         names = {p.name for p in v}
-        if names != PERF_PARAM_NAME_SET:
-            raise ValueError("parameter_values must cover exactly the five fixed parameters")
+        if names != PERF_PARAM_NAME_SET and names != LEGACY_PERF_PARAM_NAME_SET:
+            raise ValueError("parameter_values must cover either the seven fixed parameters or the legacy parameters")
         for p in v:
             if not p.approved and not (p.feedback and p.feedback.strip()):
                 raise ValueError(f"feedback is required for rejected parameter '{p.name}'")
@@ -766,9 +774,22 @@ def create_eval(
         )
 
     param_values = [
-        {"name": pv.name, "employee_rating": pv.employee_rating, "pm_rating": None, "approved": None, "feedback": None}
+        {
+            "name": pv.name,
+            "category": PERF_PARAM_CATEGORIES.get(pv.name),
+            "weight": PERF_PARAM_WEIGHTS.get(pv.name),
+            "employee_rating": pv.employee_rating,
+            "pm_rating": None,
+            "approved": None,
+            "feedback": None,
+        }
         for pv in payload.parameter_values
     ]
+
+    weighted_employee_rating = calculate_weighted_rating(
+        [{"name": pv.name, "rating": pv.employee_rating} for pv in payload.parameter_values],
+        "rating",
+    )
 
     ev = PerfEvaluation(
         project_id=payload.project_id,
@@ -776,7 +797,7 @@ def create_eval(
         period=payload.period,
         parameter_values=param_values,
         overall_comment=(payload.overall_comment or None),
-        employee_overall_rating=_mean([pv.employee_rating for pv in payload.parameter_values]),
+        employee_overall_rating=weighted_employee_rating,
         status="submitted",
         # From the session, not the payload: this column records who filed the
         # self-evaluation and must not be settable by the client.
@@ -817,6 +838,8 @@ def review_eval(
         if r is not None:
             merged.append({
                 "name": name,
+                "category": row.get("category") or PERF_PARAM_CATEGORIES.get(name),
+                "weight": row.get("weight") or PERF_PARAM_WEIGHTS.get(name),
                 "employee_rating": row.get("employee_rating"),
                 "pm_rating": r.pm_rating,
                 "approved": r.approved,
@@ -826,7 +849,10 @@ def review_eval(
             merged.append(row)
 
     ev.parameter_values = merged
-    ev.overall_rating = _mean([p.pm_rating for p in payload.parameter_values])
+    ev.overall_rating = calculate_weighted_rating(
+        [{"name": p.name, "rating": p.pm_rating} for p in payload.parameter_values],
+        "rating",
+    )
     ev.bonus_suggested = bool(payload.bonus_suggested)
     ev.bonus_note = (payload.bonus_note.strip() if payload.bonus_note else None)
     ev.status = "reviewed"
