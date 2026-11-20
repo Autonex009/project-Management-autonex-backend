@@ -5,11 +5,12 @@ Project-based monthly performance evaluation.
   (the parameters are now hardcoded — see app/constants/perf_params.py). Kept so
   the existing table is left untouched.
 - PerfEvaluation: one monthly evaluation per (project, employee, period).
-  The employee rates each of the five fixed parameters 1-5 (parameter_values),
-  gives an optional overall comment, and submits (status="submitted"). The PM
-  then reviews: approves/rejects each parameter, assigns their own 1-5 rating,
+  The employee rates each of the seven fixed parameters 1-5 (parameter_values),
+  grouped by Skill Category with assigned weightages totaling 100%, gives an
+  optional overall comment, and submits (status="submitted"). The PM then
+  reviews: approves/rejects each parameter, assigns their own 1-5 rating,
   leaves feedback on rejected parameters, and may suggest a bonus
-  (status="reviewed"). PM ratings are authoritative (overall_rating).
+  (status="reviewed"). PM weighted ratings are authoritative (overall_rating).
 """
 from sqlalchemy import Column, Integer, Float, String, Text, Boolean, TIMESTAMP, JSON, UniqueConstraint
 from sqlalchemy.sql import func
