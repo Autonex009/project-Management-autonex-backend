@@ -1754,7 +1754,6 @@ def send_unallocation_notifications(
     try:
         from datetime import date as date_cls
         from app.models.project import DailySheet as Project
-        from app.models.parent_project import MainProject
         from app.models.sub_project import SubProject as HierarchySubProject
         from app.models.allocation import Allocation
         from app.models.employee import Employee
@@ -1768,22 +1767,15 @@ def send_unallocation_notifications(
         if not project:
             return
 
-        # 1. Fast resolve PM candidate IDs from project and parent
+        # 1. Fast resolve PM candidate IDs from project
+        # Project-level assignment on project.assigned_employee_ids is sole source of truth.
+        # No MainProject fallback.
         pm_candidate_ids: set[int] = set()
         for v in (project.assigned_employee_ids or []):
             try:
                 pm_candidate_ids.add(int(v))
             except (ValueError, TypeError):
                 continue
-
-        if not pm_candidate_ids and getattr(project, "main_project_id", None):
-            mp = db.query(MainProject).filter(MainProject.id == project.main_project_id).first()
-            if mp:
-                for v in (getattr(mp, "program_manager_ids", None) or ([mp.program_manager_id] if getattr(mp, "program_manager_id", None) else [])):
-                    try:
-                        pm_candidate_ids.add(int(v))
-                    except (ValueError, TypeError):
-                        continue
 
         if getattr(project, "sub_project_id", None):
             hsp = db.query(HierarchySubProject).filter(HierarchySubProject.id == project.sub_project_id).first()

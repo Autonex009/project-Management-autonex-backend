@@ -1129,6 +1129,7 @@ def update_employee(
             raise HTTPException(status_code=400, detail="Full-time start date cannot precede date of joining.")
 
     # Handle implicit promotions/demotions via employee_type change
+    is_promoted_to_fulltime = False
     if "employee_type" in update_data:
         raw_new_type = (update_data["employee_type"] or "").strip()
         old_type = (employee.employee_type or "").strip()
@@ -1145,6 +1146,7 @@ def update_employee(
 
         if old_type.lower() != new_type.lower():
             if is_new_fulltime and not is_old_fulltime:
+                is_promoted_to_fulltime = True
                 update_data["converted_to_fulltime_at"] = (
                     update_data.get("converted_to_fulltime_at")
                     or datetime.now(timezone.utc).replace(tzinfo=None)
@@ -1189,7 +1191,7 @@ def update_employee(
             linked_user.employment_type = update_data["employee_type"]
             
             # Send notification if upgraded to Full-time
-            if update_data["employee_type"] == "Full-time" and update_data.get("converted_to_fulltime_at") is not None:
+            if is_promoted_to_fulltime:
                 db.add(Notification(
                     user_id=linked_user.id,
                     title="Converted to Full-time",
