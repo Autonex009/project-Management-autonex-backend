@@ -1283,7 +1283,13 @@ def list_salary_records(db: Session = Depends(get_db)):
             record["avatar_url"] = emp.avatar_url
             # Authoritative HR System of Record
             record["employment_type"] = emp.employee_type
-            record["status"] = "Inactive" if emp.status == "archived" else "Active"
+            # Payroll Active/Inactive is owned by the salary row (toggled via
+            # PATCH /salary-records/{id}/status); archiving the employee forces Inactive.
+            record["status"] = (
+                "Inactive"
+                if emp.status == "archived" or (row.status or "").strip().lower() == "inactive"
+                else "Active"
+            )
 
             # Auto-heal database record in-place
             if row.employment_type != emp.employee_type:
