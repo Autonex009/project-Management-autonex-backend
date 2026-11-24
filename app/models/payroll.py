@@ -96,15 +96,15 @@ class PayrollAdditionalPayment(Base):
 
 
 class Salary(Base):
-    """Read-only view of the externally-managed `salary` table.
+    """View and master record of the `salary` table.
 
-    Holds each person's actual pay (e.g. "₹100,000"), stored as text. The app
-    only reads from it for the Pay tab — it never writes back. (A masked mirror
-    of the same data lives in `masked_salaries`, which we deliberately ignore.)
+    Holds each person's actual pay (e.g. "₹100,000"), stored encrypted as text.
+    Mapped to employees via employee_id foreign key (with legacy full_name fallback).
     """
     __tablename__ = "salary"
 
     id = Column(BigInteger, primary_key=True, index=True)
+    employee_id = Column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True, index=True)
     full_name = Column(Text, nullable=True)
     status = Column(Text, nullable=True)
     employment_type = Column(Text, nullable=True)

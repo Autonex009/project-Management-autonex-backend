@@ -432,6 +432,10 @@ def preview_payroll(
     year = month_start.year
     year_start, year_end = date_type(year, 1, 1), date_type(year, 12, 31)
 
+    employees_by_id = {
+        e.id: e
+        for e in db.query(Employee).all()
+    }
     employees_by_name = {
         _normalize_name(e.name): e
         for e in db.query(Employee).all()
@@ -526,9 +530,14 @@ def preview_payroll(
 
     rows = []
     for salary_row in salary_rows:
-        # Resolve the matching active employee by name; without one there's no
-        # employee_id to attach leaves/bonuses to, so skip (admin adds them separately).
-        emp = employees_by_name.get(_normalize_name(salary_row.full_name))
+        # Resolve matching active employee by employee_id first, then normalized name
+        emp = None
+        if getattr(salary_row, "employee_id", None):
+            emp = employees_by_id.get(salary_row.employee_id)
+        if emp is None:
+            emp = employees_by_name.get(_normalize_name(salary_row.full_name))
+            if emp and hasattr(salary_row, "employee_id") and not getattr(salary_row, "employee_id", None):
+                salary_row.employee_id = emp.id
         if emp is None:
             # Orphan salary row: an Active row whose name matches no employee.
             # Show it in the run anyway (base pay decrypts to its real number,
@@ -1115,6 +1124,19 @@ def update_salary(
 
     emp.base_salary_enc = encrypt_salary(body.base_salary)
     emp.base_salary = None
+
+    # Keep corresponding Salary table row in sync
+    salary_row = None
+    if getattr(Salary, "employee_id", None) is not None:
+        salary_row = db.query(Salary).filter(Salary.employee_id == emp.id).first()
+    if not salary_row:
+        salary_row = db.query(Salary).filter(func.lower(Salary.full_name) == func.lower(emp.name)).first()
+    if salary_row:
+        if hasattr(salary_row, "employee_id"):
+            salary_row.employee_id = emp.id
+        salary_row.base_pay_monthly = emp.base_salary_enc
+        salary_row.base_pay_annual = encrypt_salary(body.base_salary * 12)
+
     db.commit()
     db.refresh(emp)
     return _salary_record(emp)
@@ -1150,18 +1172,49 @@ def _ensure_salary_rows_for_active_employees(db: Session) -> int:
     employee has a row, seeding it with a base monthly pay of 0 (the minimum) —
     enough to make them appear in the run; an admin then edits the real figure.
 
-    Matching is by normalized name. EXISTING rows are never modified — in
-    particular the rows whose ciphertext predates the current key are left
-    untouched. No-op when SALARY_KEY is unset (we can't write encrypted pay).
-
-    Returns the number of rows created.
+    Also self-heals duplicate rows created by legacy name changes and links employee_id.
     """
     if not encryption_enabled():
         return 0
 
-    existing_names = {_normalize_name(s.full_name) for s in db.query(Salary).all()}
+    all_salaries = db.query(Salary).all()
     active_employees = db.query(Employee).filter(Employee.status != "archived").all()
-    missing = [e for e in active_employees if _normalize_name(e.name) not in existing_names]
+
+    # 1. Deduplication / Self-healing pass:
+    # If an employee has multiple salary rows, keep the row with non-zero pay and purge empty duplicates
+    dedup_needed = False
+    by_key = {}
+    for s in all_salaries:
+        key = f"id_{s.employee_id}" if getattr(s, "employee_id", None) else f"name_{_normalize_name(s.full_name)}"
+        by_key.setdefault(key, []).append(s)
+
+    for key, group in by_key.items():
+        if len(group) > 1:
+            def _has_pay(r):
+                val = _read_pay(r.base_pay_monthly)
+                return val is not None and val > 0
+            group.sort(key=lambda r: (1 if _has_pay(r) else 0, r.id), reverse=True)
+            for dup in group[1:]:
+                if not _has_pay(dup):
+                    db.delete(dup)
+                    dedup_needed = True
+
+    if dedup_needed:
+        db.commit()
+        all_salaries = db.query(Salary).all()
+
+    # 2. Check for missing salary records
+    existing_emp_ids = {s.employee_id for s in all_salaries if getattr(s, "employee_id", None)}
+    existing_names = {_normalize_name(s.full_name) for s in all_salaries if s.full_name}
+
+    missing = []
+    for emp in active_employees:
+        if emp.id in existing_emp_ids:
+            continue
+        if _normalize_name(emp.name) in existing_names:
+            continue
+        missing.append(emp)
+
     if not missing:
         return 0
 
@@ -1171,11 +1224,12 @@ def _ensure_salary_rows_for_active_employees(db: Session) -> int:
     created = 0
     for emp in missing:
         key = _normalize_name(emp.name)
-        if key in seen:  # guard against two active employees sharing a name
+        if key in seen or emp.id in existing_emp_ids:
             continue
         seen.add(key)
         db.add(Salary(
             id=next_id,
+            employee_id=emp.id,
             full_name=emp.name,
             status="Active",
             employment_type=emp.employee_type,
@@ -1196,27 +1250,46 @@ def _ensure_salary_rows_for_active_employees(db: Session) -> int:
 def list_salary_records(db: Session = Depends(get_db)):
     """List every active employee, matched to their salary row where one exists.
 
-    Before listing, we back-fill a salary row (base pay 0) for any active
-    employee that doesn't have one yet, so everyone shows up here and in the
-    Monthly Pay run. Salary rows that don't match any active employee (e.g.
-    departed staff, name mismatches) are still appended so nothing silently
-    disappears from the tab.
+    Matches by employee_id first, falling back to normalized name.
+    Authoritatively sets employment_type and status from the Employee record.
     """
     _ensure_salary_rows_for_active_employees(db)
 
     employees = db.query(Employee).filter(Employee.status != "archived").order_by(Employee.name).all()
-    salary_by_name = {_normalize_name(s.full_name): s for s in db.query(Salary).order_by(Salary.id).all()}
+    all_salaries = db.query(Salary).order_by(Salary.id).all()
+
+    salary_by_emp_id = {}
+    salary_by_name = {}
+    for s in all_salaries:
+        if getattr(s, "employee_id", None):
+            salary_by_emp_id[s.employee_id] = s
+        if s.full_name:
+            salary_by_name[_normalize_name(s.full_name)] = s
 
     records = []
-    matched_names = set()
+    matched_salary_ids = set()
     for emp in employees:
-        key = _normalize_name(emp.name)
-        row = salary_by_name.get(key)
+        row = salary_by_emp_id.get(emp.id)
+        if row is None:
+            row = salary_by_name.get(_normalize_name(emp.name))
+
         if row is not None:
-            matched_names.add(key)
+            matched_salary_ids.add(row.id)
+            if hasattr(row, "employee_id") and getattr(row, "employee_id", None) != emp.id:
+                row.employee_id = emp.id
+
             record = _salary_table_record(row)
             record["employee_id"] = emp.id
             record["avatar_url"] = emp.avatar_url
+            # Authoritative HR System of Record
+            record["employment_type"] = emp.employee_type
+            record["status"] = "Inactive" if emp.status == "archived" else "Active"
+
+            # Auto-heal database record in-place
+            if row.employment_type != emp.employee_type:
+                row.employment_type = emp.employee_type
+            if emp.status == "archived" and row.status != "Inactive":
+                row.status = "Inactive"
         else:
             record = {
                 "id": None,
@@ -1232,8 +1305,8 @@ def list_salary_records(db: Session = Depends(get_db)):
             }
         records.append(record)
 
-    for key, row in salary_by_name.items():
-        if key not in matched_names:
+    for row in all_salaries:
+        if row.id not in matched_salary_ids:
             orphan = _salary_table_record(row)
             orphan["employee_id"] = None
             records.append(orphan)
@@ -1271,11 +1344,9 @@ def create_salary_record(
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found")
 
-    existing = {
-        _normalize_name(s.full_name)
-        for s in db.query(Salary).all()
-    }
-    if _normalize_name(emp.name) in existing:
+    existing_emp_ids = {s.employee_id for s in db.query(Salary).all() if getattr(s, "employee_id", None)}
+    existing_names = {_normalize_name(s.full_name) for s in db.query(Salary).all() if s.full_name}
+    if emp.id in existing_emp_ids or _normalize_name(emp.name) in existing_names:
         raise HTTPException(status_code=409, detail="A salary record already exists for this employee")
 
     max_id = db.query(func.max(Salary.id)).scalar()
@@ -1283,6 +1354,7 @@ def create_salary_record(
 
     row = Salary(
         id=next_id,
+        employee_id=emp.id,
         full_name=emp.name,
         status="Active",
         employment_type=emp.employee_type,
@@ -1350,6 +1422,18 @@ def update_salary_record(
     row.opt_bonus_monthly = encrypt_salary(body.opt_bonus_monthly) if body.opt_bonus_monthly else None
     row.base_pay_annual = encrypt_salary(body.base_pay_monthly * 12)
     row.optional_bonus_annual = encrypt_salary(body.opt_bonus_monthly * 12) if body.opt_bonus_monthly else None
+
+    # Keep Employee.base_salary_enc in sync if linked
+    target_emp = None
+    if getattr(row, "employee_id", None):
+        target_emp = db.query(Employee).filter(Employee.id == row.employee_id).first()
+    if not target_emp and row.full_name:
+        target_emp = db.query(Employee).filter(func.lower(Employee.name) == func.lower(row.full_name)).first()
+        if target_emp and hasattr(row, "employee_id"):
+            row.employee_id = target_emp.id
+    if target_emp:
+        target_emp.base_salary_enc = row.base_pay_monthly
+
     db.commit()
     db.refresh(row)
     return _salary_table_record(row)
