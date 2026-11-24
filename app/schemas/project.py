@@ -18,6 +18,7 @@ class ProjectBase(BaseModel):
 
     required_expertise: Optional[List[str]] = []   # skills removed from UI; tolerate empty/None
     assigned_employee_ids: Optional[List[int]] = []
+    team_lead_ids: Optional[List[int]] = None
     
     # NEW: Hierarchy fields
     main_project_id: Optional[int] = None
@@ -69,6 +70,7 @@ class ProjectUpdate(BaseModel):
 
     required_expertise: Optional[List[str]] = None
     assigned_employee_ids: Optional[List[int]] = None
+    team_lead_ids: Optional[List[int]] = None
     
     # NEW: Hierarchy fields
     main_project_id: Optional[int] = None

@@ -15,7 +15,6 @@ from app.db.database import get_db, SessionLocal
 from app.models.allocation import Allocation
 from app.models.project import SubProject, Project  # SubProject with Project alias
 from app.models.employee import Employee
-from app.models.parent_project import MainProject
 from app.models.sub_project import SubProject as HierarchySubProject
 from app.models.onboarding_pipeline import OnboardingPipeline
 from datetime import date as date_cls
@@ -80,17 +79,28 @@ def sync_project_allocations(db, project_id: int):
     # Fast in-memory resolution (eliminates N network round-trips to Supabase)
     for a in allocs:
         emp = emp_map.get(a.employee_id)
-        if (a.role_tags and "Team Lead" in a.role_tags) or _is_team_lead(emp):
+        is_tl = (a.role_tags and "Team Lead" in a.role_tags) or _is_team_lead(emp)
+        is_pm = (
+            (a.role_tags and any(t in ("PM", "Project Manager", "Program Manager") for t in a.role_tags))
+            or (emp and emp.designation and project_scope._normalise(emp.designation) in project_scope.ADMIN_ONLY_SUBJECT_DESIGNATIONS)
+        )
+        if is_tl:
             lead_count += 1
-        elif emp and emp.designation and project_scope._normalise(emp.designation) in project_scope.ADMIN_ONLY_SUBJECT_DESIGNATIONS:
+        elif is_pm:
             pm_ids.add(a.employee_id)
+
+    # Preserve all currently assigned PMs on the project
+    for assigned_id in (project.assigned_employee_ids or []):
+        try:
+            pm_ids.add(int(assigned_id))
+        except (ValueError, TypeError):
+            continue
 
     project.team_lead_count = lead_count
     project.team_manager_count = len(pm_ids)
-    
-    # Strictly sync assigned_employee_ids to the active PM allocations
     project.assigned_employee_ids = list(pm_ids)
-    
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "assigned_employee_ids")
     project.required_manpower = _autonex_headcount(project)
 
 router = APIRouter(prefix="/api/allocations", tags=["Allocations"], dependencies=[Depends(get_current_user)])
@@ -478,6 +488,7 @@ def get_project_allocation_row(
 def bulk_create_allocations(
     payload: BulkAllocationCreateRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm", "team_lead")),
 ):
@@ -524,6 +535,38 @@ def bulk_create_allocations(
         created_allocations.append(new_alloc)
 
     db.flush()
+
+    # Record audit log entries for all created allocations
+    if created_allocations:
+        emp_ids = [a.employee_id for a in created_allocations if a.employee_id]
+        emp_map = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()} if emp_ids else {}
+        for alloc in created_allocations:
+            emp = emp_map.get(alloc.employee_id)
+            emp_name = emp.name if emp else None
+            role_desc = f" ({', '.join(alloc.role_tags)})" if alloc.role_tags else ""
+            audit_service.record(
+                db,
+                actor=current_user,
+                action="allocation.created",
+                category="Allocations",
+                action_type="Created",
+                entity_type="allocation",
+                entity_id=alloc.id,
+                entity_name=emp_name,
+                subject_employee_id=alloc.employee_id,
+                subject_name=emp_name,
+                details=audit_service.changes(
+                    audit_service.field_diff("Project", None, project.name if project else f"#{payload.project_id}"),
+                    audit_service.field_diff("Daily hours", None, alloc.total_daily_hours or 8),
+                    audit_service.field_diff("Role tags", None, ", ".join(alloc.role_tags) if alloc.role_tags else None),
+                ),
+                summary=(
+                    f"Assigned {emp_name or 'employee'}{role_desc} to "
+                    f"{project.name if project else 'a project'} at {alloc.total_daily_hours or 8}h/day"
+                ),
+                request=http_request,
+            )
+
     sync_project_allocations(db, payload.project_id)
     project_scope.invalidate_project_scope_cache()
     invalidate_my_projects_cache()
@@ -564,6 +607,7 @@ def bulk_create_allocations(
 def bulk_delete_allocations(
     payload: BulkAllocationDeleteRequest,
     background_tasks: BackgroundTasks,
+    http_request: Request = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(require_role("admin", "pm", "team_lead")),
 ):
@@ -626,6 +670,44 @@ def bulk_delete_allocations(
                     )
 
     db.flush()
+    deleted_emp_ids = set([a.employee_id for a in allocs if a.employee_id])
+    if project and getattr(project, "assigned_employee_ids", None):
+        current_assigned = [int(x) for x in project.assigned_employee_ids if str(x).isdigit()]
+        new_assigned = [x for x in current_assigned if x not in deleted_emp_ids]
+        if len(new_assigned) != len(current_assigned):
+            project.assigned_employee_ids = new_assigned
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(project, "assigned_employee_ids")
+
+    # Record audit log entries for all removed allocations
+    if allocs:
+        del_emp_ids = [a.employee_id for a in allocs if a.employee_id]
+        del_emp_map = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(del_emp_ids)).all()} if del_emp_ids else {}
+        for a in allocs:
+            emp = del_emp_map.get(a.employee_id)
+            emp_name = emp.name if emp else None
+            audit_service.record(
+                db,
+                actor=current_user,
+                action="allocation.removed",
+                category="Allocations",
+                action_type="Deleted",
+                entity_type="allocation",
+                entity_id=a.id,
+                entity_name=emp_name,
+                subject_employee_id=a.employee_id if emp else None,
+                subject_name=emp_name,
+                details=audit_service.changes(
+                    audit_service.field_diff("Project", project.name if project else f"#{payload.project_id}", None),
+                    audit_service.field_diff("Daily hours", a.total_daily_hours, None),
+                ),
+                summary=(
+                    f"Removed {emp_name or 'employee'} from "
+                    f"{project.name if project else 'a project'}"
+                ),
+                request=http_request,
+            )
+
     sync_project_allocations(db, payload.project_id)
     project_scope.invalidate_project_scope_cache()
     invalidate_my_projects_cache()
@@ -818,6 +900,9 @@ def _format_timeline(project: Project) -> str:
 
 
 def _get_project_manager_name(db: Session, project: Project) -> str:
+    """Project-level assignment on daily_sheets.assigned_employee_ids is the sole source of truth.
+    Per Law 7, never fall back to MainProject.
+    """
     pm_name = None
 
     if getattr(project, "assigned_employee_ids", None):
@@ -830,27 +915,6 @@ def _get_project_manager_name(db: Session, project: Project) -> str:
                     break
             except (ValueError, TypeError):
                 continue
-
-    if not pm_name and getattr(project, "main_project_id", None):
-        main_project = db.query(MainProject).filter(MainProject.id == project.main_project_id).first()
-        if main_project and getattr(main_project, "program_manager_ids", None):
-            for pm_id in main_project.program_manager_ids:
-                try:
-                    emp = db.query(Employee).filter(Employee.id == int(pm_id)).first()
-                    if emp:
-                        pm_name = emp.name
-                        break
-                except (ValueError, TypeError):
-                    continue
-        if not pm_name and main_project and getattr(main_project, "program_manager_id", None):
-            pm_employee = db.query(Employee).filter(Employee.id == main_project.program_manager_id).first()
-            pm_name = pm_employee.name if pm_employee else None
-
-    if not pm_name and getattr(project, "sub_project_id", None):
-        hierarchy_sub_project = db.query(HierarchySubProject).filter(HierarchySubProject.id == project.sub_project_id).first()
-        if hierarchy_sub_project and hierarchy_sub_project.pm_id:
-            pm_employee = db.query(Employee).filter(Employee.id == hierarchy_sub_project.pm_id).first()
-            pm_name = pm_employee.name if pm_employee else None
 
     return pm_name or "Unassigned"
 
@@ -904,6 +968,9 @@ def _send_employee_allocation_removed_notification(db: Session, allocation: Allo
 
 
 def _get_project_pm_employees(db: Session, project: Project) -> list[Employee]:
+    """Project-level assignment on daily_sheets.assigned_employee_ids is the sole source of truth.
+    Per Law 7, never fall back to MainProject.
+    """
     pm_ids = set()
 
     if getattr(project, "assigned_employee_ids", None):
@@ -912,23 +979,6 @@ def _get_project_pm_employees(db: Session, project: Project) -> list[Employee]:
                 pm_ids.add(int(pm_id))
             except (ValueError, TypeError):
                 continue
-
-    if not pm_ids and getattr(project, "main_project_id", None):
-        main_project = db.query(MainProject).filter(MainProject.id == project.main_project_id).first()
-        if main_project:
-            if getattr(main_project, "program_manager_ids", None):
-                for pm_id in main_project.program_manager_ids:
-                    try:
-                        pm_ids.add(int(pm_id))
-                    except (ValueError, TypeError):
-                        continue
-            if not pm_ids and getattr(main_project, "program_manager_id", None):
-                pm_ids.add(main_project.program_manager_id)
-
-    if not pm_ids and getattr(project, "sub_project_id", None):
-        hierarchy_sub_project = db.query(HierarchySubProject).filter(HierarchySubProject.id == project.sub_project_id).first()
-        if hierarchy_sub_project and hierarchy_sub_project.pm_id:
-            pm_ids.add(hierarchy_sub_project.pm_id)
 
     if not pm_ids:
         return []
@@ -1391,18 +1441,35 @@ def update_allocation(
         
     # Force 8-hour flat assignment explicitly
     allocation.total_daily_hours = 8
+    new_sub_project_id = allocation.sub_project_id
 
     if "is_active" in changed_keys:
         if allocation.is_active is False and before_values.get("is_active") is True:
             allocation.deactivated_at = func.now()
+            if old_sub_project_id:
+                old_proj = db.query(Project).filter(Project.id == old_sub_project_id).first()
+                if old_proj and getattr(old_proj, "assigned_employee_ids", None):
+                    cur_assigned = [int(x) for x in old_proj.assigned_employee_ids if str(x).isdigit()]
+                    if allocation.employee_id in cur_assigned:
+                        old_proj.assigned_employee_ids = [x for x in cur_assigned if x != allocation.employee_id]
+                        from sqlalchemy.orm.attributes import flag_modified
+                        flag_modified(old_proj, "assigned_employee_ids")
         elif allocation.is_active is True and before_values.get("is_active") is False:
             allocation.deactivated_at = None
             allocation.deactivated_reason = None
 
+    if new_sub_project_id != old_sub_project_id and old_sub_project_id:
+        old_proj = db.query(Project).filter(Project.id == old_sub_project_id).first()
+        if old_proj and getattr(old_proj, "assigned_employee_ids", None):
+            cur_assigned = [int(x) for x in old_proj.assigned_employee_ids if str(x).isdigit()]
+            if allocation.employee_id in cur_assigned:
+                old_proj.assigned_employee_ids = [x for x in cur_assigned if x != allocation.employee_id]
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(old_proj, "assigned_employee_ids")
+
     db.flush()
 
     # Sync allocated_employees count from actual records for affected projects
-    new_sub_project_id = allocation.sub_project_id
     affected_project_ids = {old_sub_project_id}
     if new_sub_project_id != old_sub_project_id:
         affected_project_ids.add(new_sub_project_id)
@@ -1488,6 +1555,12 @@ def update_allocation(
                         "Cancelled onboarding pipeline #%s for candidate #%s upon deactivation from training.",
                         active_pipe.id, candidate_user_id
                     )
+
+    # Sync project allocated_employees and role counts dynamically
+    if old_sub_project_id and old_sub_project_id != allocation.sub_project_id:
+        sync_project_allocations(db, old_sub_project_id)
+    if allocation.sub_project_id:
+        sync_project_allocations(db, allocation.sub_project_id)
 
     db.commit()
     db.refresh(allocation)
@@ -1680,6 +1753,13 @@ def delete_allocation(
 
     db.delete(allocation)
     db.flush()
+
+    if project and getattr(project, "assigned_employee_ids", None):
+        current_assigned = [int(x) for x in project.assigned_employee_ids if str(x).isdigit()]
+        if allocation.employee_id in current_assigned:
+            project.assigned_employee_ids = [x for x in current_assigned if x != allocation.employee_id]
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(project, "assigned_employee_ids")
 
     # Sync project allocated_employees and role counts dynamically
     if project:

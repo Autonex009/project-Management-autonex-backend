@@ -36,7 +36,6 @@ from sqlalchemy.orm import Session
 
 from app.models.allocation import Allocation
 from app.models.employee import Employee
-from app.models.parent_project import MainProject
 from app.models.project import DailySheet
 from app.models.user import User
 
@@ -86,17 +85,6 @@ def _as_int_set(values: Optional[Iterable]) -> set[int]:
         except (TypeError, ValueError):
             continue
     return result
-
-
-def _main_project_pm_ids(main_project: Optional[MainProject]) -> set[int]:
-    """PMs recorded at the organisation level, newest column first."""
-    if main_project is None:
-        return set()
-    ids = _as_int_set(getattr(main_project, "program_manager_ids", None))
-    if ids:
-        return ids
-    # Legacy single-PM column, still populated on older rows.
-    return _as_int_set([getattr(main_project, "program_manager_id", None)])
 
 
 def _normalise(value: Optional[str]) -> str:
@@ -467,17 +455,13 @@ def get_manageable_employee_ids(
     is_caller_lead = (actor_role == "team_lead") or (actor_designation in PM_ONLY_SUBJECT_DESIGNATIONS)
 
     # 1. Resolve scoped subproject IDs for the caller (query only necessary columns)
+    # Sole source of truth is daily_sheets.assigned_employee_ids and active allocations.
+    # No MainProject fallback.
     proj_rows = db.query(
-        DailySheet.id, DailySheet.main_project_id, DailySheet.assigned_employee_ids
+        DailySheet.id, DailySheet.assigned_employee_ids
     ).filter(
         DailySheet.project_status.in_(["active", "in-progress", "in progress", "poc"])
     ).all()
-    
-    main_pm_rows = db.query(MainProject.id, MainProject.program_manager_ids).all()
-    actor_main_proj_ids = {
-        m[0] for m in main_pm_rows
-        if str(actor_id) in [str(x) for x in (m[1] or [])]
-    }
     
     actor_allocations = db.query(Allocation.sub_project_id).filter(
         Allocation.employee_id == actor_id,
@@ -486,12 +470,9 @@ def get_manageable_employee_ids(
     actor_alloc_proj_ids = {r[0] for r in actor_allocations if r[0]}
     
     scoped_project_ids = []
-    for pid, main_pid, assigned in proj_rows:
+    for pid, assigned in proj_rows:
         assigned_list = assigned or []
         if str(actor_id) in [str(x) for x in assigned_list]:
-            scoped_project_ids.append(pid)
-            continue
-        if main_pid in actor_main_proj_ids:
             scoped_project_ids.append(pid)
             continue
         if pid in actor_alloc_proj_ids:

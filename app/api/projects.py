@@ -129,18 +129,37 @@ def _allocate_project_leaders(db: Session, project: Project, current_user: User)
             continue
 
         is_lead = project_scope.escalates_to_pm(db, employee_id)
-        db.add(
-            Allocation(
-                employee_id=employee_id,
-                sub_project_id=project.id,
-                total_daily_hours=8,
-                role_tags=[TEAM_LEAD_ROLE_TAG] if is_lead else [],
-                time_distribution={},
-                active_start_date=project.start_date,
-                active_end_date=project.end_date,
-                override_flag=True,
-                override_reason="Auto-sync from project manager/lead assignment",
-            )
+        new_alloc = Allocation(
+            employee_id=employee_id,
+            sub_project_id=project.id,
+            total_daily_hours=8,
+            role_tags=[TEAM_LEAD_ROLE_TAG] if is_lead else [],
+            time_distribution={},
+            active_start_date=project.start_date,
+            active_end_date=project.end_date,
+            override_flag=True,
+            override_reason="Auto-sync from project manager/lead assignment",
+        )
+        db.add(new_alloc)
+        db.flush()
+        emp = db.query(Employee).filter(Employee.id == employee_id).first()
+        emp_name = emp.name if emp else None
+        audit_service.record(
+            db,
+            actor=current_user,
+            action="allocation.created",
+            category="Allocations",
+            action_type="Created",
+            entity_type="allocation",
+            entity_id=new_alloc.id,
+            entity_name=emp_name,
+            subject_employee_id=employee_id,
+            subject_name=emp_name,
+            details=audit_service.changes(
+                audit_service.field_diff("Project", None, project.name),
+                audit_service.field_diff("Daily hours", None, 8),
+            ),
+            summary=f"Assigned {emp_name or 'employee'} to {project.name} at 8h/day",
         )
 
     db.flush()
@@ -452,16 +471,27 @@ def enrich_projects_bulk(db: Session, projects: list[Project]) -> list[dict]:
                 continue
             allocated_employee_ids.append(alloc.employee_id)
             desig = emp_designations.get(alloc.employee_id, "")
-            if (alloc.role_tags and TEAM_LEAD_ROLE_TAG in alloc.role_tags) or desig in ("team lead", "team_lead", "lead", "tl"):
+            is_tl_alloc = (alloc.role_tags and TEAM_LEAD_ROLE_TAG in alloc.role_tags) or desig in ("team lead", "team_lead", "lead", "tl")
+            is_pm_alloc = (
+                (alloc.role_tags and any(t in ("PM", "Project Manager", "Program Manager") for t in alloc.role_tags))
+                or desig in project_scope.ADMIN_ONLY_SUBJECT_DESIGNATIONS
+                or any(k in desig for k in ("manager", "admin", "hr", "pm"))
+            )
+            if is_tl_alloc:
                 lead_count += 1
                 team_lead_ids.append(alloc.employee_id)
-            elif desig in (
-                "program manager",
-                "project manager",
-                "hr",
-            ):
-                pm_count += 1
+            elif is_pm_alloc:
                 pm_ids.append(alloc.employee_id)
+
+        # Include all PMs assigned directly on the project
+        for eid in (project.assigned_employee_ids or []):
+            try:
+                eid_int = int(eid)
+                if eid_int not in pm_ids:
+                    pm_ids.append(eid_int)
+            except (TypeError, ValueError):
+                continue
+        pm_count = len(pm_ids)
 
         leave_emp_ids = {
             l.employee_id
@@ -561,6 +591,7 @@ def create_project(
 ):
     data = normalize_project_payload(payload.model_dump(), db)
     data["required_manpower"] = _autonex_headcount(data)  # Autonex annotators + reviewers
+    team_lead_ids = data.pop("team_lead_ids", None)
 
     # A PM (or HR) who creates a project owns it. Guarantee they're recorded as a
     # project-level PM using their authoritative token identity, so the project is
@@ -583,6 +614,59 @@ def create_project(
 
     # Put the assigned leaders on the project straight away.
     _allocate_project_leaders(db, project, current_user)
+
+    if team_lead_ids:
+        for lid in team_lead_ids:
+            try:
+                lid_int = int(lid)
+            except (TypeError, ValueError):
+                continue
+            already_tl = db.query(Allocation).filter(
+                Allocation.employee_id == lid_int,
+                Allocation.sub_project_id == project.id,
+                Allocation.is_active == True,
+            ).first()
+            if already_tl:
+                already_tl.role_tags = list(set((already_tl.role_tags or []) + [TEAM_LEAD_ROLE_TAG]))
+                alloc_id = already_tl.id
+            else:
+                new_tl = Allocation(
+                    employee_id=lid_int,
+                    sub_project_id=project.id,
+                    total_daily_hours=8,
+                    role_tags=[TEAM_LEAD_ROLE_TAG],
+                    time_distribution={},
+                    active_start_date=project.start_date,
+                    active_end_date=project.end_date,
+                    override_flag=True,
+                    override_reason="Assigned as team lead from the project form",
+                )
+                db.add(new_tl)
+                db.flush()
+                alloc_id = new_tl.id
+            emp = db.query(Employee).filter(Employee.id == lid_int).first()
+            emp_name = emp.name if emp else None
+            audit_service.record(
+                db,
+                actor=current_user,
+                action="allocation.created",
+                category="Allocations",
+                action_type="Created",
+                entity_type="allocation",
+                entity_id=alloc_id,
+                entity_name=emp_name,
+                subject_employee_id=lid_int,
+                subject_name=emp_name,
+                details=audit_service.changes(
+                    audit_service.field_diff("Project", None, project.name),
+                    audit_service.field_diff("Daily hours", None, 8),
+                    audit_service.field_diff("Role tags", None, "Team Lead"),
+                ),
+                summary=f"Assigned {emp_name or 'employee'} as Team Lead on {project.name}",
+                request=http_request,
+            )
+        db.flush()
+        project.team_lead_count = len(team_lead_ids)
 
     # A team lead who creates a project owns it from the ground up, so they are
     # allocated to it automatically. They are deliberately NOT added to the project's
@@ -1332,6 +1416,22 @@ def get_projects_kpi(
 
 # ✅ LIST PROJECTS (PAGINATED)
 
+# ✅ GET SINGLE PROJECT
+@router.get("/{project_id}", response_model=ProjectResponse)
+def get_project(
+    project_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    project = db.query(Project).filter(Project.id == project_id).first()
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project_scope.require_project_scope(
+        db, current_user, project, action="view this project"
+    )
+    return project
+
+
 # ✅ UPDATE PROJECT
 @router.put("/{project_id}", response_model=ProjectResponse, dependencies=[Depends(require_role("admin", "pm"))])
 def update_project(
@@ -1411,52 +1511,231 @@ def update_project(
             ids.insert(0, current_user.employee_id)
         update_data["assigned_employee_ids"] = ids
 
+    team_lead_ids = update_data.pop("team_lead_ids", None)
     before = audit_service.snapshot(project, update_data.keys())
 
     for key, value in update_data.items():
         setattr(project, key, value)
 
-    # Keep required_manpower in sync with the Autonex headcount
-    project.required_manpower = _autonex_headcount(project)
-
-    # Auto-allocate any newly assigned PM/TL
     if "assigned_employee_ids" in update_data:
-        for employee_id in project.assigned_employee_ids or []:
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(project, "assigned_employee_ids")
+
+    # ── 1. Synchronize Program Managers (Auto-allocate newly assigned, deallocate removed) ──
+    if "assigned_employee_ids" in update_data:
+        old_pm_ids = set()
+        for eid in (before.get("assigned_employee_ids") or []):
             try:
-                employee_id = int(employee_id)
+                old_pm_ids.add(int(eid))
             except (TypeError, ValueError):
                 continue
 
+        new_pm_ids = set()
+        for eid in (project.assigned_employee_ids or []):
+            try:
+                new_pm_ids.add(int(eid))
+            except (TypeError, ValueError):
+                continue
+
+        # A) Newly assigned PMs -> allocate if not already active
+        for employee_id in (new_pm_ids - old_pm_ids):
             already_on = (
                 db.query(Allocation)
                 .filter(
                     Allocation.employee_id == employee_id,
                     Allocation.sub_project_id == project.id,
+                    Allocation.is_active == True,
                 )
                 .first()
             )
             if not already_on:
                 is_lead = project_scope.escalates_to_pm(db, employee_id)
-                db.add(
-                    Allocation(
-                        employee_id=employee_id,
-                        sub_project_id=project.id,
-                        total_daily_hours=8,
-                        role_tags=[TEAM_LEAD_ROLE_TAG] if is_lead else [],
-                        time_distribution={},
-                        active_start_date=project.start_date,
-                        active_end_date=project.end_date,
-                        override_flag=True,
-                        override_reason="Auto-sync from project manager/lead assignment",
-                    )
+                new_pm_alloc = Allocation(
+                    employee_id=employee_id,
+                    sub_project_id=project.id,
+                    total_daily_hours=8,
+                    role_tags=[TEAM_LEAD_ROLE_TAG] if is_lead else [],
+                    time_distribution={},
+                    active_start_date=project.start_date,
+                    active_end_date=project.end_date,
+                    override_flag=True,
+                    override_reason="Auto-sync from project manager assignment",
                 )
-        db.flush()
-        project.allocated_employees = (
-            db.query(Allocation).filter(
+                db.add(new_pm_alloc)
+                db.flush()
+                emp = db.query(Employee).filter(Employee.id == employee_id).first()
+                emp_name = emp.name if emp else None
+                audit_service.record(
+                    db,
+                    actor=current_user,
+                    action="allocation.created",
+                    category="Allocations",
+                    action_type="Created",
+                    entity_type="allocation",
+                    entity_id=new_pm_alloc.id,
+                    entity_name=emp_name,
+                    subject_employee_id=employee_id,
+                    subject_name=emp_name,
+                    details=audit_service.changes(
+                        audit_service.field_diff("Project", None, project.name),
+                        audit_service.field_diff("Daily hours", None, 8),
+                        audit_service.field_diff("Role tags", None, "Program Manager"),
+                    ),
+                    summary=f"Assigned {emp_name or 'employee'} as Project Manager on {project.name}",
+                    request=http_request,
+                )
+
+        # B) Removed PMs -> de-allocate from this project
+        removed_pm_ids = old_pm_ids - new_pm_ids
+        if removed_pm_ids:
+            removed_pm_allocs = (
+                db.query(Allocation)
+                .filter(
+                    Allocation.sub_project_id == project.id,
+                    Allocation.employee_id.in_(removed_pm_ids),
+                    Allocation.is_active == True,
+                )
+                .all()
+            )
+            for a in removed_pm_allocs:
+                emp = db.query(Employee).filter(Employee.id == a.employee_id).first()
+                emp_name = emp.name if emp else None
+                non_pm_tags = [t for t in (a.role_tags or []) if t not in ("PM", "Project Manager", "Program Manager")]
+                if non_pm_tags:
+                    a.role_tags = non_pm_tags
+                else:
+                    db.delete(a)
+                audit_service.record(
+                    db,
+                    actor=current_user,
+                    action="allocation.removed",
+                    category="Allocations",
+                    action_type="Deleted",
+                    entity_type="allocation",
+                    entity_id=a.id,
+                    entity_name=emp_name,
+                    subject_employee_id=a.employee_id,
+                    subject_name=emp_name,
+                    details=audit_service.changes(
+                        audit_service.field_diff("Project", project.name, None),
+                        audit_service.field_diff("Daily hours", a.total_daily_hours, None),
+                    ),
+                    summary=f"Removed {emp_name or 'employee'} as Project Manager from {project.name}",
+                    request=http_request,
+                )
+
+    # ── 2. Synchronize Team Leads (Auto-allocate newly assigned, deallocate removed) ──
+    if team_lead_ids is not None:
+        new_lead_ids = set()
+        for lid in team_lead_ids:
+            try:
+                new_lead_ids.add(int(lid))
+            except (TypeError, ValueError):
+                continue
+
+        current_allocs = (
+            db.query(Allocation)
+            .filter(
                 Allocation.sub_project_id == project.id,
-                Allocation.is_active == True
-            ).count()
+                Allocation.is_active == True,
+            )
+            .all()
         )
+        emp_ids = [a.employee_id for a in current_allocs if a.employee_id]
+        emp_map = {e.id: e for e in db.query(Employee).filter(Employee.id.in_(emp_ids)).all()} if emp_ids else {}
+
+        current_lead_allocs = [
+            a for a in current_allocs
+            if (a.role_tags and TEAM_LEAD_ROLE_TAG in a.role_tags)
+            or (emp_map.get(a.employee_id) and (emp_map[a.employee_id].designation or "").lower().strip() in ("team lead", "team_lead", "lead", "tl"))
+        ]
+        current_lead_ids = set([a.employee_id for a in current_lead_allocs])
+
+        # A) Removed Team Leads -> de-allocate or untag
+        removed_lead_ids = current_lead_ids - new_lead_ids
+        for a in current_lead_allocs:
+            if a.employee_id in removed_lead_ids:
+                emp = emp_map.get(a.employee_id)
+                emp_name = emp.name if emp else None
+                remaining_tags = [t for t in (a.role_tags or []) if t != TEAM_LEAD_ROLE_TAG]
+                if remaining_tags:
+                    a.role_tags = remaining_tags
+                else:
+                    db.delete(a)
+                audit_service.record(
+                    db,
+                    actor=current_user,
+                    action="allocation.removed",
+                    category="Allocations",
+                    action_type="Deleted",
+                    entity_type="allocation",
+                    entity_id=a.id,
+                    entity_name=emp_name,
+                    subject_employee_id=a.employee_id,
+                    subject_name=emp_name,
+                    details=audit_service.changes(
+                        audit_service.field_diff("Project", project.name, None),
+                        audit_service.field_diff("Daily hours", a.total_daily_hours, None),
+                    ),
+                    summary=f"Removed {emp_name or 'employee'} as Team Lead from {project.name}",
+                    request=http_request,
+                )
+
+        # B) Newly assigned Team Leads -> allocate or tag
+        added_lead_ids = new_lead_ids - current_lead_ids
+        for lid in added_lead_ids:
+            emp = db.query(Employee).filter(Employee.id == lid).first()
+            emp_name = emp.name if emp else None
+            held = next((a for a in current_allocs if a.employee_id == lid), None)
+            if held:
+                held.role_tags = list(set((held.role_tags or []) + [TEAM_LEAD_ROLE_TAG]))
+                alloc_id = held.id
+            else:
+                new_lead_alloc = Allocation(
+                    employee_id=lid,
+                    sub_project_id=project.id,
+                    total_daily_hours=8,
+                    role_tags=[TEAM_LEAD_ROLE_TAG],
+                    time_distribution={},
+                    active_start_date=project.start_date,
+                    active_end_date=project.end_date,
+                    override_flag=True,
+                    override_reason="Assigned as team lead from the project form",
+                )
+                db.add(new_lead_alloc)
+                db.flush()
+                alloc_id = new_lead_alloc.id
+            audit_service.record(
+                db,
+                actor=current_user,
+                action="allocation.created",
+                category="Allocations",
+                action_type="Created",
+                entity_type="allocation",
+                entity_id=alloc_id,
+                entity_name=emp_name,
+                subject_employee_id=lid,
+                subject_name=emp_name,
+                details=audit_service.changes(
+                    audit_service.field_diff("Project", None, project.name),
+                    audit_service.field_diff("Daily hours", None, 8),
+                    audit_service.field_diff("Role tags", None, "Team Lead"),
+                ),
+                summary=f"Assigned {emp_name or 'employee'} as Team Lead on {project.name}",
+                request=http_request,
+            )
+
+        project.team_lead_count = len(new_lead_ids)
+
+    db.flush()
+    project.allocated_employees = (
+        db.query(Allocation).filter(
+            Allocation.sub_project_id == project.id,
+            Allocation.is_active == True
+        ).count()
+    )
+    project.team_manager_count = len(project.assigned_employee_ids or [])
+    project.required_manpower = _autonex_headcount(project)
 
     # Update allocated_employees headcount when transitioning between active & archived
     if old_is_archived != new_is_archived:
