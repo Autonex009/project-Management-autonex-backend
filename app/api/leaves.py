@@ -429,9 +429,6 @@ def _get_pm_notification_targets(db: Session, employee: Employee, leave: Leave) 
     sub_projects = db.query(SubProject).filter(SubProject.id.in_(sub_project_ids)).all() if sub_project_ids else []
     sub_project_map = {sub_project.id: sub_project for sub_project in sub_projects}
 
-    main_project_ids = list({project.main_project_id for project in projects if project.main_project_id})
-    main_projects = db.query(MainProject).filter(MainProject.id.in_(main_project_ids)).all() if main_project_ids else []
-    main_project_map = {main_project.id: main_project for main_project in main_projects}
 
     pm_project_map: dict[int, list[str]] = {}
     for allocation in allocations:
@@ -452,7 +449,6 @@ def _get_pm_notification_targets(db: Session, employee: Employee, leave: Leave) 
                 continue
 
         sub_project = sub_project_map.get(project.sub_project_id) if project.sub_project_id else None
-        main_project = main_project_map.get(project.main_project_id) if project.main_project_id else None
         # Whoever may decide this request on this project. A lead has a manager's powers, so
         # they are notified about their members — but a *lead's own* request goes only to the
         # program manager, never to a peer lead who could not action it anyway.
@@ -460,14 +456,11 @@ def _get_pm_notification_targets(db: Session, employee: Employee, leave: Leave) 
             pm_ids = set(project_scope.project_pm_ids(db, project))
         else:
             pm_ids = set(project_scope.project_actor_ids(db, project))
-        # Union with the legacy scalar columns rather than replacing them: project_scope
-        # resolves assigned_employee_ids → program_manager_ids → program_manager_id, but not
-        # sub_projects.pm_id, and losing a recipient is worse than one extra.
+        # Union with the legacy scalar columns rather than replacing them
         pm_ids |= {
             pm_id
             for pm_id in (
                 getattr(sub_project, "pm_id", None),
-                getattr(main_project, "program_manager_id", None),
             )
             if pm_id
         }
