@@ -1441,6 +1441,7 @@ def update_allocation(
         
     # Force 8-hour flat assignment explicitly
     allocation.total_daily_hours = 8
+    new_sub_project_id = allocation.sub_project_id
 
     if "is_active" in changed_keys:
         if allocation.is_active is False and before_values.get("is_active") is True:
@@ -1469,7 +1470,6 @@ def update_allocation(
     db.flush()
 
     # Sync allocated_employees count from actual records for affected projects
-    new_sub_project_id = allocation.sub_project_id
     affected_project_ids = {old_sub_project_id}
     if new_sub_project_id != old_sub_project_id:
         affected_project_ids.add(new_sub_project_id)
