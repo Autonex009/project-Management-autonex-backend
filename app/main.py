@@ -75,6 +75,19 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error("Schema create_all failed at startup: %s", e)
         try:
+            from sqlalchemy import inspect as _inspect, text as _text
+            with engine.connect() as _conn:
+                _insp = _inspect(_conn)
+                if "salary" in _insp.get_table_names():
+                    _cols = [c["name"] for c in _insp.get_columns("salary")]
+                    if "employee_id" not in _cols:
+                        _conn.execute(_text("ALTER TABLE salary ADD COLUMN IF NOT EXISTS employee_id INTEGER REFERENCES employees(id) ON DELETE SET NULL;"))
+                        _conn.execute(_text("CREATE INDEX IF NOT EXISTS ix_salary_employee_id ON salary (employee_id);"))
+                        _conn.commit()
+                        logger.info("[startup] Added employee_id column to salary table")
+        except Exception as e:
+            logger.warning("[startup] Could not auto-check employee_id on salary: %s", e)
+        try:
             seed_skills()
         except Exception as e:
             logger.error("Skill seeding failed at startup: %s", e)

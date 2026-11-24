@@ -223,6 +223,139 @@ def get_user_role_from_designation(designation: str | None) -> str:
     return DESIGNATION_ROLE_MAP.get(designation, "employee")
 
 
+def _sync_employee_to_salary(
+    db: Session,
+    employee: Employee,
+    old_name: Optional[str] = None,
+    name_changed: bool = False,
+    type_changed: bool = False,
+    status_changed: bool = False,
+) -> Optional[Salary]:
+    """Atomically synchronize employee profile changes (name, employment type, status)
+    to the corresponding record in the `salary` table.
+    Matches by employee_id first, falling back to normalized name (old_name first, then current name).
+    Prevents duplicate salary account creation and ensures immediate UI reflection in the Payroll tab.
+    """
+    try:
+        from app.models.payroll import Salary
+
+        salary_record = None
+        # 1. Match by employee_id first if column exists and is set
+        if hasattr(Salary, "employee_id"):
+            salary_record = db.query(Salary).filter(Salary.employee_id == employee.id).first()
+
+        # 2. Fall back to normalized name matching (old_name first, then current name)
+        if not salary_record:
+            all_salaries = db.query(Salary).all()
+            norm_old = " ".join((old_name or "").lower().split()) if old_name else None
+            norm_curr = " ".join((employee.name or "").lower().split()) if employee.name else None
+
+            if norm_old:
+                for s in all_salaries:
+                    if s.full_name and " ".join(s.full_name.lower().split()) == norm_old:
+                        salary_record = s
+                        break
+
+            if not salary_record and norm_curr:
+                for s in all_salaries:
+                    if s.full_name and " ".join(s.full_name.lower().split()) == norm_curr:
+                        salary_record = s
+                        break
+
+        if salary_record:
+            # Bind foreign key
+            if hasattr(Salary, "employee_id"):
+                salary_record.employee_id = employee.id
+
+            # Sync name
+            if name_changed or (old_name and salary_record.full_name != employee.name):
+                salary_record.full_name = employee.name
+
+            # Sync employment type
+            if type_changed or salary_record.employment_type != employee.employee_type:
+                salary_record.employment_type = employee.employee_type
+
+            # Sync active/inactive status
+            if status_changed:
+                salary_record.status = "Inactive" if employee.status == "archived" else "Active"
+
+        return salary_record
+    except Exception as exc:
+        logger.warning("[_sync_employee_to_salary] Failed to sync Salary: %s", exc)
+        return None
+
+
+def _sync_employee_leadership_across_projects(db: Session, employee: Employee) -> None:
+    """When an employee's designation changes (e.g. to/from Team Lead or PM),
+    automatically sync leadership counts and assigned_employee_ids across all projects they are on.
+    """
+    from app.models.allocation import Allocation
+    from app.models.project import Project
+    from app.services import project_scope
+    from app.services.project_cache import invalidate_my_projects_cache
+    from app.api.allocations import sync_project_allocations, _is_team_lead
+
+    # 1. Find all projects the employee is actively allocated to
+    alloc_project_ids = [
+        a.sub_project_id for a in db.query(Allocation.sub_project_id).filter(
+            Allocation.employee_id == employee.id,
+            Allocation.is_active == True,
+        ).all() if a.sub_project_id
+    ]
+    affected_project_ids = set(alloc_project_ids)
+
+    # 2. Also find all projects where employee is in assigned_employee_ids
+    all_candidate_projects = db.query(Project).filter(
+        Project.assigned_employee_ids.isnot(None)
+    ).all()
+    for p in all_candidate_projects:
+        assigned_list = [int(x) for x in (p.assigned_employee_ids or []) if str(x).isdigit()]
+        if employee.id in assigned_list:
+            affected_project_ids.add(p.id)
+
+    norm_desig = project_scope._normalise(employee.designation)
+    is_pm_desig = (
+        norm_desig in project_scope.ADMIN_ONLY_SUBJECT_DESIGNATIONS
+        or any(k in (employee.designation or "").lower() for k in ("manager", "admin", "hr", "pm"))
+    )
+    is_tl_desig = _is_team_lead(employee)
+
+    # Sync role_tags on employee's active allocations
+    active_allocs = db.query(Allocation).filter(
+        Allocation.employee_id == employee.id,
+        Allocation.is_active == True,
+    ).all()
+    for a in active_allocs:
+        tags = [t for t in (a.role_tags or []) if t.strip().lower() not in ("team lead", "team_lead", "tl", "pm", "project manager", "program manager")]
+        if is_tl_desig:
+            tags.append("Team Lead")
+        elif is_pm_desig:
+            tags.append("PM")
+        a.role_tags = tags
+
+    for pid in affected_project_ids:
+        proj = db.query(Project).filter(Project.id == pid).first()
+        if not proj:
+            continue
+        cur_assigned = [int(x) for x in (proj.assigned_employee_ids or []) if str(x).isdigit()]
+
+        if is_pm_desig and pid in alloc_project_ids and employee.id not in cur_assigned:
+            cur_assigned.append(employee.id)
+            proj.assigned_employee_ids = cur_assigned
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(proj, "assigned_employee_ids")
+        elif not is_pm_desig and employee.id in cur_assigned:
+            proj.assigned_employee_ids = [x for x in cur_assigned if x != employee.id]
+            from sqlalchemy.orm.attributes import flag_modified
+            flag_modified(proj, "assigned_employee_ids")
+
+        # Dynamically sync lead and manager counts and manpower
+        sync_project_allocations(db, pid)
+
+    project_scope.invalidate_project_scope_cache()
+    invalidate_my_projects_cache(employee.id)
+
+
 def check_employee_access(employee: Employee, current_user: User):
     if has_team_read(current_user):
         return
@@ -1172,6 +1305,7 @@ def update_employee(
     linked_user = db.query(User).filter(User.employee_id == employee.id).first()
     old_role = linked_user.role if linked_user else None
 
+    old_employee_name = employee.name
     for key, value in update_data.items():
         setattr(employee, key, value)
 
@@ -1213,14 +1347,15 @@ def update_employee(
                 except Exception as _exc:
                     logger.warning("[update_employee] Could not send promotion Slack message: %s", _exc)
 
-    # Keep corresponding salary record in sync with employment_type
-    if "employee_type" in update_data:
-        try:
-            salary_record = db.query(Salary).filter(Salary.full_name == employee.name).first()
-            if salary_record:
-                salary_record.employment_type = update_data["employee_type"]
-        except Exception as exc:
-            logger.warning("[update_employee] Could not sync Salary employment_type: %s", exc)
+    # Keep corresponding salary record in sync with name, employment_type, and status
+    _sync_employee_to_salary(
+        db,
+        employee,
+        old_name=old_employee_name,
+        name_changed="name" in update_data,
+        type_changed="employee_type" in update_data,
+        status_changed="status" in update_data,
+    )
 
     details = audit_service.diff_all(before, employee, EMPLOYEE_FIELD_LABELS)
     # A designation change silently rewrites the login role, which is a permissions
@@ -1254,6 +1389,12 @@ def update_employee(
             ),
             request=http_request,
         )
+
+    if "designation" in update_data:
+        old_desig = (before.get("designation") or "").strip()
+        new_desig = (employee.designation or "").strip()
+        if old_desig.lower() != new_desig.lower():
+            _sync_employee_leadership_across_projects(db, employee)
 
     db.commit()
     db.refresh(employee)
@@ -1480,9 +1621,7 @@ def convert_to_fulltime(
         ))
 
     # Keep corresponding salary record in sync
-    salary_record = db.query(Salary).filter(Salary.full_name == employee.name).first()
-    if salary_record:
-        salary_record.employment_type = "Full-time"
+    _sync_employee_to_salary(db, employee, type_changed=True)
     audit_service.record(
         db,
         actor=current_user,
@@ -1508,6 +1647,12 @@ def convert_to_fulltime(
         ),
         request=http_request,
     )
+
+    if body.designation:
+        old_desig = (old_designation or "").strip()
+        new_desig = (employee.designation or "").strip()
+        if old_desig.lower() != new_desig.lower():
+            _sync_employee_leadership_across_projects(db, employee)
 
     db.commit()
     db.refresh(employee)
