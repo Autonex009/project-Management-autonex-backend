@@ -79,11 +79,12 @@ def get_dashboard_kpis(
     from app.models.leave import Leave
     from app.models.wfh import WFHRequest
     from app.models.allocation import Allocation
+    from app.utils.business_time import today_ist
     from datetime import date
     from sqlalchemy import func
     import hashlib
 
-    today = date.today()
+    today = today_ist()
     allowed_ids = _get_pm_associated_sub_project_ids(db, current_user)
 
     # === SMART PREFLIGHT ETAG CHECK (< 1-2ms) ===
@@ -120,18 +121,18 @@ def get_dashboard_kpis(
     allocated_employee_ids = db.query(Allocation.employee_id).filter(Allocation.is_active == True).distinct().all()
     allocated_employee_ids = [r[0] for r in allocated_employee_ids]
 
-    today = date.today()
-    on_leave_today_query = db.query(Leave.employee_id).filter(
+    on_leave_today_query = db.query(Leave.employee_id).join(Employee, Leave.employee_id == Employee.id).filter(
+        Employee.status != "archived",
         Leave.start_date <= today,
         Leave.end_date >= today,
-        Leave.status == "approved"
-    )
+        Leave.status != "rejected"
+    ).distinct()
     if pm_emp_ids is not None:
         on_leave_today_query = on_leave_today_query.filter(Leave.employee_id.in_(pm_emp_ids))
     on_leave_ids = [r[0] for r in on_leave_today_query.all()]
 
     idle_query = db.query(Employee).filter(
-        Employee.status == "active",
+        Employee.status != "archived",
         Employee.id.notin_(allocated_employee_ids),
         Employee.id.notin_(on_leave_ids) if on_leave_ids else True
     )
@@ -160,14 +161,15 @@ def get_dashboard_kpis(
     leave_dict = dict(leave_stats)
     
     on_leave_today_people_query = db.query(Leave.employee_id, Employee.name).join(Employee, Leave.employee_id == Employee.id).filter(
+        Employee.status != "archived",
         Leave.start_date <= today,
         Leave.end_date >= today,
-        Leave.status == "approved"
-    )
+        Leave.status != "rejected"
+    ).distinct()
     if pm_emp_ids is not None:
         on_leave_today_people_query = on_leave_today_people_query.filter(Leave.employee_id.in_(pm_emp_ids))
     on_leave_today_result = on_leave_today_people_query.all()
-    on_leave_today_count = len(on_leave_today_result)
+    on_leave_today_count = len(on_leave_ids)
     on_leave_today_people = [{"id": r[0], "name": r[1]} for r in on_leave_today_result]
 
     pending_leaves_query = db.query(Leave.id, Leave.employee_id, Employee.name, Leave.start_date, Leave.end_date, Leave.is_emergency).join(Employee, Leave.employee_id == Employee.id).filter(Leave.status == "pending")

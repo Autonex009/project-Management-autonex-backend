@@ -528,7 +528,7 @@ def bulk_create_allocations(
             sub_project_id=payload.project_id,
             employee_id=eid,
             role_tags=clean_role_tags,
-            total_daily_hours=int(payload.daily_hours) if payload.daily_hours is not None else 8,
+            total_daily_hours=8,
             is_active=True,
         )
         db.add(new_alloc)

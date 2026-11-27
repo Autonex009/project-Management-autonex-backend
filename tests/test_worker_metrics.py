@@ -50,7 +50,11 @@ def test_instrumented_tasks_keep_the_names_arq_dispatches_by():
     resolve at runtime — with nothing failing at import to warn anyone."""
     registered = {func(f).name for f in live_worker.WorkerSettings.functions}
 
-    assert registered == {"run_encord_sync", "run_user_sync_task"}
+    assert registered == {
+        "run_encord_sync",
+        "run_user_sync_task",
+        "send_assessment_reminders_task",
+    }
 
 
 def test_the_live_worker_is_the_instrumented_one():

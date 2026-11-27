@@ -374,3 +374,31 @@ def require_role(*roles):
             detail=f"Access denied. Required role: {', '.join(roles)}",
         )
     return role_checker
+
+
+def require_assessment_admin(user: User = Depends(get_current_user)) -> User:
+    """Strict gate for Assessment, Cluster, and Assignment management (Admin & HR only).
+
+    Deliberately excludes ``pm`` and ``team_lead`` so neither role can create/edit tests,
+    read raw answer keys, manage clusters/assignments, grant retests, or extend deadlines.
+    """
+    if user.role not in ("admin", "hr"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Only Admin or HR can perform this action.",
+        )
+    return user
+
+
+def require_assessment_viewer(user: User = Depends(get_current_user)) -> User:
+    """Gate for evaluator-facing read-only scorecard, log, and recording playback views.
+
+    Admin and HR have full access; PM and Team Lead are further filtered by
+    ``app.services.project_scope`` hierarchy in the endpoint.
+    """
+    if user.role not in ("admin", "hr", "pm", "team_lead"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Evaluator role required.",
+        )
+    return user

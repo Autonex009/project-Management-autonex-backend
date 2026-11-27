@@ -201,22 +201,7 @@ def _gen_temp_password(length: int = 8) -> str:
 # move their login onto their real work address, but not onto an arbitrary one.
 COMPANY_EMAIL_DOMAIN = os.getenv("COMPANY_EMAIL_DOMAIN", "autonexai360.com").strip().lower().lstrip("@")
 EMPLOYEE_PORTAL_URL = os.getenv("EMPLOYEE_PORTAL_URL", "https://pmportal.autonexai360.com/login/employee")
-DESIGNATION_ROLE_MAP = {
-    "Admin": "admin",
-    "HR": "hr",   # combined Admin + PM access
-    "Program Manager": "pm",
-    # Reads everything a PM reads, approves nothing — see services/project_scope.py.
-    # Must stay in step with DESIGNATION_ACCESS in api/auth.py: that map decides the
-    # token role at login, this one decides the stored users.role. Because the role is
-    # re-derived from the designation on every employee update (below), omitting this
-    # entry would demote a team lead to "employee" on an unrelated profile edit.
-    "Team Lead": "team_lead",
-    "Annotator/ Reviewer": "employee",
-    "Annotator/Reviewer": "employee",
-    "Annotator": "employee",
-    "Reviewer": "employee",
-    "Developer": "employee",
-}
+from app.constants.designations import DESIGNATION_ROLE_MAP
 
 
 def get_user_role_from_designation(designation: str | None) -> str:
@@ -433,6 +418,8 @@ def create_employee(
 
     db.commit()
     db.refresh(employee)
+    from app.api.clusters import invalidate_member_picker_cache
+    invalidate_member_picker_cache()
 
     # ── Auto-generate internship offer letter for interns / contractors ─────────
     if is_intern_or_contractor(employee.employee_type):
@@ -462,6 +449,22 @@ def create_employee(
         temp_password=temp_password,
         portal_url=portal_url,
     )
+
+    # ── Non-blocking dynamic cluster sync ─────────────────────────────────────────
+    try:
+        from app.services.cluster_service import sync_dynamic_clusters_for_employee
+        with db.begin_nested():
+            sync_dynamic_clusters_for_employee(db, employee.id)
+        db.commit()
+        from app.api.clusters import invalidate_member_picker_cache
+        invalidate_member_picker_cache()
+    except Exception as _c_exc:
+        db.rollback()
+        logging.getLogger(__name__).warning(
+            "Non-blocking dynamic cluster sync failed for employee %s: %s",
+            employee.id,
+            _c_exc,
+        )
 
     response_data = EmployeeCreateResponse.model_validate(employee)
     response_data.temp_password = temp_password
@@ -952,7 +955,7 @@ def employee_stats(db: Session = Depends(get_db)):
     by_type = db.query(Employee.employee_type, func.count(Employee.id)).filter(Employee.status != "archived").group_by(Employee.employee_type).all()
     by_type_active = db.query(Employee.employee_type, func.count(Employee.id)).filter(Employee.status == "active").group_by(Employee.employee_type).all()
     
-    today = date.today()
+    today = today_ist()
     on_leave_ids = [r[0] for r in db.query(Leave.employee_id).filter(
         Leave.start_date <= today,
         Leave.end_date >= today,
@@ -1357,6 +1360,17 @@ def update_employee(
         status_changed="status" in update_data,
     )
 
+    # Sync dynamic cluster membership if role, type, status, or join date changed
+    if any(k in update_data for k in ("designation", "employee_type", "status", "date_of_joining")):
+        try:
+            from app.services.cluster_service import sync_dynamic_clusters_for_employee
+            with db.begin_nested():
+                sync_dynamic_clusters_for_employee(db, employee.id)
+            from app.api.clusters import invalidate_member_picker_cache
+            invalidate_member_picker_cache()
+        except Exception as _c_exc:
+            logger.warning("[update_employee] Dynamic cluster sync failed: %s", _c_exc)
+
     details = audit_service.diff_all(before, employee, EMPLOYEE_FIELD_LABELS)
     # A designation change silently rewrites the login role, which is a permissions
     # change — surface it explicitly rather than leaving it implied by "Designation".
@@ -1398,6 +1412,8 @@ def update_employee(
 
     db.commit()
     db.refresh(employee)
+    from app.api.clusters import invalidate_member_picker_cache
+    invalidate_member_picker_cache()
 
     # Invalidate L1 RAM cache for this employee profile
     from app.services.project_cache import employee_profile_l1_cache
@@ -1548,6 +1564,8 @@ def verify_employee_email_change(
     db.delete(otp_record)
     db.commit()
     db.refresh(employee)
+    from app.api.clusters import invalidate_member_picker_cache
+    invalidate_member_picker_cache()
     
     if linked_user:
         from app.services.auth_service import invalidate_user_auth_cache
@@ -1654,8 +1672,18 @@ def convert_to_fulltime(
         if old_desig.lower() != new_desig.lower():
             _sync_employee_leadership_across_projects(db, employee)
 
+    # Sync dynamic cluster membership (full_time & designation cohorts) inside savepoint
+    try:
+        from app.services.cluster_service import sync_dynamic_clusters_for_employee
+        with db.begin_nested():
+            sync_dynamic_clusters_for_employee(db, employee.id)
+    except Exception as _c_exc:
+        logger.warning("[convert_to_fulltime] Dynamic cluster sync failed: %s", _c_exc)
+
     db.commit()
     db.refresh(employee)
+    from app.api.clusters import invalidate_member_picker_cache
+    invalidate_member_picker_cache()
 
     if linked_user:
         from app.services.auth_service import invalidate_user_auth_cache
@@ -1739,6 +1767,14 @@ def delete_employee(
             for pipe in active_pipes:
                 pipe.status = "cancelled"
 
+        # Remove from dynamic cluster memberships and cancel unstarted assessments
+        try:
+            from app.services.cluster_service import sync_dynamic_clusters_for_employee
+            with db.begin_nested():
+                sync_dynamic_clusters_for_employee(db, employee.id)
+        except Exception as _c_exc:
+            logger.warning("[archive_employee] Dynamic cluster cleanup failed for employee %s: %s", employee.id, _c_exc)
+
         db.flush()
 
         audit_service.record(
@@ -1774,6 +1810,8 @@ def delete_employee(
         )
 
         db.commit()
+        from app.api.clusters import invalidate_member_picker_cache
+        invalidate_member_picker_cache()
         from app.services.project_cache import employee_profile_l1_cache
         employee_profile_l1_cache.invalidate(employee.id)
         if linked_user:
@@ -1808,6 +1846,14 @@ def restore_employee(
             linked_user = db.query(User).filter(User.email == employee.email).first()
         if linked_user:
             linked_user.is_active = True
+
+        # Re-enroll restored employee into matching dynamic smart clusters
+        try:
+            from app.services.cluster_service import sync_dynamic_clusters_for_employee
+            with db.begin_nested():
+                sync_dynamic_clusters_for_employee(db, employee.id)
+        except Exception as _c_exc:
+            logger.warning("[restore_employee] Dynamic cluster sync failed for employee %s: %s", employee.id, _c_exc)
 
         audit_service.record(
             db,
@@ -2126,6 +2172,8 @@ def set_employee_avatar_from_slack(
     )
     db.commit()
     db.refresh(employee)
+    from app.api.clusters import invalidate_member_picker_cache
+    invalidate_member_picker_cache()
     from app.services.project_cache import employee_profile_l1_cache
     employee_profile_l1_cache.invalidate(employee.id)
     return employee
@@ -2148,6 +2196,8 @@ def delete_employee_avatar(
     employee.avatar_url = None
     db.commit()
     db.refresh(employee)
+    from app.api.clusters import invalidate_member_picker_cache
+    invalidate_member_picker_cache()
     from app.services.project_cache import employee_profile_l1_cache
     employee_profile_l1_cache.invalidate(employee.id)
     # After the commit: the row is what the UI reads, so clearing it is the part

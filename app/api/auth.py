@@ -304,6 +304,12 @@ def login(body: LoginRequest, db: Session = Depends(get_db)):
         if employee is not None:
             check_duplicate_user_for_employee(db, employee.id, exclude_user_id=user.id)
             user.employee_id = employee.id
+            try:
+                from app.services.cluster_service import sync_dynamic_clusters_for_employee
+                with db.begin_nested():
+                    sync_dynamic_clusters_for_employee(db, employee.id)
+            except Exception as _c_exc:
+                logger.warning("[login] Dynamic cluster sync failed for employee %s: %s", employee.id, _c_exc)
             db.commit()
             db.refresh(user)
             logger.info("[login] Auto-linked user id=%s to employee id=%s", user.id, user.employee_id)
