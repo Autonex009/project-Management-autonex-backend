@@ -1,4 +1,5 @@
 from sqlalchemy import create_engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 import os
@@ -12,16 +13,21 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if DATABASE_URL is None:
     # Default to SQLite if no DATABASE_URL is provided
     DATABASE_URL = "sqlite:///./autonex.db"
-    print(f"Warning: No DATABASE_URL found in .env file. Using SQLite: {DATABASE_URL}")
+    print("Using database: sqlite (local autonex.db)")
 else:
     # SQLAlchemy 2.1 defaults to psycopg (v3) for 'postgresql://'.
     # We must explicitly force it to use psycopg2 since that's what we have installed.
     if DATABASE_URL.startswith("postgresql://"):
         DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
-        
-    # Print confirmation but hide password for security
-    db_info = DATABASE_URL.split('@')[0] if '@' in DATABASE_URL else DATABASE_URL
-    print(f"Using database: {db_info}...")
+
+    # Never log username/password segments of DATABASE_URL
+    try:
+        parsed_url = make_url(DATABASE_URL)
+        safe_host = parsed_url.host or "local"
+        safe_db = parsed_url.database or ""
+        print(f"Using database: {parsed_url.drivername}://{safe_host}/{safe_db}")
+    except Exception:
+        print("Using configured DATABASE_URL")
 
 # Add connect_args for SQLite or SSL for PostgreSQL
 connect_args = {}
