@@ -40,3 +40,7 @@ import app.models.sub_project      # noqa: F401
 import app.models.user             # noqa: F401
 import app.models.weekly_compensation  # noqa: F401
 import app.models.wfh              # noqa: F401
+import app.models.cluster          # noqa: F401
+import app.models.assignment       # noqa: F401
+import app.models.assessment       # noqa: F401
+

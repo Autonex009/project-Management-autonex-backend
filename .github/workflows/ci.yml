@@ -33,3 +33,50 @@ jobs:
 
       - name: Run Tests
         run: pytest tests/
+
+  postgres-integration:
+    name: PostgreSQL Migrations & Lock Integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Alembic migrations & Postgres lock/index harness
+        env:
+          DATABASE_URL: postgresql+psycopg2://app:app@localhost:5432/app_test
+          REDIS_URL: redis://localhost:6379
+          JWT_SECRET_KEY: ci-postgres-jwt-secret
+          OTP_SECRET_KEY: ci-postgres-otp-secret
+        run: |
+          python tests/postgres_integration_check.py bootstrap
+          alembic stamp g1h2i3j4k5l6
+          alembic upgrade head
+          alembic downgrade g1h2i3j4k5l6
+          alembic upgrade head
+          python tests/postgres_integration_check.py verify
