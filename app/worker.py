@@ -92,6 +92,74 @@ async def run_user_sync_task(ctx, log_id: str, employee_id: int, start: datetime
     await asyncio.to_thread(_sync_user_badges)
     return result
 
+
+@instrumented
+async def send_assessment_reminders_task(ctx, targets: list[dict]):
+    """
+    Asynchronous ARQ task for bulk assessment Slack reminders.
+    Keeps 1.1s pacing and Slack 429 Retry-After backoff off FastAPI request threads.
+    """
+    from app.services.slack_service import try_send_assessment_reminder_dm, SlackRateLimitError
+
+    sent_count = 0
+    failed_count = 0
+    target_list = targets or []
+    for idx, item in enumerate(target_list):
+        slack_uid = item.get("slack_user_id")
+        emp_email = item.get("employee_email")
+        emp_name = item.get("employee_name") or ""
+        title = item.get("assessment_title") or "Assessment"
+        deadline_str = item.get("deadline_str") or "As soon as possible"
+        enr_id = item.get("enrollment_id")
+        overdue = bool(item.get("overdue", False))
+        try:
+            sent = await asyncio.to_thread(
+                try_send_assessment_reminder_dm,
+                slack_uid,
+                emp_name,
+                title,
+                deadline_str,
+                enr_id,
+                overdue=overdue,
+                employee_email=emp_email,
+            )
+            if sent:
+                sent_count += 1
+            if sent and idx < len(target_list) - 1:
+                await asyncio.sleep(1.1)
+        except SlackRateLimitError as rate_exc:
+            wait_secs = max(float(getattr(rate_exc, "retry_after_seconds", 2)), 1.0)
+            logger.warning("[ARQ_REMINDERS] Slack rate limit on enrollment %s; sleeping %.1fs", enr_id, wait_secs)
+            await asyncio.sleep(wait_secs)
+            try:
+                sent = await asyncio.to_thread(
+                    try_send_assessment_reminder_dm,
+                    slack_uid,
+                    emp_name,
+                    title,
+                    deadline_str,
+                    enr_id,
+                    overdue=overdue,
+                    employee_email=emp_email,
+                )
+                if sent:
+                    sent_count += 1
+            except Exception as retry_exc:
+                failed_count += 1
+                logger.warning("[ARQ_REMINDERS] Slack DM retry failed for enrollment %s: %s", enr_id, retry_exc)
+        except Exception as exc:
+            failed_count += 1
+            logger.warning("[ARQ_REMINDERS] Slack DM dispatch failed for enrollment %s: %s", enr_id, exc)
+
+    logger.info(
+        "[ARQ_REMINDERS] Reminder batch completed: sent=%d failed=%d total=%d",
+        sent_count,
+        failed_count,
+        len(target_list),
+    )
+    return {"sent_count": sent_count, "failed_count": failed_count}
+
+
 async def startup(ctx):
     start_metrics_server()
     ctx["queue_depth_task"] = asyncio.create_task(watch_queue_depth(ctx["redis"]))
@@ -105,7 +173,7 @@ async def shutdown(ctx):
 
 # ARQ looks for this specific class name when starting up
 class WorkerSettings:
-    functions = [run_encord_sync, run_user_sync_task]
+    functions = [run_encord_sync, run_user_sync_task, send_assessment_reminders_task]
     redis_settings = RedisSettings.from_dsn(REDIS_URL)
 
     # Optional: Prevent out-of-memory errors on Railway by limiting concurrent jobs

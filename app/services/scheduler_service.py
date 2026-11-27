@@ -687,6 +687,7 @@ def _check_internship_endings() -> None:
     """
     from datetime import date
     from app.models.employee import Employee
+    from sqlalchemy import or_, update
     from app.models.user import User
     from app.models.notification import Notification
     from app.constants.leave_types import is_intern_or_contractor
@@ -1052,6 +1053,53 @@ def start_scheduler() -> None:
     # )
 
 
+    # Nightly dynamic cluster reconciliation: runs daily at 02:00 AM IST
+    _scheduler.add_job(
+        _scheduled_reconcile_dynamic_clusters,
+        trigger="cron",
+        hour=2,
+        minute=0,
+        id="reconcile_dynamic_clusters",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Assessment in-flight reaper: runs every 2 minutes
+    _scheduler.add_job(
+        _reconcile_expired_assessment_attempts_job,
+        trigger="interval",
+        minutes=2,
+        id="assessment_expired_attempts_reaper",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Daily assignment reminder: runs daily at 09:00 AM IST
+    _scheduler.add_job(
+        _send_daily_assignment_reminders_job,
+        trigger="cron",
+        hour=9,
+        minute=0,
+        id="daily_assignment_reminders",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
+    # Assessment recordings purge: runs nightly at 03:30 AM IST
+    _scheduler.add_job(
+        _purge_expired_assessment_recordings_job,
+        trigger="cron",
+        hour=3,
+        minute=30,
+        id="purge_expired_assessment_recordings",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+
     logger.info(
         "[scheduler] Started — Encord sync every %s min; hiring sync %s",
         ENCORD_SYNC_MINUTE,
@@ -1206,6 +1254,425 @@ def _scheduled_self_eval_reminder() -> None:
         "[scheduler] Self-eval reminder batch finished: %d sent, %d failed out of %d.",
         sent, failed, len(targets)
     )
+
+
+def _scheduled_reconcile_dynamic_clusters() -> None:
+    """Nightly job at 02:00 AM IST: Self-healing reconciliation for dynamic smart clusters."""
+    from app.services.cluster_service import reconcile_dynamic_clusters_job
+
+    db = SessionLocal()
+    try:
+        reconcile_dynamic_clusters_job(db)
+    except Exception as exc:
+        logger.error(f"[scheduler] Dynamic cluster reconciliation failed: {exc}", exc_info=True)
+    finally:
+        db.close()
+
+
+def _reconcile_expired_assessment_attempts_job(
+    db_session=None,
+    *,
+    batch_size: int = 30,
+    max_total: int = 500,
+    budget_seconds: float = 45.0,
+) -> dict[str, int]:
+    """
+    Bounded expired-attempt reaper with canonical lock order, deferred blueprint JSONB,
+    per-attempt savepoints, and per-batch commits so row locks release every ~30 rows.
+    """
+    import time
+    from datetime import datetime, timezone
+    from sqlalchemy.orm import contains_eager
+    from app.models.assessment import Assessment, AssessmentAttempt, AssessmentEnrollment
+    from app.services.assessment_lifecycle import finalize_attempt
+
+    now = datetime.now(timezone.utc)
+    started_mono = time.monotonic()
+    owns_session = db_session is None
+    db = db_session or SessionLocal()
+
+    reaped_count = 0
+    batch_count = 0
+    failed_ids: set[int] = set()
+
+    try:
+        bind = db.get_bind() if hasattr(db, "get_bind") else getattr(db, "bind", None)
+        dialect_name = bind.dialect.name if bind is not None else ""
+
+        while reaped_count + len(failed_ids) < max_total:
+            if (time.monotonic() - started_mono) >= budget_seconds:
+                logger.warning(
+                    "[scheduler] Expired attempt reaper reached %.1fs budget after %d attempt(s) across %d batch(es).",
+                    budget_seconds,
+                    reaped_count,
+                    batch_count,
+                )
+                break
+
+            remaining_cap = max_total - (reaped_count + len(failed_ids))
+            chunk_limit = min(batch_size, remaining_cap)
+            if chunk_limit <= 0:
+                break
+
+            query = (
+                db.query(AssessmentAttempt)
+                .join(AssessmentAttempt.enrollment)
+                .options(
+                    contains_eager(AssessmentAttempt.enrollment)
+                    .joinedload(AssessmentEnrollment.assessment)
+                    .defer(Assessment.test_config)
+                )
+                .filter(AssessmentAttempt.status == "in_progress", AssessmentAttempt.expires_at < now)
+                .order_by(AssessmentAttempt.expires_at.asc())
+                .limit(chunk_limit)
+            )
+            if failed_ids:
+                query = query.filter(~AssessmentAttempt.id.in_(failed_ids))
+            if dialect_name == "postgresql":
+                query = query.with_for_update(of=[AssessmentEnrollment, AssessmentAttempt], skip_locked=True)
+
+            due_attempts = query.all()
+            if not due_attempts:
+                break
+
+            batch_count += 1
+            for att in due_attempts:
+                try:
+                    with db.begin_nested():
+                        enrollment = att.enrollment
+                        finalize_attempt(
+                            db,
+                            att,
+                            enrollment,
+                            enrollment.assessment,
+                            att.answers or {},
+                            now,
+                            reason="timeout",
+                        )
+                    reaped_count += 1
+                except Exception as e:
+                    failed_ids.add(int(att.id))
+                    logger.error(f"[scheduler] Failed to auto-reap attempt {att.id}: {e}", exc_info=True)
+
+            db.commit()
+            if len(due_attempts) < chunk_limit:
+                break
+
+        return {"reaped": reaped_count, "batches": batch_count, "failed": len(failed_ids)}
+    except Exception as exc:
+        db.rollback()
+        logger.error(f"[scheduler] Expired attempt reaper job failed: {exc}", exc_info=True)
+        return {"reaped": reaped_count, "batches": batch_count, "failed": len(failed_ids)}
+    finally:
+        if owns_session:
+            db.close()
+
+
+def _send_daily_assignment_reminders_job() -> None:
+    """
+    Daily job at 09:00 AM IST: Claim-then-send idempotent assessment reminders
+    for assignments due within 3 days or up to 7 days overdue.
+    Uses per-row savepoints and sends Slack DMs strictly after DB commit succeeds.
+    """
+    import time
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy import func
+    from sqlalchemy.orm import joinedload, defer, load_only
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    from app.models.cluster import Cluster
+    from app.models.employee import Employee
+    from sqlalchemy import or_, update
+    from app.models.user import User
+    from app.models.notification import Notification
+    from app.models.assignment import Assignment
+    from app.models.assessment import Assessment, AssessmentEnrollment
+    from app.services.assessment_lifecycle import utc
+    from app.services.slack_service import (
+        try_send_assessment_reminder_dm,
+        lookup_user_id_by_email,
+        _get_bot_token,
+    )
+    from app.utils.business_time import today_ist, IST
+    from datetime import time as dt_time
+
+    now = datetime.now(timezone.utc)
+    today = today_ist()
+    today_start_ist = datetime.combine(today, dt_time.min, tzinfo=IST)
+    today_start_utc = today_start_ist.astimezone(timezone.utc)
+    window_start = now - timedelta(days=7)
+    window_end = now + timedelta(days=3)
+
+    slack_targets = []
+    db = SessionLocal()
+    try:
+        due_enrollments = (
+            db.query(AssessmentEnrollment)
+            .join(Employee, Employee.id == AssessmentEnrollment.employee_id)
+            .join(Assignment, Assignment.id == AssessmentEnrollment.assignment_id)
+            .join(Cluster, Cluster.id == Assignment.cluster_id)
+            .join(Assessment, Assessment.id == AssessmentEnrollment.assessment_id)
+            .options(
+                joinedload(AssessmentEnrollment.employee).load_only(
+                    Employee.id, Employee.name, Employee.email, Employee.slack_user_id
+                ),
+                joinedload(AssessmentEnrollment.assignment),
+                joinedload(AssessmentEnrollment.assessment).defer(Assessment.test_config),
+            )
+            .filter(
+                Assignment.is_active == True,
+                Cluster.is_archived == False,
+                Assessment.status == "published",
+                Employee.status == "active",
+                AssessmentEnrollment.status.in_(["assigned", "in_progress"]),
+                or_(
+                    AssessmentEnrollment.last_reminded_at.is_(None),
+                    AssessmentEnrollment.last_reminded_at < today_start_utc,
+                ),
+                func.coalesce(AssessmentEnrollment.deadline, Assignment.deadline).between(window_start, window_end),
+            )
+            .all()
+        )
+
+        if not due_enrollments:
+            return
+
+        emp_ids = list({e.employee_id for e in due_enrollments})
+        active_users_by_emp = {
+            u.employee_id: u.id
+            for u in db.query(User.id, User.employee_id)
+            .filter(User.employee_id.in_(emp_ids), User.is_active == True)
+            .all()
+        }
+
+        staged_targets = []
+        for enr in due_enrollments:
+            try:
+                # Atomic Compare-and-Swap claim directly on AssessmentEnrollment.last_reminded_at.
+                # Guarantees multi-worker / multi-pod race immunity with 0 extra tables.
+                res = db.execute(
+                    update(AssessmentEnrollment)
+                    .where(
+                        AssessmentEnrollment.id == enr.id,
+                        or_(
+                            AssessmentEnrollment.last_reminded_at.is_(None),
+                            AssessmentEnrollment.last_reminded_at < today_start_utc,
+                        ),
+                    )
+                    .values(last_reminded_at=now)
+                )
+                if not res.rowcount:
+                    continue  # Claimed by concurrent worker or reminded today
+
+                due_dt = utc(enr.deadline) or utc(enr.assignment.deadline) or now
+                due_str = due_dt.astimezone(IST).strftime("%d %b %Y, %I:%M %p IST")
+                title = enr.assessment.title if enr.assessment else "Assessment"
+                overdue = due_dt < now
+
+                user_id = active_users_by_emp.get(enr.employee_id)
+                if user_id:
+                    db.add(Notification(
+                        user_id=user_id,
+                        title=f"Assessment {'Overdue' if overdue else 'Due Soon'}: {title}",
+                        message=(
+                            f"Your assigned assessment '{title}' "
+                            f"{'was due on' if overdue else 'is due by'} {due_str}. "
+                            "Please complete it promptly."
+                        ),
+                        type="assessment_reminder",
+                    ))
+
+                emp = enr.employee
+                if emp:
+                    staged_targets.append({
+                        "employee_id": emp.id,
+                        "email": emp.email,
+                        "slack_id": emp.slack_user_id,
+                        "employee_name": emp.name,
+                        "assessment_title": title,
+                        "deadline_str": due_str,
+                        "enrollment_id": enr.id,
+                        "overdue": overdue,
+                    })
+            except Exception as e:
+                logger.error(f"[scheduler] Failed claiming reminder for enr {enr.id}: {e}")
+
+        db.commit()
+        slack_targets = staged_targets
+    except Exception as exc:
+        db.rollback()
+        logger.error(f"[scheduler] Assignment reminder job failed: {exc}", exc_info=True)
+    finally:
+        db.close()  # Release DB connection before outbound Slack I/O
+
+    # Send Slack DMs strictly after claim commit, resolving missing slack_user_ids outside DB hold
+    has_slack_token = bool(_get_bot_token())
+    resolved_to_cache = {}
+    for idx, target in enumerate(slack_targets):
+        if not has_slack_token:
+            break
+        slack_id = target.get("slack_id")
+        if not slack_id and target.get("email"):
+            try:
+                slack_id = lookup_user_id_by_email(target["email"])
+                if slack_id:
+                    resolved_to_cache[target["employee_id"]] = slack_id
+            except Exception:
+                slack_id = None
+        if not slack_id:
+            continue
+
+        sent = try_send_assessment_reminder_dm(
+            employee_slack_user_id=slack_id,
+            employee_name=target["employee_name"],
+            assessment_title=target["assessment_title"],
+            deadline_str=target["deadline_str"],
+            enrollment_id=target["enrollment_id"],
+            overdue=target["overdue"],
+        )
+        if sent and idx < len(slack_targets) - 1:
+            time.sleep(1.1)
+
+    if resolved_to_cache:
+        db = SessionLocal()
+        try:
+            for eid, sid in resolved_to_cache.items():
+                db.query(Employee).filter(
+                    Employee.id == eid,
+                    Employee.slack_user_id.is_(None),
+                ).update({"slack_user_id": sid}, synchronize_session=False)
+            db.commit()
+        except Exception:
+            db.rollback()
+        finally:
+            db.close()
+
+
+def _purge_expired_assessment_recordings_job() -> None:
+    """
+    Nightly job at 03:30 AM IST:
+    1) Cleans up any abandoned >24h pending_upload objects and marks them failed.
+    2) Keyset-paginated bulk purge of expired 'ready' recordings past 7-day retention (capped at 50 chunks).
+    """
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy import or_, and_
+    from app.models.assessment import AssessmentRecording
+    from app.services.assessment_storage_service import delete_recording_files_bulk
+    from app.utils.business_time import today_ist
+
+    now = datetime.now(timezone.utc)
+    yesterday = now - timedelta(hours=24)
+
+    # 1. Sweep abandoned pending_upload rows (>24h)
+    stale_pending = []
+    db = SessionLocal()
+    try:
+        stale_pending = (
+            db.query(AssessmentRecording.id, AssessmentRecording.video_storage_path)
+            .filter(
+                AssessmentRecording.status == "pending_upload",
+                AssessmentRecording.created_at <= yesterday,
+            )
+            .limit(500)
+            .all()
+        )
+        db.commit()
+    except Exception as exc:
+        logger.error(f"[scheduler] Assessment purge prep failed: {exc}", exc_info=True)
+        db.rollback()
+    finally:
+        db.close()
+
+    if stale_pending:
+        # Remove any orphan files uploaded before a crashed /finalize before marking failed
+        delete_recording_files_bulk([row[1] for row in stale_pending])
+        db = SessionLocal()
+        try:
+            db.query(AssessmentRecording).filter(
+                AssessmentRecording.id.in_([row[0] for row in stale_pending]),
+                AssessmentRecording.status == "pending_upload",
+            ).update({"status": "failed", "updated_at": now}, synchronize_session=False)
+            db.commit()
+        except Exception as exc:
+            logger.error(f"[scheduler] Failed marking stale pending uploads failed: {exc}", exc_info=True)
+            db.rollback()
+        finally:
+            db.close()
+
+    # 2. Keyset-paginated bulk purge of expired 'ready' recordings past 7-day retention
+    last_exp = None
+    last_id = None
+    max_iterations = 50
+    for _ in range(max_iterations):
+        db = SessionLocal()
+        batch_rows = []
+        try:
+            q = db.query(
+                AssessmentRecording.id,
+                AssessmentRecording.expires_at,
+                AssessmentRecording.video_storage_path,
+            ).filter(
+                AssessmentRecording.status == "ready",
+                AssessmentRecording.expires_at <= now,
+            )
+            if last_exp is not None and last_id is not None:
+                q = q.filter(
+                    or_(
+                        AssessmentRecording.expires_at > last_exp,
+                        and_(
+                            AssessmentRecording.expires_at == last_exp,
+                            AssessmentRecording.id > last_id,
+                        ),
+                    )
+                )
+            batch_rows = (
+                q.order_by(AssessmentRecording.expires_at.asc(), AssessmentRecording.id.asc())
+                .limit(100)
+                .all()
+            )
+        except Exception as exc:
+            logger.error(f"[scheduler] Assessment recordings keyset query failed: {exc}", exc_info=True)
+            break
+        finally:
+            db.close()  # Release DB connection before outbound storage HTTP calls
+
+        if not batch_rows:
+            break
+
+        last_exp = batch_rows[-1][1]
+        last_id = batch_rows[-1][0]
+
+        confirmed_paths = delete_recording_files_bulk([row[2] for row in batch_rows])
+        purged_ids = [rec_id for rec_id, _exp, storage_path in batch_rows if storage_path in confirmed_paths]
+
+        if purged_ids:
+            db = SessionLocal()
+            try:
+                db.query(AssessmentRecording).filter(
+                    AssessmentRecording.id.in_(purged_ids)
+                ).update(
+                    {"status": "purged", "purged_at": now, "updated_at": now},
+                    synchronize_session=False,
+                )
+                db.commit()
+            except Exception as exc:
+                logger.error(f"[scheduler] Assessment recordings status update failed: {exc}", exc_info=True)
+                db.rollback()
+            finally:
+                db.close()
+
+        if len(batch_rows) < 100:
+            break
+
+
+# Public job references for external triggers and test suites
+reconcile_dynamic_clusters_scheduler_job = _scheduled_reconcile_dynamic_clusters
+reconcile_expired_attempts_job = _reconcile_expired_assessment_attempts_job
+send_daily_assignment_reminders_job = _send_daily_assignment_reminders_job
+purge_expired_assessment_recordings_job = _purge_expired_assessment_recordings_job
+
+
 
 def shutdown_scheduler() -> None:
     # guard against double-shutdown if called more than once

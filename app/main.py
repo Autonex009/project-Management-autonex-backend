@@ -11,7 +11,7 @@ from arq.connections import RedisSettings
 import anyio.to_thread
 
 from app.db.database import Base, engine
-from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log, employee_badge, onboarding_pipeline, employee_document, weekly_compensation
+from app.models import project, allocation, leave, employee, parent_project, user, sub_project, guideline, side_project, skill, notification, wfh, signup_request, referral, payroll, performance_review, perf_eval, onboarding, company_settings, wifi_network, chat, encord_analytics, encord_activity, vendor, audit_log, employee_badge, onboarding_pipeline, employee_document, weekly_compensation, cluster, assignment, assessment
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
@@ -55,6 +55,9 @@ from app.api.checkins import router as checkins_router
 from app.api.onboarding_pipeline import router as onboarding_pipeline_router
 from app.api.employee_documents import router as employee_documents_router
 from app.api.weekly_compensation import router as weekly_compensation_router
+from app.api.clusters import router as clusters_router
+from app.api.assignments import router as assignments_router
+from app.api.assessments import router as assessments_router
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,13 @@ async def lifespan(app: FastAPI):
                         _conn.execute(_text("CREATE INDEX IF NOT EXISTS ix_salary_employee_id ON salary (employee_id);"))
                         _conn.commit()
                         logger.info("[startup] Added employee_id column to salary table")
+                if "clusters" in _insp.get_table_names():
+                    _cluster_cols = [c["name"] for c in _insp.get_columns("clusters")]
+                    if "dynamic_scopes" not in _cluster_cols:
+                        _col_type = "JSONB" if engine.dialect.name == "postgresql" else "JSON"
+                        _conn.execute(_text(f"ALTER TABLE clusters ADD COLUMN IF NOT EXISTS dynamic_scopes {_col_type};"))
+                        _conn.commit()
+                        logger.info("[startup] Added dynamic_scopes column to clusters table")
         except Exception as e:
             logger.warning("[startup] Could not auto-check employee_id on salary: %s", e)
         try:
@@ -264,4 +274,7 @@ app.include_router(checkins_router)
 app.include_router(onboarding_pipeline_router)
 app.include_router(employee_documents_router)
 app.include_router(weekly_compensation_router)
+app.include_router(clusters_router)
+app.include_router(assignments_router)
+app.include_router(assessments_router)
 app.mount("/uploads", StaticFiles(directory=uploads_dir), name="uploads")

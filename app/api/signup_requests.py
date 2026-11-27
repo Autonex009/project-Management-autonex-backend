@@ -511,6 +511,12 @@ def approve_signup_request(
         ),
         request=http_request,
     )
+    try:
+        from app.services.cluster_service import sync_dynamic_clusters_for_employee
+        with db.begin_nested():
+            sync_dynamic_clusters_for_employee(db, employee.id)
+    except Exception as _c_exc:
+        logger.warning("[signup-request] Dynamic cluster sync failed for employee %s: %s", employee.id, _c_exc)
     db.commit()
 
     logger.info("[signup-request] Approved id=%s → employee id=%s user id=%s", req.id, employee.id, user.id)
@@ -722,6 +728,12 @@ def undo_approve_signup_request(
     employee = db.query(Employee).filter(Employee.email == req.email).first()
     if employee:
         employee.status = "inactive"
+        try:
+            from app.services.cluster_service import sync_dynamic_clusters_for_employee
+            with db.begin_nested():
+                sync_dynamic_clusters_for_employee(db, employee.id)
+        except Exception as _c_exc:
+            logger.warning("[signup-request] Dynamic cluster cleanup failed for employee %s: %s", employee.id, _c_exc)
     previous_status = req.status
     req.status = "rejected"
     req.reviewed_by = current_user.id

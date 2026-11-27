@@ -37,10 +37,11 @@ def is_supabase_configured() -> bool:
 
 
 def _auth_headers(content_type: Optional[str] = None) -> dict:
-    h = {
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "apiKey": SUPABASE_KEY,
-    }
+    h = {"apiKey": SUPABASE_KEY}
+    # Legacy service_role keys are JWTs and go in Authorization too. The new `sb_secret_...` keys are
+    # not JWTs: Supabase wants them in the apikey header only.
+    if not SUPABASE_KEY.startswith("sb_"):
+        h["Authorization"] = f"Bearer {SUPABASE_KEY}"
     if content_type:
         h["Content-Type"] = content_type
     return h
