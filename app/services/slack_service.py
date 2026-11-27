@@ -2704,3 +2704,74 @@ def try_send_self_eval_reminder(employee_slack_user_id: str, employee_name: str)
         return (response.get("ts"), channel_id)
     logger.error(f"Failed to send self-eval reminder to {employee_slack_user_id}: {response.get('error')}")
     return (None, None)
+
+
+def try_send_assessment_reminder_dm(
+    employee_slack_user_id: str | None,
+    employee_name: str,
+    assessment_title: str,
+    deadline_str: str,
+    enrollment_id: int,
+    overdue: bool = False,
+    employee_email: str | None = None,
+) -> bool:
+    """Best-effort Slack DM reminding an employee about an upcoming or overdue assessment."""
+    token = _get_bot_token()
+    if not token:
+        return False
+    if not employee_slack_user_id and employee_email:
+        employee_slack_user_id = lookup_user_id_by_email(employee_email)
+    if not employee_slack_user_id:
+        return False
+    try:
+        channel_id = open_direct_message_channel(employee_slack_user_id)
+        portal_url = (os.getenv("FRONTEND_URL") or "http://localhost:5173").strip().rstrip("/")
+        test_url = f"{portal_url}/assessments/{enrollment_id}/take"
+        due_phrase = "was due on" if overdue else "is due by"
+        header_label = "Assessment Overdue Reminder" if overdue else "Assessment Due Reminder"
+        response = _slack_request(
+            "/chat.postMessage",
+            {
+                "channel": channel_id,
+                "text": f"Assessment Reminder: '{assessment_title}' {due_phrase} {deadline_str}.",
+                "blocks": [
+                    {
+                        "type": "section",
+                        "text": {
+                            "type": "mrkdwn",
+                            "text": (
+                                f"*{header_label}*\n\n"
+                                f"Hi {employee_name}, you have a pending assessment: *{assessment_title}*.\n"
+                                f"Deadline ({due_phrase}): *{deadline_str}*"
+                            ),
+                        },
+                    },
+                    {
+                        "type": "actions",
+                        "elements": [
+                            {
+                                "type": "button",
+                                "text": {"type": "plain_text", "text": "Start Assessment", "emoji": True},
+                                "style": "primary",
+                                "url": test_url,
+                                "action_id": "go_to_assessment",
+                            }
+                        ],
+                    },
+                ],
+            },
+        )
+        if response.get("ok"):
+            return True
+        logger.warning(
+            "Failed to send assessment reminder DM to %s: %s",
+            employee_slack_user_id,
+            response.get("error"),
+        )
+        return False
+    except SlackRateLimitError:
+        raise
+    except Exception as exc:
+        logger.warning("Assessment reminder Slack DM skipped for %s: %s", employee_slack_user_id, exc)
+        return False
+
